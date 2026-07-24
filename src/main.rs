@@ -24,8 +24,10 @@ use paths::clip_path;
 use preview::PreviewWindow;
 use recorder::RecordingEvent;
 
-const FRAME_RATE: u32 = 15;
-const POLL_INTERVAL: Duration = Duration::from_millis(1000 / FRAME_RATE as u64);
+const DETECTION_FRAME_RATE: u32 = 15;
+const DETECTION_POLL_INTERVAL: Duration = Duration::from_millis(1000 / DETECTION_FRAME_RATE as u64);
+const PREVIEW_FRAME_RATE: u32 = 30;
+const PREVIEW_POLL_INTERVAL: Duration = Duration::from_millis(1000 / PREVIEW_FRAME_RATE as u64);
 
 fn main() -> Result<()> {
     env_logger::init();
@@ -34,37 +36,91 @@ fn main() -> Result<()> {
     startup::check_dependencies(&config)?;
 
     let pre_buffer = Duration::from_secs(config.pre_buffer_secs as u64);
-    let post_buffer = Duration::from_secs(config.post_buffer_secs as u64);
-
     let ring_buffer = Arc::new(Mutex::new(RingBuffer::new(pre_buffer)));
 
     let _camera = capture::camera::start_camera_capture(
         config.camera_device.as_deref(),
         Arc::clone(&ring_buffer),
     )?;
-
     let _audio_stream = capture::audio::start_audio_capture(Arc::clone(&ring_buffer))?;
-
-    let mut motion_gate = MotionGate::new(config.motion_threshold)?;
-    let mut detector = Detector::load(config.model_path(), config.force_cpu)?;
-
-    let mut preview = if config.preview {
-        Some(PreviewWindow::open()?)
-    } else {
-        None
-    };
-
-    let mut active_event: Option<RecordingEvent> = None;
 
     let shutdown = Arc::new(AtomicBool::new(false));
     let shutdown_handler = Arc::clone(&shutdown);
+
     ctrlc::set_handler(move || {
         log::info!("shutdown requested; finishing any in-progress recording before exit");
         shutdown_handler.store(true, Ordering::SeqCst);
     })
     .context("failed to register shutdown handler")?;
 
+    let show_preview = config.preview;
+
+    // Motion detection, YOLO confirmation, and the recording lifecycle run on
+    // a dedicated worker thread at their own (much slower) pace, since YOLO
+    // inference can take far longer than a single video frame interval. The
+    // preview window stays on the main thread (highgui's GUI event loop isn't
+    // safe to drive from a background thread) and runs its own fast display
+    // loop pulling directly from the ring buffer, so a slow detection pass
+    // never causes the visible feed to stutter.
+    let worker_shutdown = Arc::clone(&shutdown);
+    let worker_ring_buffer = Arc::clone(&ring_buffer);
+    let worker_handle = thread::spawn(move || {
+        if let Err(err) = run_detection_loop(config, worker_ring_buffer, worker_shutdown) {
+            log::error!("detection worker exited with error: {err:?}");
+        }
+    });
+
     log::info!("motioncap started; watching for motion");
+    
+    run_preview_loop(&ring_buffer, &shutdown, show_preview)?;
+
+    worker_handle.join().expect("detection worker panicked");
+    Ok(())
+}
+
+fn run_preview_loop(
+    ring_buffer: &Arc<Mutex<RingBuffer>>,
+    shutdown: &Arc<AtomicBool>,
+    show_preview: bool,
+) -> Result<()> {
+    let mut preview = if show_preview {
+        Some(PreviewWindow::open()?)
+    } else {
+        None
+    };
+
+    loop {
+        if shutdown.load(Ordering::SeqCst) {
+            return Ok(());
+        }
+
+        thread::sleep(PREVIEW_POLL_INTERVAL);
+
+        let Some(preview) = preview.as_mut() else {
+            continue;
+        };
+
+        let latest_frame = {
+            let buf = ring_buffer.lock().expect("ring buffer lock poisoned");
+            buf.latest_frame().map(|f| f.image.clone())
+        };
+
+        if let Some(frame) = latest_frame {
+            preview.show(&frame)?;
+        }
+    }
+}
+
+fn run_detection_loop(
+    config: Config,
+    ring_buffer: Arc<Mutex<RingBuffer>>,
+    shutdown: Arc<AtomicBool>,
+) -> Result<()> {
+    let post_buffer = Duration::from_secs(config.post_buffer_secs as u64);
+
+    let mut motion_gate = MotionGate::new(config.motion_threshold)?;
+    let mut detector = Detector::load(config.model_path(), config.force_cpu)?;
+    let mut active_event: Option<RecordingEvent> = None;
 
     loop {
         if shutdown.load(Ordering::SeqCst) {
@@ -72,10 +128,10 @@ fn main() -> Result<()> {
                 event.finish()?;
                 log::info!("recording closed on shutdown");
             }
-            break Ok(());
+            return Ok(());
         }
 
-        thread::sleep(POLL_INTERVAL);
+        thread::sleep(DETECTION_POLL_INTERVAL);
 
         let latest_frame = {
             let buf = ring_buffer.lock().expect("ring buffer lock poisoned");
@@ -86,10 +142,6 @@ fn main() -> Result<()> {
             continue;
         };
 
-        if let Some(preview) = preview.as_mut() {
-            preview.show(&frame)?;
-        }
-
         if let Some(event) = active_event.as_mut() {
             event.write_frame(&frame)?;
 
@@ -97,7 +149,6 @@ fn main() -> Result<()> {
 
             if motion_tripped {
                 let detections = detector.detect(&frame, config.detection_confidence)?;
-                
                 if let Some(confirmed) = triggers::evaluate(detections) {
                     for d in &confirmed {
                         event.record_detection(d.class_name, d.confidence);
@@ -132,7 +183,6 @@ fn main() -> Result<()> {
         };
 
         let mut classes: Vec<&str> = confirmed.iter().map(|d| d.class_name).collect();
-
         classes.sort_unstable();
         classes.dedup();
 
@@ -142,12 +192,11 @@ fn main() -> Result<()> {
         };
 
         let path = clip_path(&config.output_dir, chrono::Local::now(), &classes)?;
-        let mut event = RecordingEvent::start(path, pre_frames, pre_audio, FRAME_RATE)?;
-
+        let mut event = RecordingEvent::start(path, pre_frames, pre_audio, DETECTION_FRAME_RATE)?;
         for d in &confirmed {
             event.record_detection(d.class_name, d.confidence);
         }
-        
+
         log::info!("recording started: {:?}", classes);
         active_event = Some(event);
     }
