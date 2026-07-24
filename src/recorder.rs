@@ -213,7 +213,12 @@ fn spawn_video_encoder(
     height: u32,
     frame_rate: u32,
 ) -> Result<Child> {
-    Command::new("ffmpeg")
+    #[cfg(unix)]
+    use std::os::unix::process::CommandExt;
+
+    let mut command = Command::new("ffmpeg");
+    
+    command
         .args(["-y", "-f", "rawvideo", "-pixel_format", "rgb24"])
         .args(["-video_size", &format!("{width}x{height}")])
         .args(["-framerate", &frame_rate.to_string()])
@@ -222,9 +227,20 @@ fn spawn_video_encoder(
         .arg(path)
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .context("failed to spawn ffmpeg video encoder")
+        .stderr(Stdio::null());
+
+    // Put ffmpeg in its own process group so a terminal SIGINT (Ctrl+C)
+    // doesn't reach it directly -- it shares the foreground process group
+    // with motioncap by default, so without this, Ctrl+C kills ffmpeg at
+    // the same instant as motioncap's own ctrlc handler tries to close it
+    // gracefully (closing stdin, then waiting), racing ffmpeg's own SIGINT
+    // handling and producing a nonzero exit even when the output file is
+    // actually complete and valid. Graceful shutdown should be the only
+    // thing that ever tells ffmpeg to stop.
+    #[cfg(unix)]
+    command.process_group(0);
+
+    command.spawn().context("failed to spawn ffmpeg video encoder")
 }
 
 /// Muxes the buffered raw audio into the encoded video. `-shortest` is

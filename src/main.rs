@@ -59,6 +59,18 @@ fn main() -> Result<()> {
 
     let show_preview = config.preview;
 
+    // The active recording, if any, is shared between the detection worker
+    // (which decides when to start/stop it and records YOLO confirmations
+    // into it) and a dedicated recording-writer thread (which only writes
+    // frames/audio to it on a steady clock). Splitting these apart matters
+    // because motion-gate + YOLO inference can take far longer than one
+    // video frame interval; if the same loop iteration that runs inference
+    // also writes the frame, frames land in the encoder's stdin at
+    // irregular, stretched-out intervals while ffmpeg's fixed `-framerate`
+    // assumes uniform spacing, which plays back as a stutter in the
+    // recorded clip.
+    let active_event: Arc<Mutex<Option<RecordingEvent>>> = Arc::new(Mutex::new(None));
+
     // Motion detection, YOLO confirmation, and the recording lifecycle run on
     // a dedicated worker thread at their own (much slower) pace, since YOLO
     // inference can take far longer than a single video frame interval. The
@@ -68,11 +80,13 @@ fn main() -> Result<()> {
     // never causes the visible feed to stutter.
     let worker_shutdown = Arc::clone(&shutdown);
     let worker_ring_buffer = Arc::clone(&ring_buffer);
+    let worker_active_event = Arc::clone(&active_event);
     let worker_handle = thread::spawn(move || {
         if let Err(err) = run_detection_loop(
             config,
             worker_ring_buffer,
             worker_shutdown,
+            worker_active_event,
             audio_sample_rate,
             audio_channels,
         ) {
@@ -80,12 +94,60 @@ fn main() -> Result<()> {
         }
     });
 
+    let writer_shutdown = Arc::clone(&shutdown);
+    let writer_ring_buffer = Arc::clone(&ring_buffer);
+    let writer_active_event = Arc::clone(&active_event);
+    let writer_handle = thread::spawn(move || {
+        run_recording_writer_loop(writer_ring_buffer, writer_active_event, writer_shutdown);
+    });
+
     log::info!("motioncap started; watching for motion");
-    
+
     run_preview_loop(&ring_buffer, &shutdown, show_preview)?;
 
     worker_handle.join().expect("detection worker panicked");
+    writer_handle.join().expect("recording writer panicked");
     Ok(())
+}
+
+/// Writes frames/audio into the active recording (if any) on a steady clock,
+/// independent of how long motion-gate/YOLO evaluation takes in the
+/// detection loop. This is what keeps recorded clips at a uniform frame
+/// rate even while YOLO inference is running on the same tick elsewhere.
+fn run_recording_writer_loop(
+    ring_buffer: Arc<Mutex<RingBuffer>>,
+    active_event: Arc<Mutex<Option<RecordingEvent>>>,
+    shutdown: Arc<AtomicBool>,
+) {
+    loop {
+        if shutdown.load(Ordering::SeqCst) {
+            return;
+        }
+
+        thread::sleep(DETECTION_POLL_INTERVAL);
+
+        let latest_frame = {
+            let buf = ring_buffer.lock().expect("ring buffer lock poisoned");
+            buf.latest_frame().map(|f| f.image.clone())
+        };
+
+        let Some(frame) = latest_frame else {
+            continue;
+        };
+
+        let mut guard = active_event.lock().expect("active event lock poisoned");
+        let Some(event) = guard.as_mut() else {
+            continue;
+        };
+
+        if let Err(err) = event.write_frame(&frame) {
+            log::error!("failed to write frame to active recording: {err:?}");
+        }
+        
+        if let Err(err) = event.drain_audio(&ring_buffer) {
+            log::error!("failed to drain audio into active recording: {err:?}");
+        }
+    }
 }
 
 fn run_preview_loop(
@@ -125,6 +187,7 @@ fn run_detection_loop(
     config: Config,
     ring_buffer: Arc<Mutex<RingBuffer>>,
     shutdown: Arc<AtomicBool>,
+    active_event: Arc<Mutex<Option<RecordingEvent>>>,
     audio_sample_rate: u32,
     audio_channels: u16,
 ) -> Result<()> {
@@ -132,11 +195,11 @@ fn run_detection_loop(
 
     let mut motion_gate = MotionGate::new(config.motion_threshold)?;
     let mut detector = Detector::load(config.model_path(), config.force_cpu)?;
-    let mut active_event: Option<RecordingEvent> = None;
 
     loop {
         if shutdown.load(Ordering::SeqCst) {
-            if let Some(event) = active_event.take() {
+            let event = active_event.lock().expect("active event lock poisoned").take();
+            if let Some(event) = event {
                 event.finish()?;
                 log::info!("recording closed on shutdown");
             }
@@ -154,16 +217,32 @@ fn run_detection_loop(
             continue;
         };
 
-        if let Some(event) = active_event.as_mut() {
-            event.write_frame(&frame)?;
-            event.drain_audio(&ring_buffer)?;
+        let has_active_event = active_event.lock().expect("active event lock poisoned").is_some();
 
+        if has_active_event {
             let motion_tripped = motion_gate.evaluate(&frame)?;
 
-            if motion_tripped {
+            // `detector.detect` runs without holding the event lock since
+            // YOLO inference is the slow step; the recording writer thread
+            // must be free to keep writing frames/audio at a steady pace
+            // while this runs, not blocked waiting on this lock.
+            let confirmed = if motion_tripped {
                 let detections = detector.detect(&frame, config.detection_confidence)?;
-                if let Some(confirmed) = triggers::evaluate(detections) {
-                    for d in &confirmed {
+                triggers::evaluate(detections)
+            } else {
+                None
+            };
+
+            let mut guard = active_event.lock().expect("active event lock poisoned");
+            let Some(event) = guard.as_mut() else {
+                // Recording was closed elsewhere (e.g. shutdown) while
+                // inference was running above.
+                continue;
+            };
+
+            if motion_tripped {
+                if let Some(confirmed) = &confirmed {
+                    for d in confirmed {
                         event.record_detection(d.class_name, d.confidence);
                     }
                 } else {
@@ -175,7 +254,8 @@ fn run_detection_loop(
             }
 
             if event.quiet_for() >= post_buffer {
-                let event = active_event.take().expect("checked Some above");
+                let event = guard.take().expect("checked Some above");
+                drop(guard);
                 event.finish()?;
                 log::info!("recording closed");
             }
@@ -223,7 +303,7 @@ fn run_detection_loop(
         }
 
         log::info!("recording started: {:?}", classes);
-        
-        active_event = Some(event);
+
+        *active_event.lock().expect("active event lock poisoned") = Some(event);
     }
 }
