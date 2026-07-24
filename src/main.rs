@@ -177,16 +177,16 @@ fn run_recording_writer_loop(
 
         let mut guard = active_event.lock().expect("active event lock poisoned");
 
-        if let ActiveEvent::Pending(_) = &*guard {
-            let ActiveEvent::Pending(mut pending) = std::mem::replace(&mut *guard, ActiveEvent::None) else {
-                unreachable!("just matched Pending above");
-            };
-
-            if let Err(err) = pending.event.seed(&pending.pre_frames, &pending.pre_audio, DETECTION_FRAME_RATE) {
-                log::error!("failed to seed pre-buffer into new recording: {err:?}");
+        let taken = std::mem::replace(&mut *guard, ActiveEvent::None);
+        
+        match taken {
+            ActiveEvent::Pending(mut pending) => {
+                if let Err(err) = pending.event.seed(&pending.pre_frames, &pending.pre_audio, DETECTION_FRAME_RATE) {
+                    log::error!("failed to seed pre-buffer into new recording: {err:?}");
+                }
+                *guard = ActiveEvent::Active(pending.event);
             }
-
-            *guard = ActiveEvent::Active(pending.event);
+            other => *guard = other,
         }
 
         let Some(frame) = latest_frame else {
