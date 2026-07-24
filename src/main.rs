@@ -1,4 +1,5 @@
 mod buffer;
+mod capture;
 mod config;
 mod startup;
 
