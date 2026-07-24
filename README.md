@@ -70,7 +70,7 @@ automatically; see
 
 ## Output layout
 
-```
+```sh
 <output_dir>/<YYYY-MM-DD>/<HH-MM-SS>_<class1>_<class2>.mp4
 ```
 
