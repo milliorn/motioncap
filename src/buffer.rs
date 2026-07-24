@@ -83,6 +83,20 @@ impl RingBuffer {
         self.frames.back()
     }
 
+    /// Frames pushed strictly after `since`, oldest first. Used by the
+    /// recording writer to drain every frame the camera produced between
+    /// polls instead of only ever reading `latest_frame` -- reading just the
+    /// latest silently skips any frame that arrived and was superseded
+    /// before the writer's next poll, which shows up as a visible jump in
+    /// the subject's position despite otherwise-correct frame timestamps.
+    pub fn frames_since(&self, since: Instant) -> Vec<TimestampedFrame> {
+        self.frames
+            .iter()
+            .filter(|frame| frame.timestamp > since)
+            .cloned()
+            .collect()
+    }
+
     /// Audio chunks pushed strictly after `since`, oldest first. Used to drain
     /// newly-captured audio into an active recording each poll, so live clips
     /// keep accumulating audio for their full duration instead of only ever

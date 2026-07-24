@@ -67,8 +67,25 @@ impl ActiveEvent {
     }
 }
 
+// Motion-gate + YOLO evaluation cadence. Kept separate from the recording
+// frame rate below since inference cost doesn't scale down usefully at
+// higher polling rates -- 15fps is plenty for deciding whether a subject is
+// still present.
 const DETECTION_FRAME_RATE: u32 = 15;
 const DETECTION_POLL_INTERVAL: Duration = Duration::from_millis(1000 / DETECTION_FRAME_RATE as u64);
+
+// Recorded video frame rate, used by the writer thread and the video
+// encoder. Measured (via traced ring-buffer frame timestamps under real
+// running conditions -- all threads active, real RGB decode load) at ~18fps
+// average delivery for this camera, well short of the 50-65fps seen in
+// isolated capture-only testing. Polling faster than the camera actually
+// delivers just makes the writer re-write stale frames, which plays back as
+// stutter/perceived speed-up (measured ~42% duplicate frame writes at
+// 30fps vs. 0% at 15fps). 15fps is the safe ceiling until the writer tracks
+// per-frame identity to skip real duplicates.
+const RECORDING_FRAME_RATE: u32 = 15;
+const RECORDING_POLL_INTERVAL: Duration = Duration::from_millis(1000 / RECORDING_FRAME_RATE as u64);
+
 const PREVIEW_FRAME_RATE: u32 = 30;
 const PREVIEW_POLL_INTERVAL: Duration = Duration::from_millis(1000 / PREVIEW_FRAME_RATE as u64);
 
@@ -168,20 +185,15 @@ fn run_recording_writer_loop(
             return;
         }
 
-        thread::sleep(DETECTION_POLL_INTERVAL);
-
-        let latest_frame = {
-            let buf = ring_buffer.lock().expect("ring buffer lock poisoned");
-            buf.latest_frame().map(|f| f.image.clone())
-        };
+        thread::sleep(RECORDING_POLL_INTERVAL);
 
         let mut guard = active_event.lock().expect("active event lock poisoned");
 
         let taken = std::mem::replace(&mut *guard, ActiveEvent::None);
-        
+
         match taken {
             ActiveEvent::Pending(mut pending) => {
-                if let Err(err) = pending.event.seed(&pending.pre_frames, &pending.pre_audio, DETECTION_FRAME_RATE) {
+                if let Err(err) = pending.event.seed(&pending.pre_frames, &pending.pre_audio, RECORDING_FRAME_RATE) {
                     log::error!("failed to seed pre-buffer into new recording: {err:?}");
                 }
                 *guard = ActiveEvent::Active(pending.event);
@@ -189,16 +201,12 @@ fn run_recording_writer_loop(
             other => *guard = other,
         }
 
-        let Some(frame) = latest_frame else {
-            continue;
-        };
-
         let Some(event) = guard.as_recording_mut() else {
             continue;
         };
 
-        if let Err(err) = event.write_frame(&frame) {
-            log::error!("failed to write frame to active recording: {err:?}");
+        if let Err(err) = event.drain_frames(&ring_buffer) {
+            log::error!("failed to drain frames into active recording: {err:?}");
         }
         if let Err(err) = event.drain_audio(&ring_buffer) {
             log::error!("failed to drain audio into active recording: {err:?}");
@@ -359,7 +367,7 @@ fn run_detection_loop(
             path,
             width,
             height,
-            DETECTION_FRAME_RATE,
+            RECORDING_FRAME_RATE,
             audio_sample_rate,
             audio_channels,
         )?;

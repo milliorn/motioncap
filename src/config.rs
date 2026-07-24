@@ -31,7 +31,7 @@ pub struct Config {
     pub post_buffer_secs: u32,
 
     /// Minimum confidence (0.0-1.0) for a YOLO detection to confirm a living-thing event
-    #[arg(long, default_value_t = 0.5)]
+    #[arg(long, default_value_t = 0.3)]
     pub detection_confidence: f32,
 
     /// Minimum changed-pixel ratio (0.0-1.0) for the background-subtraction gate to trip

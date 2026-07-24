@@ -36,9 +36,12 @@ pub struct RecordingEvent {
     video_tmp_path: std::path::PathBuf,
     audio_sample_rate: u32,
     audio_channels: u16,
+    frame_rate: u32,
     clip_started: Instant,
     last_trigger_at: Instant,
     last_audio_drain_at: Instant,
+    last_frame_drain_at: Instant,
+    next_frame_due: Option<Instant>,
     detections: Vec<DetectionRecord>,
 }
 
@@ -86,9 +89,12 @@ impl RecordingEvent {
             video_tmp_path,
             audio_sample_rate,
             audio_channels,
+            frame_rate,
             clip_started: now,
             last_trigger_at: now,
             last_audio_drain_at: now,
+            last_frame_drain_at: now,
+            next_frame_due: None,
             detections: Vec::new(),
         })
     }
@@ -111,8 +117,16 @@ impl RecordingEvent {
         pre_audio: &[TimestampedAudio],
         frame_rate: u32,
     ) -> Result<()> {
-        for frame in resample_to_frame_rate(pre_frames, frame_rate) {
+        let selected = resample_to_frame_rate(pre_frames, frame_rate);
+
+        for frame in &selected {
             self.write_frame(&frame.image)?;
+        }
+
+        if let Some(last) = selected.last() {
+            let tick = Duration::from_secs_f64(1.0 / frame_rate as f64);
+            self.last_frame_drain_at = last.timestamp;
+            self.next_frame_due = Some(last.timestamp + tick);
         }
 
         for chunk in pre_audio {
@@ -122,6 +136,43 @@ impl RecordingEvent {
         if let Some(last) = pre_audio.last() {
             self.last_audio_drain_at = last.timestamp;
         }
+
+        Ok(())
+    }
+
+    /// Writes every frame captured since the last drain (or since `seed`,
+    /// for the first call), resampled to this event's configured frame rate
+    /// using a persistent tick anchor carried across calls. Must be polled
+    /// periodically while the event is active.
+    ///
+    /// Draining *all* new frames (not just the newest) matters because the
+    /// camera's delivery rate can momentarily exceed the writer's poll rate;
+    /// reading only the latest frame each poll silently skips over whatever
+    /// arrived and was superseded in between, which produces a visible jump
+    /// in the subject's position despite otherwise-correct frame timing.
+    pub fn drain_frames(&mut self, ring_buffer: &std::sync::Mutex<crate::buffer::RingBuffer>) -> Result<()> {
+        let new_frames = {
+            let buf = ring_buffer.lock().expect("ring buffer lock poisoned");
+            buf.frames_since(self.last_frame_drain_at)
+        };
+
+        if let Some(last) = new_frames.last() {
+            self.last_frame_drain_at = last.timestamp;
+        }
+
+        let tick = Duration::from_secs_f64(1.0 / self.frame_rate as f64);
+        let mut next_due = self.next_frame_due;
+
+        for frame in &new_frames {
+            let due = next_due.unwrap_or(frame.timestamp);
+            
+            if frame.timestamp >= due {
+                self.write_frame(&frame.image)?;
+                next_due = Some(due + tick);
+            }
+        }
+
+        self.next_frame_due = next_due;
 
         Ok(())
     }
