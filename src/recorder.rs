@@ -3,7 +3,6 @@ use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
-use chrono::{DateTime, Local};
 use serde::Serialize;
 
 use crate::buffer::{TimestampedAudio, TimestampedFrame};
@@ -38,7 +37,6 @@ pub struct RecordingEvent {
     audio_file: std::fs::File,
     final_clip_path: std::path::PathBuf,
     video_tmp_path: std::path::PathBuf,
-    started_at: DateTime<Local>,
     clip_started: Instant,
     last_trigger_at: Instant,
     detections: Vec<DetectionRecord>,
@@ -56,7 +54,6 @@ impl RecordingEvent {
         pre_audio: Vec<TimestampedAudio>,
         frame_rate: u32,
     ) -> Result<Self> {
-        let started_at = Local::now();
         let (width, height) = pre_frames
             .first()
             .map(|f| f.image.dimensions())
@@ -75,7 +72,6 @@ impl RecordingEvent {
             audio_file,
             final_clip_path,
             video_tmp_path,
-            started_at,
             clip_started: Instant::now(),
             last_trigger_at: Instant::now(),
             detections: Vec::new(),
@@ -132,10 +128,6 @@ impl RecordingEvent {
 
     pub fn quiet_for(&self) -> Duration {
         self.last_trigger_at.elapsed()
-    }
-
-    pub fn started_at(&self) -> DateTime<Local> {
-        self.started_at
     }
 
     /// Stops encoding, muxes the buffered audio into the video, and writes

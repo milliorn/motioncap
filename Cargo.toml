@@ -9,6 +9,7 @@ chrono = "0.4.45"
 clap = { version = "4.6.4", features = ["derive"] }
 cpal = "0.18.1"
 crossbeam-channel = "0.5.16"
+env_logger = "0.11.11"
 image = { version = "0.25.10", default-features = false, features = ["jpeg", "png", "rayon"] }
 log = "0.4.33"
 ndarray = "0.17.2"
