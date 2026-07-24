@@ -1141,6 +1141,7 @@ dependencies = [
  "crossbeam-channel",
  "image",
  "log",
+ "ndarray",
  "nokhwa",
  "opencv",
  "ort",

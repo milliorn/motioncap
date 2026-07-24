@@ -11,6 +11,7 @@ cpal = "0.18.1"
 crossbeam-channel = "0.5.16"
 image = { version = "0.25.10", default-features = false, features = ["jpeg", "png", "rayon"] }
 log = "0.4.33"
+ndarray = "0.17.2"
 nokhwa = { version = "0.10.11", features = ["input-v4l", "decoding", "output-threaded"] }
 opencv = { version = "0.99.0", default-features = false, features = ["clang-runtime", "video", "videoio", "imgproc", "imgcodecs", "highgui"] }
 ort = { version = "2.0.0-rc.12", features = ["cuda", "load-dynamic", "ndarray", "openvino", "rocm"] }
