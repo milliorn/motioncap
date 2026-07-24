@@ -8,9 +8,6 @@ use serde::Serialize;
 use crate::buffer::{TimestampedAudio, TimestampedFrame};
 use crate::paths::sidecar_path;
 
-const AUDIO_SAMPLE_RATE: u32 = 48_000;
-const AUDIO_CHANNELS: u32 = 1;
-
 #[derive(Serialize)]
 pub struct DetectionRecord {
     pub offset_secs: f64,
@@ -37,8 +34,11 @@ pub struct RecordingEvent {
     audio_file: std::fs::File,
     final_clip_path: std::path::PathBuf,
     video_tmp_path: std::path::PathBuf,
+    audio_sample_rate: u32,
+    audio_channels: u16,
     clip_started: Instant,
     last_trigger_at: Instant,
+    last_audio_drain_at: Instant,
     detections: Vec<DetectionRecord>,
 }
 
@@ -48,11 +48,25 @@ impl RecordingEvent {
     /// trigger fired. `final_clip_path` should already reflect the trigger's
     /// classes/timestamp per the output layout convention (ADR 4); this
     /// module only performs the actual encoding/muxing, not path naming.
+    ///
+    /// `audio_sample_rate`/`audio_channels` must match whatever format the
+    /// caller's audio samples were captured/converted to (see
+    /// `capture::audio::AudioStreamInfo`), since the mux step needs the real
+    /// values to interpret the buffered PCM correctly.
+    ///
+    /// The ring buffer accumulates frames at the camera's native capture
+    /// rate, which may be higher than `frame_rate` (the rate the video
+    /// encoder is configured for). Pre-buffered frames are resampled down to
+    /// `frame_rate` using their timestamps before writing, so the pre-buffer
+    /// portion of the clip plays back at the correct real-time duration
+    /// instead of being stretched by writing every captured frame 1:1.
     pub fn start(
         final_clip_path: std::path::PathBuf,
         pre_frames: Vec<TimestampedFrame>,
         pre_audio: Vec<TimestampedAudio>,
         frame_rate: u32,
+        audio_sample_rate: u32,
+        audio_channels: u16,
     ) -> Result<Self> {
         let (width, height) = pre_frames
             .first()
@@ -66,18 +80,23 @@ impl RecordingEvent {
         let audio_file = std::fs::File::create(&audio_tmp_path)
             .with_context(|| format!("failed to create temp audio file {}", audio_tmp_path.display()))?;
 
+        let last_audio_timestamp = pre_audio.last().map(|chunk| chunk.timestamp);
+
         let mut event = Self {
             ffmpeg_video,
             audio_tmp_path,
             audio_file,
             final_clip_path,
             video_tmp_path,
+            audio_sample_rate,
+            audio_channels,
             clip_started: Instant::now(),
             last_trigger_at: Instant::now(),
+            last_audio_drain_at: last_audio_timestamp.unwrap_or_else(Instant::now),
             detections: Vec::new(),
         };
 
-        for frame in &pre_frames {
+        for frame in resample_to_frame_rate(&pre_frames, frame_rate) {
             event.write_frame(&frame.image)?;
         }
 
@@ -86,6 +105,27 @@ impl RecordingEvent {
         }
 
         Ok(event)
+    }
+
+    /// Writes any audio captured since the last drain (or since the event
+    /// started, for the first call). Must be polled periodically while the
+    /// event is active so live audio keeps accumulating for the clip's full
+    /// duration, not just the pre-buffer window written in `start`.
+    pub fn drain_audio(&mut self, ring_buffer: &std::sync::Mutex<crate::buffer::RingBuffer>) -> Result<()> {
+        let new_chunks = {
+            let buf = ring_buffer.lock().expect("ring buffer lock poisoned");
+            buf.audio_since(self.last_audio_drain_at)
+        };
+
+        if let Some(last) = new_chunks.last() {
+            self.last_audio_drain_at = last.timestamp;
+        }
+
+        for chunk in &new_chunks {
+            self.write_audio(&chunk.samples)?;
+        }
+
+        Ok(())
     }
 
     pub fn write_frame(&mut self, image: &image::RgbImage) -> Result<()> {
@@ -143,7 +183,13 @@ impl RecordingEvent {
 
         drop(self.audio_file);
 
-        mux_audio_into_video(&self.video_tmp_path, &self.audio_tmp_path, &self.final_clip_path)?;
+        mux_audio_into_video(
+            &self.video_tmp_path,
+            &self.audio_tmp_path,
+            &self.final_clip_path,
+            self.audio_sample_rate,
+            self.audio_channels,
+        )?;
         
         let _ = std::fs::remove_file(&self.video_tmp_path);
         let _ = std::fs::remove_file(&self.audio_tmp_path);
@@ -181,14 +227,27 @@ fn spawn_video_encoder(
         .context("failed to spawn ffmpeg video encoder")
 }
 
-fn mux_audio_into_video(video_path: &std::path::Path, audio_path: &std::path::Path, output_path: &std::path::Path) -> Result<()> {
+/// Muxes the buffered raw audio into the encoded video. `-shortest` is
+/// deliberately not used: with independently-accumulated video/audio streams,
+/// whichever stream is shorter due to minor drift would otherwise have the
+/// *other* stream silently truncated to match, losing recorded content.
+/// Instead, the audio stream is padded with silence (`apad`) to at least the
+/// video's duration and `-shortest` is applied only to that padded output, so
+/// the result is exactly the video's length with no dropped video frames.
+fn mux_audio_into_video(
+    video_path: &std::path::Path,
+    audio_path: &std::path::Path,
+    output_path: &std::path::Path,
+    sample_rate: u32,
+    channels: u16,
+) -> Result<()> {
     let status = Command::new("ffmpeg")
         .args(["-y", "-i"])
         .arg(video_path)
-        .args(["-f", "f32le", "-ar", &AUDIO_SAMPLE_RATE.to_string(), "-ac", &AUDIO_CHANNELS.to_string()])
+        .args(["-f", "f32le", "-ar", &sample_rate.to_string(), "-ac", &channels.to_string()])
         .arg("-i")
         .arg(audio_path)
-        .args(["-c:v", "copy", "-c:a", "aac", "-shortest"])
+        .args(["-c:v", "copy", "-af", "apad", "-c:a", "aac", "-shortest"])
         .arg(output_path)
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -198,6 +257,35 @@ fn mux_audio_into_video(video_path: &std::path::Path, audio_path: &std::path::Pa
     if !status.success() {
         bail!("ffmpeg audio mux exited with {status}");
     }
-    
+
     Ok(())
+}
+
+/// Downsamples timestamped frames to approximately `frame_rate` frames per
+/// second based on their capture timestamps, keeping the first frame at or
+/// after each target tick. The ring buffer accumulates frames at the
+/// camera's native capture rate (which may be higher than the encoder's
+/// configured `frame_rate`), so writing every buffered frame 1:1 would
+/// stretch the pre-buffer's playback duration beyond its real elapsed time.
+fn resample_to_frame_rate(frames: &[TimestampedFrame], frame_rate: u32) -> Vec<&TimestampedFrame> {
+    let Some(first) = frames.first() else {
+        return Vec::new();
+    };
+
+    if frame_rate == 0 {
+        return frames.iter().collect();
+    }
+
+    let tick = Duration::from_secs_f64(1.0 / frame_rate as f64);
+    let mut selected = Vec::new();
+    let mut next_due = first.timestamp;
+
+    for frame in frames {
+        if frame.timestamp >= next_due {
+            selected.push(frame);
+            next_due += tick;
+        }
+    }
+
+    selected
 }

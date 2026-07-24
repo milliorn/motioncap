@@ -82,4 +82,16 @@ impl RingBuffer {
     pub fn latest_frame(&self) -> Option<&TimestampedFrame> {
         self.frames.back()
     }
+
+    /// Audio chunks pushed strictly after `since`, oldest first. Used to drain
+    /// newly-captured audio into an active recording each poll, so live clips
+    /// keep accumulating audio for their full duration instead of only ever
+    /// containing the pre-buffer's audio.
+    pub fn audio_since(&self, since: Instant) -> Vec<TimestampedAudio> {
+        self.audio
+            .iter()
+            .filter(|chunk| chunk.timestamp > since)
+            .cloned()
+            .collect()
+    }
 }

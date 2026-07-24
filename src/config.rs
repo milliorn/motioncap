@@ -38,7 +38,7 @@ pub struct Config {
     #[arg(long, default_value_t = 0.01)]
     pub motion_threshold: f32,
 
-    /// Show a live preview window with detection overlays (off by default)
+    /// Show a live preview window with the raw camera feed (off by default)
     #[arg(long, default_value_t = false)]
     pub preview: bool,
 }

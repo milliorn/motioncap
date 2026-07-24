@@ -42,7 +42,11 @@ fn main() -> Result<()> {
         config.camera_device.as_deref(),
         Arc::clone(&ring_buffer),
     )?;
-    let _audio_stream = capture::audio::start_audio_capture(Arc::clone(&ring_buffer))?;
+
+    let audio_info = capture::audio::start_audio_capture(Arc::clone(&ring_buffer))?;
+    let audio_sample_rate = audio_info.sample_rate;
+    let audio_channels = audio_info.channels;
+    let _audio_stream = audio_info.stream;
 
     let shutdown = Arc::new(AtomicBool::new(false));
     let shutdown_handler = Arc::clone(&shutdown);
@@ -65,7 +69,13 @@ fn main() -> Result<()> {
     let worker_shutdown = Arc::clone(&shutdown);
     let worker_ring_buffer = Arc::clone(&ring_buffer);
     let worker_handle = thread::spawn(move || {
-        if let Err(err) = run_detection_loop(config, worker_ring_buffer, worker_shutdown) {
+        if let Err(err) = run_detection_loop(
+            config,
+            worker_ring_buffer,
+            worker_shutdown,
+            audio_sample_rate,
+            audio_channels,
+        ) {
             log::error!("detection worker exited with error: {err:?}");
         }
     });
@@ -115,6 +125,8 @@ fn run_detection_loop(
     config: Config,
     ring_buffer: Arc<Mutex<RingBuffer>>,
     shutdown: Arc<AtomicBool>,
+    audio_sample_rate: u32,
+    audio_channels: u16,
 ) -> Result<()> {
     let post_buffer = Duration::from_secs(config.post_buffer_secs as u64);
 
@@ -144,6 +156,7 @@ fn run_detection_loop(
 
         if let Some(event) = active_event.as_mut() {
             event.write_frame(&frame)?;
+            event.drain_audio(&ring_buffer)?;
 
             let motion_tripped = motion_gate.evaluate(&frame)?;
 
@@ -170,6 +183,7 @@ fn run_detection_loop(
         }
 
         let motion_tripped = motion_gate.evaluate(&frame)?;
+
         log::trace!("frame received; motion_tripped={motion_tripped}");
 
         if !motion_tripped {
@@ -177,12 +191,15 @@ fn run_detection_loop(
         }
 
         let detections = detector.detect(&frame, config.detection_confidence)?;
+
         log::trace!("motion tripped; {} detections above threshold", detections.len());
+
         let Some(confirmed) = triggers::evaluate(detections) else {
             continue;
         };
 
         let mut classes: Vec<&str> = confirmed.iter().map(|d| d.class_name).collect();
+
         classes.sort_unstable();
         classes.dedup();
 
@@ -192,12 +209,21 @@ fn run_detection_loop(
         };
 
         let path = clip_path(&config.output_dir, chrono::Local::now(), &classes)?;
-        let mut event = RecordingEvent::start(path, pre_frames, pre_audio, DETECTION_FRAME_RATE)?;
+        let mut event = RecordingEvent::start(
+            path,
+            pre_frames,
+            pre_audio,
+            DETECTION_FRAME_RATE,
+            audio_sample_rate,
+            audio_channels,
+        )?;
+
         for d in &confirmed {
             event.record_detection(d.class_name, d.confidence);
         }
 
         log::info!("recording started: {:?}", classes);
+        
         active_event = Some(event);
     }
 }
