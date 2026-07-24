@@ -104,22 +104,32 @@ impl Detector {
     }
 }
 
-/// Resizes to the model's expected input size and converts to an NCHW f32
-/// tensor normalized to [0, 1], the standard YOLOv8 ONNX export input format.
+/// Letterboxes the frame into a square canvas (preserving aspect ratio, padding
+/// with grey) and converts to an NCHW f32 tensor normalized to [0, 1] -- the
+/// standard YOLOv8 preprocessing. A naive stretch-to-square resize distorts
+/// non-square camera frames (e.g. this webcam's 640x480) enough to
+/// meaningfully degrade detection confidence, since the model is trained on
+/// letterboxed inputs, not stretched ones.
 fn preprocess(frame: &RgbImage) -> Array4<f32> {
-    let resized = image::imageops::resize(
-        frame,
-        MODEL_INPUT_SIZE,
-        MODEL_INPUT_SIZE,
-        FilterType::Triangle,
-    );
+    let (src_w, src_h) = frame.dimensions();
+    let scale = (MODEL_INPUT_SIZE as f32 / src_w as f32).min(MODEL_INPUT_SIZE as f32 / src_h as f32);
+    let new_w = (src_w as f32 * scale).round() as u32;
+    let new_h = (src_h as f32 * scale).round() as u32;
 
-    let mut tensor = Array4::<f32>::zeros((1, 3, MODEL_INPUT_SIZE as usize, MODEL_INPUT_SIZE as usize));
+    let resized = image::imageops::resize(frame, new_w, new_h, FilterType::Triangle);
+
+    let pad_x = (MODEL_INPUT_SIZE - new_w) / 2;
+    let pad_y = (MODEL_INPUT_SIZE - new_h) / 2;
+
+    let mut tensor = Array4::<f32>::from_elem(
+        (1, 3, MODEL_INPUT_SIZE as usize, MODEL_INPUT_SIZE as usize),
+        114.0 / 255.0,
+    );
     for (x, y, pixel) in resized.enumerate_pixels() {
-        let (x, y) = (x as usize, y as usize);
-        tensor[[0, 0, y, x]] = pixel[0] as f32 / 255.0;
-        tensor[[0, 1, y, x]] = pixel[1] as f32 / 255.0;
-        tensor[[0, 2, y, x]] = pixel[2] as f32 / 255.0;
+        let (dst_x, dst_y) = ((x + pad_x) as usize, (y + pad_y) as usize);
+        tensor[[0, 0, dst_y, dst_x]] = pixel[0] as f32 / 255.0;
+        tensor[[0, 1, dst_y, dst_x]] = pixel[1] as f32 / 255.0;
+        tensor[[0, 2, dst_y, dst_x]] = pixel[2] as f32 / 255.0;
     }
     tensor
 }

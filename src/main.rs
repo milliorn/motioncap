@@ -9,11 +9,12 @@ mod recorder;
 mod startup;
 mod triggers;
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::Duration;
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 
 use buffer::RingBuffer;
 use config::Config;
@@ -55,9 +56,25 @@ fn main() -> Result<()> {
 
     let mut active_event: Option<RecordingEvent> = None;
 
+    let shutdown = Arc::new(AtomicBool::new(false));
+    let shutdown_handler = Arc::clone(&shutdown);
+    ctrlc::set_handler(move || {
+        log::info!("shutdown requested; finishing any in-progress recording before exit");
+        shutdown_handler.store(true, Ordering::SeqCst);
+    })
+    .context("failed to register shutdown handler")?;
+
     log::info!("motioncap started; watching for motion");
 
     loop {
+        if shutdown.load(Ordering::SeqCst) {
+            if let Some(event) = active_event.take() {
+                event.finish()?;
+                log::info!("recording closed on shutdown");
+            }
+            break Ok(());
+        }
+
         thread::sleep(POLL_INTERVAL);
 
         let latest_frame = {
@@ -102,12 +119,14 @@ fn main() -> Result<()> {
         }
 
         let motion_tripped = motion_gate.evaluate(&frame)?;
+        log::trace!("frame received; motion_tripped={motion_tripped}");
 
         if !motion_tripped {
             continue;
         }
 
         let detections = detector.detect(&frame, config.detection_confidence)?;
+        log::trace!("motion tripped; {} detections above threshold", detections.len());
         let Some(confirmed) = triggers::evaluate(detections) else {
             continue;
         };
