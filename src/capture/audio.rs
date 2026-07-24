@@ -12,8 +12,11 @@ use crate::buffer::RingBuffer;
 /// default input config, so callers need those to configure ffmpeg's mux step
 /// correctly instead of assuming a fixed rate.
 pub struct AudioStreamInfo {
+    /// The live cpal stream; must be kept alive for capture to continue.
     pub stream: Stream,
+    /// The input device's actual sample rate, needed to configure ffmpeg's mux step.
     pub sample_rate: u32,
+    /// The input device's actual channel count, needed to configure ffmpeg's mux step.
     pub channels: u16,
 }
 

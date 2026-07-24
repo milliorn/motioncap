@@ -33,14 +33,20 @@ const LIVING_THING_CLASSES: &[(usize, &str)] = &[
     (23, "giraffe"),
 ];
 
+/// `YOLOv8`'s fixed square input resolution.
 const MODEL_INPUT_SIZE: u32 = 640;
 
+/// A single YOLO detection above the confidence threshold.
 pub struct Detection {
+    /// The detected COCO class name (person or an animal, see `LIVING_THING_CLASSES`).
     pub class_name: &'static str,
+    /// The model's reported confidence for this detection.
     pub confidence: f32,
 }
 
+/// A loaded YOLO ONNX Runtime session ready to run inference.
 pub struct Detector {
+    /// The underlying ONNX Runtime inference session.
     session: Session,
 }
 

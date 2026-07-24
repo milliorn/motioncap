@@ -8,11 +8,14 @@ use opencv::video::{BackgroundSubtractorTrait, create_background_subtractor_mog2
 /// itself is only ever triggered by a subsequent confirmed YOLO
 /// classification, never by this gate alone.
 pub struct MotionGate {
+    /// The `OpenCV` MOG2 background-subtraction model.
     subtractor: opencv::core::Ptr<opencv::video::BackgroundSubtractorMOG2>,
+    /// Minimum changed-pixel ratio (0.0-1.0) for `evaluate` to report motion.
     threshold: f32,
 }
 
 impl MotionGate {
+    /// Creates a motion gate with a fresh MOG2 background model.
     pub fn new(threshold: f32) -> Result<Self> {
         let subtractor = create_background_subtractor_mog2(500, 16.0, true)
             .context("failed to create MOG2 background subtractor")?;
@@ -42,6 +45,7 @@ impl MotionGate {
     }
 }
 
+/// Fraction of `total_pixels` marked foreground in `mask`.
 fn changed_ratio(mask: &(impl MatTraitConst + ToInputArray), total_pixels: f32) -> Result<f32> {
     if total_pixels <= 0.0 {
         return Ok(0.0);
@@ -57,6 +61,7 @@ fn changed_ratio(mask: &(impl MatTraitConst + ToInputArray), total_pixels: f32) 
     Ok(ratio)
 }
 
+/// Converts an RGB image into an `OpenCV` BGR `Mat` for use with the background subtractor.
 fn rgb_image_to_mat(image: &RgbImage) -> Result<Mat> {
     let (width, height) = image.dimensions();
     let bgr: Vec<Vec3b> = image

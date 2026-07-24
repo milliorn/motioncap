@@ -14,6 +14,7 @@ pub fn check_dependencies(config: &Config) -> Result<()> {
     Ok(())
 }
 
+/// Checks that `ffmpeg` is on `PATH`, exiting with install instructions if not.
 fn check_ffmpeg() -> Result<()> {
     let found = Command::new("ffmpeg")
         .arg("-version")
@@ -37,6 +38,7 @@ fn check_ffmpeg() -> Result<()> {
     Ok(())
 }
 
+/// Checks that the configured ONNX model file exists.
 fn check_model_file(path: &Path) -> Result<()> {
     if !path.is_file() {
         bail!(

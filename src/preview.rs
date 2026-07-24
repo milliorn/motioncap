@@ -3,6 +3,7 @@ use image::RgbImage;
 use opencv::core::{Mat, Vec3b};
 use opencv::highgui;
 
+/// Title of the `OpenCV` highgui preview window.
 const WINDOW_NAME: &str = "motioncap preview";
 
 /// Opt-in live preview window (ADR: off by default). Entirely decoupled from
@@ -11,6 +12,7 @@ const WINDOW_NAME: &str = "motioncap preview";
 pub struct PreviewWindow;
 
 impl PreviewWindow {
+    /// Opens the highgui preview window.
     pub fn open() -> Result<Self> {
         highgui::named_window(WINDOW_NAME, highgui::WINDOW_AUTOSIZE)
             .context("failed to open preview window")?;
@@ -40,6 +42,7 @@ impl Drop for PreviewWindow {
     }
 }
 
+/// Converts an RGB image into an `OpenCV` BGR `Mat` for display via highgui.
 fn rgb_image_to_mat(image: &RgbImage) -> Result<Mat> {
     let (width, height) = image.dimensions();
 

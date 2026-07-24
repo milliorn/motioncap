@@ -1,12 +1,25 @@
+//! motioncap: webcam-based security motion capture. See `CLAUDE.md` and
+//! `docs/adr/` for architecture and design-decision context.
+
+/// Rolling pre-buffer of recent frames/audio (see `RingBuffer`).
 mod buffer;
+/// Camera and audio capture callbacks.
 mod capture;
+/// CLI argument parsing.
 mod config;
+/// YOLO object-detection inference.
 mod detect;
+/// Background-subtraction motion gate.
 mod motion;
+/// Output file/folder naming.
 mod paths;
+/// Opt-in live preview window.
 mod preview;
+/// Recording lifecycle and ffmpeg-backed encoding.
 mod recorder;
+/// Startup dependency checks.
 mod startup;
+/// YOLO-detection-to-trigger evaluation.
 mod triggers;
 
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -31,8 +44,11 @@ use recorder::RecordingEvent;
 /// first thing it does once it sees a pending event, then it becomes a
 /// normal actively-written event.
 struct PendingEvent {
+    /// The started recording (ffmpeg already spawned) awaiting its pre-buffer seed.
     event: RecordingEvent,
+    /// Pre-trigger frames to seed into `event` once the writer thread picks it up.
     pre_frames: Vec<TimestampedFrame>,
+    /// Pre-trigger audio to seed into `event` once the writer thread picks it up.
     pre_audio: Vec<TimestampedAudio>,
 }
 
@@ -41,16 +57,21 @@ struct PendingEvent {
 /// thread can seed it without blocking whichever thread created it; once
 /// seeded it becomes `Active` and receives normal steady-paced writes.
 enum ActiveEvent {
+    /// No recording is in progress.
     None,
+    /// ffmpeg has been spawned but the pre-event buffer hasn't been seeded yet.
     Pending(PendingEvent),
+    /// The event is seeded and receiving normal steady-paced writes.
     Active(RecordingEvent),
 }
 
 impl ActiveEvent {
+    /// Whether any recording (pending or active) is currently in progress.
     const fn is_some(&self) -> bool {
         !matches!(self, Self::None)
     }
 
+    /// The active `RecordingEvent`, if one is seeded and receiving writes.
     const fn as_recording_mut(&mut self) -> Option<&mut RecordingEvent> {
         match self {
             Self::None | Self::Pending(_) => None,
@@ -58,6 +79,7 @@ impl ActiveEvent {
         }
     }
 
+    /// Takes the in-progress recording (if any), leaving `None` behind.
     fn take(&mut self) -> Option<RecordingEvent> {
         match std::mem::replace(self, Self::None) {
             Self::None => None,
@@ -67,28 +89,35 @@ impl ActiveEvent {
     }
 }
 
-// Motion-gate + YOLO evaluation cadence. Kept separate from the recording
-// frame rate below since inference cost doesn't scale down usefully at
-// higher polling rates -- 15fps is plenty for deciding whether a subject is
-// still present.
+/// Motion-gate + YOLO evaluation cadence. Kept separate from the recording
+/// frame rate below since inference cost doesn't scale down usefully at
+/// higher polling rates -- 15fps is plenty for deciding whether a subject is
+/// still present.
 const DETECTION_FRAME_RATE: u32 = 15;
+/// Poll interval derived from `DETECTION_FRAME_RATE`.
 const DETECTION_POLL_INTERVAL: Duration = Duration::from_millis(1000 / DETECTION_FRAME_RATE as u64);
 
-// Recorded video frame rate, used by the writer thread and the video
-// encoder. Measured (via traced ring-buffer frame timestamps under real
-// running conditions -- all threads active, real RGB decode load) at ~18fps
-// average delivery for this camera, well short of the 50-65fps seen in
-// isolated capture-only testing. Polling faster than the camera actually
-// delivers just makes the writer re-write stale frames, which plays back as
-// stutter/perceived speed-up (measured ~42% duplicate frame writes at
-// 30fps vs. 0% at 15fps). 15fps is the safe ceiling until the writer tracks
-// per-frame identity to skip real duplicates.
+/// Recorded video frame rate, used by the writer thread and the video
+/// encoder. Measured (via traced ring-buffer frame timestamps under real
+/// running conditions -- all threads active, real RGB decode load) at ~18fps
+/// average delivery for this camera, well short of the 50-65fps seen in
+/// isolated capture-only testing. Polling faster than the camera actually
+/// delivers just makes the writer re-write stale frames, which plays back as
+/// stutter/perceived speed-up (measured ~42% duplicate frame writes at
+/// 30fps vs. 0% at 15fps). 15fps is the safe ceiling until the writer tracks
+/// per-frame identity to skip real duplicates.
 const RECORDING_FRAME_RATE: u32 = 15;
+/// Poll interval derived from `RECORDING_FRAME_RATE`.
 const RECORDING_POLL_INTERVAL: Duration = Duration::from_millis(1000 / RECORDING_FRAME_RATE as u64);
 
+/// Live preview window refresh rate (diagnostic only; see `preview.rs`).
 const PREVIEW_FRAME_RATE: u32 = 30;
+/// Poll interval derived from `PREVIEW_FRAME_RATE`.
 const PREVIEW_POLL_INTERVAL: Duration = Duration::from_millis(1000 / PREVIEW_FRAME_RATE as u64);
 
+/// Starts capture, the detection worker, the recording writer, and (if
+/// `--preview` is set) the preview loop, then blocks on the preview loop
+/// until shutdown.
 fn main() -> Result<()> {
     env_logger::init();
     let config = Config::parse_args();
@@ -233,6 +262,9 @@ fn run_recording_writer_loop(
     }
 }
 
+/// Displays the latest ring-buffer frame in a live preview window, if
+/// `--preview` was passed. Runs on the main thread since `OpenCV`'s highgui
+/// event loop isn't safe to drive from a background thread.
 fn run_preview_loop(
     ring_buffer: &Arc<Mutex<RingBuffer>>,
     shutdown: &Arc<AtomicBool>,
@@ -266,6 +298,10 @@ fn run_preview_loop(
     }
 }
 
+/// Polls the ring buffer at `DETECTION_FRAME_RATE`, runs the motion gate and
+/// (on trip) YOLO confirmation, and owns the recording lifecycle: starting a
+/// new `ActiveEvent::Pending` on a confirmed detection and closing it once
+/// the post-buffer quiet window elapses.
 #[allow(
     clippy::needless_pass_by_value,
     reason = "config and Arc clones are moved into a spawned 'static thread closure, so they must be owned here"

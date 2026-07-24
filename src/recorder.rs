@@ -8,15 +8,21 @@ use serde::Serialize;
 use crate::buffer::{TimestampedAudio, TimestampedFrame};
 use crate::paths::sidecar_path;
 
+/// One recorded detection, written into a clip's `.json` sidecar (ADR 4).
 #[derive(Serialize)]
 pub struct DetectionRecord {
+    /// Seconds from the start of the clip when this detection occurred.
     pub offset_secs: f64,
+    /// The detected COCO class name.
     pub class_name: String,
+    /// The model's reported confidence for this detection.
     pub confidence: f32,
 }
 
+/// A clip's `.json` sidecar contents (ADR 4).
 #[derive(Serialize)]
 pub struct Sidecar {
+    /// Every detection recorded during the clip, in chronological order.
     pub detections: Vec<DetectionRecord>,
 }
 
@@ -29,19 +35,33 @@ pub struct Sidecar {
 /// both streams up front to mux them correctly; video frames, by contrast,
 /// are streamed live via ffmpeg's stdin as they arrive.
 pub struct RecordingEvent {
+    /// The running ffmpeg process encoding video, fed live via its stdin.
     ffmpeg_video: Child,
+    /// Path to the temporary raw PCM file audio is buffered into.
     audio_tmp_path: std::path::PathBuf,
+    /// Open handle to `audio_tmp_path`, written to as audio arrives.
     audio_file: std::fs::File,
+    /// Where the finished, muxed clip is written on `finish`.
     final_clip_path: std::path::PathBuf,
+    /// Path to the temporary video-only file ffmpeg encodes into.
     video_tmp_path: std::path::PathBuf,
+    /// Sample rate of the buffered audio, needed to mux correctly.
     audio_sample_rate: u32,
+    /// Channel count of the buffered audio, needed to mux correctly.
     audio_channels: u16,
+    /// Configured video frame rate for this clip.
     frame_rate: u32,
+    /// When this event was started.
     clip_started: Instant,
+    /// When the most recent triggering detection occurred (drives the post-buffer quiet window).
     last_trigger_at: Instant,
+    /// Timestamp up to which audio has already been drained.
     last_audio_drain_at: Instant,
+    /// Timestamp up to which frames have already been drained.
     last_frame_drain_at: Instant,
+    /// The next frame-rate tick due to be written, if any.
     next_frame_due: Option<Instant>,
+    /// Every detection recorded so far during this clip.
     detections: Vec<DetectionRecord>,
 }
 
@@ -199,6 +219,8 @@ impl RecordingEvent {
     /// started, for the first call). Must be polled periodically while the
     /// event is active so live audio keeps accumulating for the clip's full
     /// duration, not just the pre-buffer window written in `start`.
+    /// Writes every audio chunk captured since the last drain (or since the
+    /// event started, for the first call) into the temp PCM file.
     pub fn drain_audio(
         &mut self,
         ring_buffer: &std::sync::Mutex<crate::buffer::RingBuffer>,
@@ -219,6 +241,7 @@ impl RecordingEvent {
         Ok(())
     }
 
+    /// Streams one raw video frame to ffmpeg's stdin.
     pub fn write_frame(&mut self, image: &image::RgbImage) -> Result<()> {
         let stdin = self
             .ffmpeg_video
@@ -232,6 +255,7 @@ impl RecordingEvent {
         Ok(())
     }
 
+    /// Appends raw PCM samples to the temp audio file.
     pub fn write_audio(&mut self, samples: &[f32]) -> Result<()> {
         let bytes: Vec<u8> = samples.iter().flat_map(|s| s.to_le_bytes()).collect();
 
@@ -241,6 +265,7 @@ impl RecordingEvent {
         Ok(())
     }
 
+    /// Records a detection into the sidecar and resets the post-buffer quiet window.
     pub fn record_detection(&mut self, class_name: &str, confidence: f32) {
         let offset_secs = self.clip_started.elapsed().as_secs_f64();
 
@@ -253,10 +278,13 @@ impl RecordingEvent {
         self.last_trigger_at = Instant::now();
     }
 
+    /// Resets the post-buffer quiet window without recording a new detection
+    /// (e.g. motion continues but wasn't re-confirmed by YOLO this tick).
     pub fn touch(&mut self) {
         self.last_trigger_at = Instant::now();
     }
 
+    /// How long it's been since the last trigger/touch.
     pub fn quiet_for(&self) -> Duration {
         self.last_trigger_at.elapsed()
     }
@@ -302,6 +330,7 @@ impl RecordingEvent {
     }
 }
 
+/// Spawns ffmpeg to encode raw RGB frames fed via stdin into an H.264 file.
 fn spawn_video_encoder(
     path: &std::path::Path,
     width: u32,

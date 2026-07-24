@@ -3,27 +3,37 @@ use std::time::{Duration, Instant};
 
 use image::RgbImage;
 
+/// A captured video frame paired with the instant it arrived.
 #[derive(Clone)]
 pub struct TimestampedFrame {
+    /// When this frame was captured.
     pub timestamp: Instant,
+    /// The captured frame's decoded pixel data.
     pub image: RgbImage,
 }
 
+/// A chunk of captured audio samples paired with the instant it arrived.
 #[derive(Clone)]
 pub struct TimestampedAudio {
+    /// When this audio chunk was captured.
     pub timestamp: Instant,
+    /// Interleaved PCM samples for this chunk.
     pub samples: Vec<f32>,
 }
 
 /// Rolling window of the last `retention` worth of frames and audio, so a
 /// recording event can be started with footage from *before* the trigger fired.
 pub struct RingBuffer {
+    /// How long a frame/audio chunk is kept before being evicted.
     retention: Duration,
+    /// Buffered video frames, oldest first.
     frames: VecDeque<TimestampedFrame>,
+    /// Buffered audio chunks, oldest first.
     audio: VecDeque<TimestampedAudio>,
 }
 
 impl RingBuffer {
+    /// Creates an empty buffer that retains up to `retention` worth of frames/audio.
     pub const fn new(retention: Duration) -> Self {
         Self {
             retention,
@@ -32,6 +42,7 @@ impl RingBuffer {
         }
     }
 
+    /// Appends a newly-captured frame, timestamped now, and evicts stale frames.
     pub fn push_frame(&mut self, image: RgbImage) {
         let now = Instant::now();
         self.frames.push_back(TimestampedFrame {
@@ -41,6 +52,7 @@ impl RingBuffer {
         self.evict_frames(now);
     }
 
+    /// Appends a newly-captured audio chunk, timestamped now, and evicts stale audio.
     pub fn push_audio(&mut self, samples: Vec<f32>) {
         let now = Instant::now();
         self.audio.push_back(TimestampedAudio {
@@ -50,6 +62,7 @@ impl RingBuffer {
         self.evict_audio(now);
     }
 
+    /// Drops frames older than `retention` relative to `now`.
     fn evict_frames(&mut self, now: Instant) {
         while let Some(front) = self.frames.front() {
             if now.duration_since(front.timestamp) > self.retention {
@@ -60,6 +73,7 @@ impl RingBuffer {
         }
     }
 
+    /// Drops audio chunks older than `retention` relative to `now`.
     fn evict_audio(&mut self, now: Instant) {
         while let Some(front) = self.audio.front() {
             if now.duration_since(front.timestamp) > self.retention {
@@ -79,6 +93,7 @@ impl RingBuffer {
         )
     }
 
+    /// The most recently pushed frame, if any.
     pub fn latest_frame(&self) -> Option<&TimestampedFrame> {
         self.frames.back()
     }
