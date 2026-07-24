@@ -20,7 +20,11 @@ impl PreviewWindow {
 
     /// Displays one frame. Must be called periodically from the main loop for
     /// the window to pump its event queue and stay responsive.
-    pub fn show(&mut self, frame: &RgbImage) -> Result<()> {
+    #[allow(
+        clippy::unused_self,
+        reason = "self ties display to the open window's RAII handle even though the call is stateless"
+    )]
+    pub fn show(&self, frame: &RgbImage) -> Result<()> {
         let mat = rgb_image_to_mat(frame)?;
 
         highgui::imshow(WINDOW_NAME, &mat).context("failed to display preview frame")?;
@@ -44,6 +48,10 @@ fn rgb_image_to_mat(image: &RgbImage) -> Result<Mat> {
         .map(|p| Vec3b::from([p[2], p[1], p[0]]))
         .collect();
 
+    #[allow(
+        clippy::cast_possible_wrap,
+        reason = "camera frame dimensions never approach i32::MAX"
+    )]
     let borrowed = Mat::new_rows_cols_with_data(height as i32, width as i32, &bgr)
         .context("failed to build Mat from frame")?;
 

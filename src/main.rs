@@ -47,22 +47,22 @@ enum ActiveEvent {
 }
 
 impl ActiveEvent {
-    fn is_some(&self) -> bool {
-        !matches!(self, ActiveEvent::None)
+    const fn is_some(&self) -> bool {
+        !matches!(self, Self::None)
     }
 
-    fn as_recording_mut(&mut self) -> Option<&mut RecordingEvent> {
+    const fn as_recording_mut(&mut self) -> Option<&mut RecordingEvent> {
         match self {
-            ActiveEvent::None | ActiveEvent::Pending(_) => None,
-            ActiveEvent::Active(event) => Some(event),
+            Self::None | Self::Pending(_) => None,
+            Self::Active(event) => Some(event),
         }
     }
 
     fn take(&mut self) -> Option<RecordingEvent> {
-        match std::mem::replace(self, ActiveEvent::None) {
-            ActiveEvent::None => None,
-            ActiveEvent::Pending(pending) => Some(pending.event),
-            ActiveEvent::Active(event) => Some(event),
+        match std::mem::replace(self, Self::None) {
+            Self::None => None,
+            Self::Pending(pending) => Some(pending.event),
+            Self::Active(event) => Some(event),
         }
     }
 }
@@ -95,7 +95,7 @@ fn main() -> Result<()> {
 
     startup::check_dependencies(&config)?;
 
-    let pre_buffer = Duration::from_secs(config.pre_buffer_secs as u64);
+    let pre_buffer = Duration::from_secs(u64::from(config.pre_buffer_secs));
     let ring_buffer = Arc::new(Mutex::new(RingBuffer::new(pre_buffer)));
 
     let _camera = capture::camera::start_camera_capture(
@@ -175,6 +175,14 @@ fn main() -> Result<()> {
 /// independent of how long motion-gate/YOLO evaluation takes in the
 /// detection loop. This is what keeps recorded clips at a uniform frame
 /// rate even while YOLO inference is running on the same tick elsewhere.
+#[allow(
+    clippy::needless_pass_by_value,
+    reason = "Arc clones are moved into a spawned 'static thread closure, so they must be owned here"
+)]
+#[allow(
+    clippy::significant_drop_tightening,
+    reason = "guard must stay held across seed/drain so shutdown's take() can't race an in-flight event"
+)]
 fn run_recording_writer_loop(
     ring_buffer: Arc<Mutex<RingBuffer>>,
     active_event: Arc<Mutex<ActiveEvent>>,
@@ -187,6 +195,13 @@ fn run_recording_writer_loop(
 
         thread::sleep(RECORDING_POLL_INTERVAL);
 
+        // The lock is deliberately held across the seed/drain calls below,
+        // not just the state-swap: `active_event` must reflect "a recording
+        // is in flight" continuously for the detection loop's shutdown path
+        // (which calls `take()` and finishes the event) and its `is_some()`
+        // check to observe consistent state. Releasing it mid-drain would
+        // open a window where a concurrent shutdown fails to finalize the
+        // in-flight clip.
         let mut guard = active_event.lock().expect("active event lock poisoned");
 
         let taken = std::mem::replace(&mut *guard, ActiveEvent::None);
@@ -251,6 +266,10 @@ fn run_preview_loop(
     }
 }
 
+#[allow(
+    clippy::needless_pass_by_value,
+    reason = "config and Arc clones are moved into a spawned 'static thread closure, so they must be owned here"
+)]
 fn run_detection_loop(
     config: Config,
     ring_buffer: Arc<Mutex<RingBuffer>>,
@@ -259,7 +278,7 @@ fn run_detection_loop(
     audio_sample_rate: u32,
     audio_channels: u16,
 ) -> Result<()> {
-    let post_buffer = Duration::from_secs(config.post_buffer_secs as u64);
+    let post_buffer = Duration::from_secs(u64::from(config.post_buffer_secs));
 
     let mut motion_gate = MotionGate::new(config.motion_threshold)?;
     let mut detector = Detector::load(config.model_path(), config.force_cpu)?;
@@ -389,7 +408,7 @@ fn run_detection_loop(
             event.record_detection(d.class_name, d.confidence);
         }
 
-        log::info!("recording started: {:?}", classes);
+        log::info!("recording started: {classes:?}");
 
         *active_event.lock().expect("active event lock poisoned") =
             ActiveEvent::Pending(PendingEvent {

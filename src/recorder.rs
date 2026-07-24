@@ -128,7 +128,8 @@ impl RecordingEvent {
         }
 
         if let Some(last) = selected.last() {
-            let tick = Duration::from_secs_f64(1.0 / frame_rate as f64);
+            let tick = Duration::from_secs_f64(1.0 / f64::from(frame_rate));
+            
             self.last_frame_drain_at = last.timestamp;
             self.next_frame_due = Some(last.timestamp + tick);
         }
@@ -167,7 +168,7 @@ impl RecordingEvent {
             self.last_frame_drain_at = last.timestamp;
         }
 
-        let tick = Duration::from_secs_f64(1.0 / self.frame_rate as f64);
+        let tick = Duration::from_secs_f64(1.0 / f64::from(self.frame_rate));
         let mut next_due = self.next_frame_due;
 
         for frame in &new_frames {
@@ -385,7 +386,7 @@ fn resample_to_frame_rate(frames: &[TimestampedFrame], frame_rate: u32) -> Vec<&
         return frames.iter().collect();
     }
 
-    let tick = Duration::from_secs_f64(1.0 / frame_rate as f64);
+    let tick = Duration::from_secs_f64(1.0 / f64::from(frame_rate));
     let mut selected = Vec::new();
     let mut next_due = first.timestamp;
 

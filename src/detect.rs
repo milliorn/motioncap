@@ -46,7 +46,7 @@ pub struct Detector {
 
 impl Detector {
     /// Loads the YOLO ONNX model, registering execution providers in priority
-    /// order CUDA -> ROCm -> OpenVINO -> CPU (ADR 3). `ort` probes availability
+    /// order CUDA -> `ROCm` -> `OpenVINO` -> CPU (ADR 3). `ort` probes availability
     /// per-provider and falls through automatically, so this works unmodified
     /// on hardware with any subset of these accelerators, or none at all.
     pub fn load(model_path: &Path, force_cpu: bool) -> Result<Self> {
@@ -54,6 +54,7 @@ impl Detector {
             Session::builder(),
             "failed to create ONNX Runtime session builder",
         )?;
+
         let mut builder = ort_err(
             builder.with_optimization_level(GraphOptimizationLevel::Level3),
             "failed to set optimization level",
@@ -115,15 +116,29 @@ impl Detector {
 
 /// Letterboxes the frame into a square canvas (preserving aspect ratio, padding
 /// with grey) and converts to an NCHW f32 tensor normalized to [0, 1] -- the
-/// standard YOLOv8 preprocessing. A naive stretch-to-square resize distorts
+/// standard `YOLOv8` preprocessing. A naive stretch-to-square resize distorts
 /// non-square camera frames (e.g. this webcam's 640x480) enough to
 /// meaningfully degrade detection confidence, since the model is trained on
 /// letterboxed inputs, not stretched ones.
+#[allow(
+    clippy::cast_precision_loss,
+    reason = "camera frame dimensions never approach f32's 24-bit exact-integer range"
+)]
 fn preprocess(frame: &RgbImage) -> Array4<f32> {
     let (src_w, src_h) = frame.dimensions();
     let scale =
         (MODEL_INPUT_SIZE as f32 / src_w as f32).min(MODEL_INPUT_SIZE as f32 / src_h as f32);
+    #[allow(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        reason = "scale is derived from MODEL_INPUT_SIZE / src_dim, so result stays within [0, MODEL_INPUT_SIZE]"
+    )]
     let new_w = (src_w as f32 * scale).round() as u32;
+    #[allow(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        reason = "scale is derived from MODEL_INPUT_SIZE / src_dim, so result stays within [0, MODEL_INPUT_SIZE]"
+    )]
     let new_h = (src_h as f32 * scale).round() as u32;
 
     let resized = image::imageops::resize(frame, new_w, new_h, FilterType::Triangle);
@@ -137,23 +152,30 @@ fn preprocess(frame: &RgbImage) -> Array4<f32> {
     );
     for (x, y, pixel) in resized.enumerate_pixels() {
         let (dst_x, dst_y) = ((x + pad_x) as usize, (y + pad_y) as usize);
-        tensor[[0, 0, dst_y, dst_x]] = pixel[0] as f32 / 255.0;
-        tensor[[0, 1, dst_y, dst_x]] = pixel[1] as f32 / 255.0;
-        tensor[[0, 2, dst_y, dst_x]] = pixel[2] as f32 / 255.0;
+        tensor[[0, 0, dst_y, dst_x]] = f32::from(pixel[0]) / 255.0;
+        tensor[[0, 1, dst_y, dst_x]] = f32::from(pixel[1]) / 255.0;
+        tensor[[0, 2, dst_y, dst_x]] = f32::from(pixel[2]) / 255.0;
     }
     tensor
 }
 
-/// Parses YOLOv8's standard `[1, 84, 8400]` output (4 box coords + 80 class
+/// Parses `YOLOv8`'s standard `[1, 84, 8400]` output (4 box coords + 80 class
 /// scores, per anchor) and filters to living-thing classes above threshold.
 /// No NMS/box deduplication is performed since only class presence (not
 /// precise box geometry) is needed to decide whether to trigger a recording.
 fn postprocess(shape: &Shape, data: &[f32], confidence_threshold: f32) -> Vec<Detection> {
+    #[allow(
+        clippy::cast_possible_truncation,
+        clippy::cast_sign_loss,
+        reason = "ONNX tensor dims are always small positive values (e.g. 1, 84, 8400)"
+    )]
     let dims: Vec<usize> = shape.iter().map(|&d| d as usize).collect();
+
     if dims.len() != 3 || dims[1] != 84 {
         log::warn!("unexpected YOLO output shape: {dims:?}");
         return Vec::new();
     }
+    
     let num_anchors = dims[2];
 
     let view = ndarray::ArrayView2::from_shape((84, num_anchors), data)

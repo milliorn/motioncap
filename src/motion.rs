@@ -32,6 +32,10 @@ impl MotionGate {
             .apply(&mat, &mut fgmask, -1.0)
             .context("background subtraction apply failed")?;
 
+        #[allow(
+            clippy::cast_precision_loss,
+            reason = "camera frame dimensions never approach f32's 24-bit exact-integer range"
+        )]
         let total_pixels = (frame.width() * frame.height()) as f32;
         Ok(changed_ratio(&fgmask, total_pixels)? > self.threshold)
     }
@@ -41,8 +45,15 @@ fn changed_ratio(mask: &(impl MatTraitConst + ToInputArray), total_pixels: f32) 
     if total_pixels <= 0.0 {
         return Ok(0.0);
     }
+
     let nonzero = opencv::core::count_non_zero(mask).context("count_non_zero failed")?;
-    Ok(nonzero as f32 / total_pixels)
+    
+    #[allow(
+        clippy::cast_precision_loss,
+        reason = "nonzero pixel count never approaches f32's 24-bit exact-integer range"
+    )]
+    let ratio = nonzero as f32 / total_pixels;
+    Ok(ratio)
 }
 
 fn rgb_image_to_mat(image: &RgbImage) -> Result<Mat> {
@@ -51,6 +62,10 @@ fn rgb_image_to_mat(image: &RgbImage) -> Result<Mat> {
         .pixels()
         .map(|p| Vec3b::from([p[2], p[1], p[0]]))
         .collect();
+    #[allow(
+        clippy::cast_possible_wrap,
+        reason = "camera frame dimensions never approach i32::MAX"
+    )]
     let borrowed = Mat::new_rows_cols_with_data(height as i32, width as i32, &bgr)
         .context("failed to build Mat from frame")?;
     borrowed.try_clone().context("failed to clone frame Mat")

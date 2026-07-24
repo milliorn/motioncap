@@ -24,7 +24,7 @@ pub struct RingBuffer {
 }
 
 impl RingBuffer {
-    pub fn new(retention: Duration) -> Self {
+    pub const fn new(retention: Duration) -> Self {
         Self {
             retention,
             frames: VecDeque::new(),
