@@ -2,6 +2,12 @@
 name = "motioncap"
 version = "0.1.0"
 edition = "2024"
+description = "Webcam-based security motion-capture tool with motion detection, YOLO confirmation, and H.264+AAC recording"
+license = "MIT"
+repository = "https://github.com/milliorn/motioncap"
+readme = "README.md"
+keywords = ["security", "surveillance", "motion-detection", "camera", "yolo"]
+categories = ["multimedia::video", "computer-vision"]
 
 [dependencies]
 anyhow = "1.0.104"
