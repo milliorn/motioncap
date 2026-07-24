@@ -129,9 +129,14 @@ impl RecordingEvent {
 
         if let Some(last) = selected.last() {
             let tick = Duration::from_secs_f64(1.0 / f64::from(frame_rate));
-            
+
             self.last_frame_drain_at = last.timestamp;
-            self.next_frame_due = Some(last.timestamp + tick);
+            #[allow(
+                clippy::arithmetic_side_effects,
+                reason = "Instant + a sub-second Duration only overflows after ~584 billion years of process uptime"
+            )]
+            let next_due = last.timestamp + tick;
+            self.next_frame_due = Some(next_due);
         }
 
         for chunk in pre_audio {
@@ -176,7 +181,12 @@ impl RecordingEvent {
 
             if frame.timestamp >= due {
                 self.write_frame(&frame.image)?;
-                next_due = Some(due + tick);
+                #[allow(
+                    clippy::arithmetic_side_effects,
+                    reason = "Instant + a sub-second Duration only overflows after ~584 billion years of process uptime"
+                )]
+                let new_due = due + tick;
+                next_due = Some(new_due);
             }
         }
 
@@ -393,7 +403,13 @@ fn resample_to_frame_rate(frames: &[TimestampedFrame], frame_rate: u32) -> Vec<&
     for frame in frames {
         if frame.timestamp >= next_due {
             selected.push(frame);
-            next_due += tick;
+            #[allow(
+                clippy::arithmetic_side_effects,
+                reason = "Instant += a sub-second Duration only overflows after ~584 billion years of process uptime"
+            )]
+            {
+                next_due += tick;
+            }
         }
     }
 

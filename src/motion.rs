@@ -34,7 +34,8 @@ impl MotionGate {
 
         #[allow(
             clippy::cast_precision_loss,
-            reason = "camera frame dimensions never approach f32's 24-bit exact-integer range"
+            clippy::arithmetic_side_effects,
+            reason = "camera frame dimensions never approach u32::MAX / f32's 24-bit exact-integer range"
         )]
         let total_pixels = (frame.width() * frame.height()) as f32;
         Ok(changed_ratio(&fgmask, total_pixels)? > self.threshold)
@@ -47,7 +48,7 @@ fn changed_ratio(mask: &(impl MatTraitConst + ToInputArray), total_pixels: f32) 
     }
 
     let nonzero = opencv::core::count_non_zero(mask).context("count_non_zero failed")?;
-    
+
     #[allow(
         clippy::cast_precision_loss,
         reason = "nonzero pixel count never approaches f32's 24-bit exact-integer range"

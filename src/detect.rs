@@ -143,7 +143,20 @@ fn preprocess(frame: &RgbImage) -> Array4<f32> {
 
     let resized = image::imageops::resize(frame, new_w, new_h, FilterType::Triangle);
 
+    // new_w/new_h <= MODEL_INPUT_SIZE always holds: scale = min(SIZE/src_w,
+    // SIZE/src_h) <= 1.0, so new_w = round(src_w * scale) <= SIZE (likewise
+    // new_h). The subtraction and the pad_x/pad_y additions below therefore
+    // never overflow, and the resulting tensor index is always < SIZE,
+    // matching tensor's allocated shape.
+    #[allow(
+        clippy::arithmetic_side_effects,
+        reason = "new_w/new_h <= MODEL_INPUT_SIZE, proven above"
+    )]
     let pad_x = (MODEL_INPUT_SIZE - new_w) / 2;
+    #[allow(
+        clippy::arithmetic_side_effects,
+        reason = "new_w/new_h <= MODEL_INPUT_SIZE, proven above"
+    )]
     let pad_y = (MODEL_INPUT_SIZE - new_h) / 2;
 
     let mut tensor = Array4::<f32>::from_elem(
@@ -151,10 +164,25 @@ fn preprocess(frame: &RgbImage) -> Array4<f32> {
         114.0 / 255.0,
     );
     for (x, y, pixel) in resized.enumerate_pixels() {
-        let (dst_x, dst_y) = ((x + pad_x) as usize, (y + pad_y) as usize);
-        tensor[[0, 0, dst_y, dst_x]] = f32::from(pixel[0]) / 255.0;
-        tensor[[0, 1, dst_y, dst_x]] = f32::from(pixel[1]) / 255.0;
-        tensor[[0, 2, dst_y, dst_x]] = f32::from(pixel[2]) / 255.0;
+        #[allow(
+            clippy::arithmetic_side_effects,
+            reason = "x < new_w and pad_x + new_w <= MODEL_INPUT_SIZE, so x + pad_x never overflows"
+        )]
+        let dst_x = (x + pad_x) as usize;
+        #[allow(
+            clippy::arithmetic_side_effects,
+            reason = "y < new_h and pad_y + new_h <= MODEL_INPUT_SIZE, so y + pad_y never overflows"
+        )]
+        let dst_y = (y + pad_y) as usize;
+        #[allow(
+            clippy::indexing_slicing,
+            reason = "dst_x, dst_y < MODEL_INPUT_SIZE, matching tensor's allocated shape"
+        )]
+        {
+            tensor[[0, 0, dst_y, dst_x]] = f32::from(pixel[0]) / 255.0;
+            tensor[[0, 1, dst_y, dst_x]] = f32::from(pixel[1]) / 255.0;
+            tensor[[0, 2, dst_y, dst_x]] = f32::from(pixel[2]) / 255.0;
+        }
     }
     tensor
 }
@@ -171,12 +199,14 @@ fn postprocess(shape: &Shape, data: &[f32], confidence_threshold: f32) -> Vec<De
     )]
     let dims: Vec<usize> = shape.iter().map(|&d| d as usize).collect();
 
-    if dims.len() != 3 || dims[1] != 84 {
+    let [_, class_dim, num_anchors] = dims[..] else {
+        log::warn!("unexpected YOLO output shape: {dims:?}");
+        return Vec::new();
+    };
+    if class_dim != 84 {
         log::warn!("unexpected YOLO output shape: {dims:?}");
         return Vec::new();
     }
-    
-    let num_anchors = dims[2];
 
     let view = ndarray::ArrayView2::from_shape((84, num_anchors), data)
         .expect("output tensor size should match its own reported shape");
