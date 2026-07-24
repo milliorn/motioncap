@@ -16,13 +16,56 @@ use std::time::Duration;
 
 use anyhow::{Context, Result};
 
-use buffer::RingBuffer;
+use buffer::{RingBuffer, TimestampedAudio, TimestampedFrame};
 use config::Config;
 use detect::Detector;
 use motion::MotionGate;
 use paths::clip_path;
 use preview::PreviewWindow;
 use recorder::RecordingEvent;
+
+/// An event that's been started (ffmpeg spawned) but whose pre-event buffer
+/// hasn't been written yet. Kept separate from `RecordingEvent` construction
+/// (see `RecordingEvent::start`'s docs) so the detection loop never blocks on
+/// writing dozens of pre-buffer frames -- the writer thread seeds it as the
+/// first thing it does once it sees a pending event, then it becomes a
+/// normal actively-written event.
+struct PendingEvent {
+    event: RecordingEvent,
+    pre_frames: Vec<TimestampedFrame>,
+    pre_audio: Vec<TimestampedAudio>,
+}
+
+/// Shared state for the currently in-progress recording, if any. Starts as
+/// `Pending` (ffmpeg spawned, pre-buffer not yet written) so the writer
+/// thread can seed it without blocking whichever thread created it; once
+/// seeded it becomes `Active` and receives normal steady-paced writes.
+enum ActiveEvent {
+    None,
+    Pending(PendingEvent),
+    Active(RecordingEvent),
+}
+
+impl ActiveEvent {
+    fn is_some(&self) -> bool {
+        !matches!(self, ActiveEvent::None)
+    }
+
+    fn as_recording_mut(&mut self) -> Option<&mut RecordingEvent> {
+        match self {
+            ActiveEvent::None | ActiveEvent::Pending(_) => None,
+            ActiveEvent::Active(event) => Some(event),
+        }
+    }
+
+    fn take(&mut self) -> Option<RecordingEvent> {
+        match std::mem::replace(self, ActiveEvent::None) {
+            ActiveEvent::None => None,
+            ActiveEvent::Pending(pending) => Some(pending.event),
+            ActiveEvent::Active(event) => Some(event),
+        }
+    }
+}
 
 const DETECTION_FRAME_RATE: u32 = 15;
 const DETECTION_POLL_INTERVAL: Duration = Duration::from_millis(1000 / DETECTION_FRAME_RATE as u64);
@@ -69,7 +112,7 @@ fn main() -> Result<()> {
     // irregular, stretched-out intervals while ffmpeg's fixed `-framerate`
     // assumes uniform spacing, which plays back as a stutter in the
     // recorded clip.
-    let active_event: Arc<Mutex<Option<RecordingEvent>>> = Arc::new(Mutex::new(None));
+    let active_event: Arc<Mutex<ActiveEvent>> = Arc::new(Mutex::new(ActiveEvent::None));
 
     // Motion detection, YOLO confirmation, and the recording lifecycle run on
     // a dedicated worker thread at their own (much slower) pace, since YOLO
@@ -107,6 +150,7 @@ fn main() -> Result<()> {
 
     worker_handle.join().expect("detection worker panicked");
     writer_handle.join().expect("recording writer panicked");
+
     Ok(())
 }
 
@@ -116,7 +160,7 @@ fn main() -> Result<()> {
 /// rate even while YOLO inference is running on the same tick elsewhere.
 fn run_recording_writer_loop(
     ring_buffer: Arc<Mutex<RingBuffer>>,
-    active_event: Arc<Mutex<Option<RecordingEvent>>>,
+    active_event: Arc<Mutex<ActiveEvent>>,
     shutdown: Arc<AtomicBool>,
 ) {
     loop {
@@ -131,19 +175,31 @@ fn run_recording_writer_loop(
             buf.latest_frame().map(|f| f.image.clone())
         };
 
+        let mut guard = active_event.lock().expect("active event lock poisoned");
+
+        if let ActiveEvent::Pending(_) = &*guard {
+            let ActiveEvent::Pending(mut pending) = std::mem::replace(&mut *guard, ActiveEvent::None) else {
+                unreachable!("just matched Pending above");
+            };
+
+            if let Err(err) = pending.event.seed(&pending.pre_frames, &pending.pre_audio, DETECTION_FRAME_RATE) {
+                log::error!("failed to seed pre-buffer into new recording: {err:?}");
+            }
+
+            *guard = ActiveEvent::Active(pending.event);
+        }
+
         let Some(frame) = latest_frame else {
             continue;
         };
 
-        let mut guard = active_event.lock().expect("active event lock poisoned");
-        let Some(event) = guard.as_mut() else {
+        let Some(event) = guard.as_recording_mut() else {
             continue;
         };
 
         if let Err(err) = event.write_frame(&frame) {
             log::error!("failed to write frame to active recording: {err:?}");
         }
-        
         if let Err(err) = event.drain_audio(&ring_buffer) {
             log::error!("failed to drain audio into active recording: {err:?}");
         }
@@ -187,7 +243,7 @@ fn run_detection_loop(
     config: Config,
     ring_buffer: Arc<Mutex<RingBuffer>>,
     shutdown: Arc<AtomicBool>,
-    active_event: Arc<Mutex<Option<RecordingEvent>>>,
+    active_event: Arc<Mutex<ActiveEvent>>,
     audio_sample_rate: u32,
     audio_channels: u16,
 ) -> Result<()> {
@@ -199,10 +255,12 @@ fn run_detection_loop(
     loop {
         if shutdown.load(Ordering::SeqCst) {
             let event = active_event.lock().expect("active event lock poisoned").take();
+
             if let Some(event) = event {
                 event.finish()?;
                 log::info!("recording closed on shutdown");
             }
+            
             return Ok(());
         }
 
@@ -234,9 +292,10 @@ fn run_detection_loop(
             };
 
             let mut guard = active_event.lock().expect("active event lock poisoned");
-            let Some(event) = guard.as_mut() else {
+            let Some(event) = guard.as_recording_mut() else {
                 // Recording was closed elsewhere (e.g. shutdown) while
-                // inference was running above.
+                // inference was running above, or the writer thread hasn't
+                // finished seeding it yet.
                 continue;
             };
 
@@ -288,11 +347,18 @@ fn run_detection_loop(
             buf.snapshot()
         };
 
+        let Some((width, height)) = pre_frames.first().map(|f| f.image.dimensions()) else {
+            // No buffered frames yet (e.g. trigger fired immediately at
+            // startup, before the camera has produced anything); skip this
+            // trigger rather than starting a recording with no video.
+            continue;
+        };
+
         let path = clip_path(&config.output_dir, chrono::Local::now(), &classes)?;
         let mut event = RecordingEvent::start(
             path,
-            pre_frames,
-            pre_audio,
+            width,
+            height,
             DETECTION_FRAME_RATE,
             audio_sample_rate,
             audio_channels,
@@ -304,6 +370,10 @@ fn run_detection_loop(
 
         log::info!("recording started: {:?}", classes);
 
-        *active_event.lock().expect("active event lock poisoned") = Some(event);
+        *active_event.lock().expect("active event lock poisoned") = ActiveEvent::Pending(PendingEvent {
+            event,
+            pre_frames,
+            pre_audio,
+        });
     }
 }

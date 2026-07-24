@@ -44,35 +44,31 @@ pub struct RecordingEvent {
 
 impl RecordingEvent {
     /// Starts a new event: launches the video-encoding ffmpeg process and
-    /// immediately writes the pre-buffered frames/audio captured before the
-    /// trigger fired. `final_clip_path` should already reflect the trigger's
-    /// classes/timestamp per the output layout convention (ADR 4); this
-    /// module only performs the actual encoding/muxing, not path naming.
+    /// creates the temp audio file. `final_clip_path` should already reflect
+    /// the trigger's classes/timestamp per the output layout convention
+    /// (ADR 4); this module only performs the actual encoding/muxing, not
+    /// path naming.
     ///
     /// `audio_sample_rate`/`audio_channels` must match whatever format the
     /// caller's audio samples were captured/converted to (see
     /// `capture::audio::AudioStreamInfo`), since the mux step needs the real
     /// values to interpret the buffered PCM correctly.
     ///
-    /// The ring buffer accumulates frames at the camera's native capture
-    /// rate, which may be higher than `frame_rate` (the rate the video
-    /// encoder is configured for). Pre-buffered frames are resampled down to
-    /// `frame_rate` using their timestamps before writing, so the pre-buffer
-    /// portion of the clip plays back at the correct real-time duration
-    /// instead of being stretched by writing every captured frame 1:1.
+    /// Deliberately does *not* write the pre-buffer here -- see `seed`.
+    /// Writing dozens of frames synchronously on the caller's thread would
+    /// block it for long enough that real wall-clock time passes with
+    /// nothing being recorded, which shows up as a skip/jump right at the
+    /// start of the clip once live writing resumes. Callers should invoke
+    /// `seed` from whatever thread is responsible for steady-paced frame
+    /// writing instead.
     pub fn start(
         final_clip_path: std::path::PathBuf,
-        pre_frames: Vec<TimestampedFrame>,
-        pre_audio: Vec<TimestampedAudio>,
+        width: u32,
+        height: u32,
         frame_rate: u32,
         audio_sample_rate: u32,
         audio_channels: u16,
     ) -> Result<Self> {
-        let (width, height) = pre_frames
-            .first()
-            .map(|f| f.image.dimensions())
-            .context("cannot start a recording with no buffered frames")?;
-
         let video_tmp_path = final_clip_path.with_extension("video.tmp.mp4");
         let audio_tmp_path = final_clip_path.with_extension("audio.tmp.pcm");
 
@@ -80,9 +76,9 @@ impl RecordingEvent {
         let audio_file = std::fs::File::create(&audio_tmp_path)
             .with_context(|| format!("failed to create temp audio file {}", audio_tmp_path.display()))?;
 
-        let last_audio_timestamp = pre_audio.last().map(|chunk| chunk.timestamp);
+        let now = Instant::now();
 
-        let mut event = Self {
+        Ok(Self {
             ffmpeg_video,
             audio_tmp_path,
             audio_file,
@@ -90,21 +86,44 @@ impl RecordingEvent {
             video_tmp_path,
             audio_sample_rate,
             audio_channels,
-            clip_started: Instant::now(),
-            last_trigger_at: Instant::now(),
-            last_audio_drain_at: last_audio_timestamp.unwrap_or_else(Instant::now),
+            clip_started: now,
+            last_trigger_at: now,
+            last_audio_drain_at: now,
             detections: Vec::new(),
-        };
+        })
+    }
 
-        for frame in resample_to_frame_rate(&pre_frames, frame_rate) {
-            event.write_frame(&frame.image)?;
+    /// Writes the pre-event buffer (frames captured before the trigger
+    /// fired) into a freshly-started event. Must be called once, as the
+    /// first write against a new event, before any live `write_frame`/
+    /// `drain_audio` calls -- see the note on `start` for why this is
+    /// separate from event construction.
+    ///
+    /// The ring buffer accumulates frames at the camera's native capture
+    /// rate, which may be higher than `frame_rate` (the rate the video
+    /// encoder is configured for). Pre-buffered frames are resampled down to
+    /// `frame_rate` using their timestamps before writing, so the pre-buffer
+    /// portion of the clip plays back at the correct real-time duration
+    /// instead of being stretched by writing every captured frame 1:1.
+    pub fn seed(
+        &mut self,
+        pre_frames: &[TimestampedFrame],
+        pre_audio: &[TimestampedAudio],
+        frame_rate: u32,
+    ) -> Result<()> {
+        for frame in resample_to_frame_rate(pre_frames, frame_rate) {
+            self.write_frame(&frame.image)?;
         }
 
-        for chunk in &pre_audio {
-            event.write_audio(&chunk.samples)?;
+        for chunk in pre_audio {
+            self.write_audio(&chunk.samples)?;
         }
 
-        Ok(event)
+        if let Some(last) = pre_audio.last() {
+            self.last_audio_drain_at = last.timestamp;
+        }
+
+        Ok(())
     }
 
     /// Writes any audio captured since the last drain (or since the event
