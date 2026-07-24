@@ -14,7 +14,7 @@ impl PreviewWindow {
     pub fn open() -> Result<Self> {
         highgui::named_window(WINDOW_NAME, highgui::WINDOW_AUTOSIZE)
             .context("failed to open preview window")?;
-        
+
         Ok(Self)
     }
 

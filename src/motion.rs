@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
 use image::RgbImage;
 use opencv::core::{Mat, MatTraitConst, ToInputArray, Vec3b};
-use opencv::video::{create_background_subtractor_mog2, BackgroundSubtractorTrait};
+use opencv::video::{BackgroundSubtractorTrait, create_background_subtractor_mog2};
 
 /// Background-subtraction motion gate (ADR 2). Its only job is deciding
 /// whether whole-frame motion exceeded the configured threshold; recording

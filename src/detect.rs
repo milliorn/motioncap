@@ -2,11 +2,13 @@ use std::fmt::Debug;
 use std::path::Path;
 
 use anyhow::{Context, Result};
-use image::{imageops::FilterType, RgbImage};
-use ndarray::{s, Array4};
-use ort::ep::{CPUExecutionProvider, CUDAExecutionProvider, OpenVINOExecutionProvider, ROCmExecutionProvider};
-use ort::session::builder::GraphOptimizationLevel;
+use image::{RgbImage, imageops::FilterType};
+use ndarray::{Array4, s};
+use ort::ep::{
+    CPUExecutionProvider, CUDAExecutionProvider, OpenVINOExecutionProvider, ROCmExecutionProvider,
+};
 use ort::session::Session;
+use ort::session::builder::GraphOptimizationLevel;
 use ort::value::{Shape, Tensor};
 
 /// `ort::Error` doesn't implement `std::error::Error` in a way `anyhow::Context`
@@ -48,7 +50,10 @@ impl Detector {
     /// per-provider and falls through automatically, so this works unmodified
     /// on hardware with any subset of these accelerators, or none at all.
     pub fn load(model_path: &Path, force_cpu: bool) -> Result<Self> {
-        let builder = ort_err(Session::builder(), "failed to create ONNX Runtime session builder")?;
+        let builder = ort_err(
+            Session::builder(),
+            "failed to create ONNX Runtime session builder",
+        )?;
         let mut builder = ort_err(
             builder.with_optimization_level(GraphOptimizationLevel::Level3),
             "failed to set optimization level",
@@ -82,7 +87,11 @@ impl Detector {
     /// Runs YOLO inference on a frame and returns every detected instance of
     /// a living-thing class (person or COCO animal, see `LIVING_THING_CLASSES`)
     /// above `confidence_threshold`.
-    pub fn detect(&mut self, frame: &RgbImage, confidence_threshold: f32) -> Result<Vec<Detection>> {
+    pub fn detect(
+        &mut self,
+        frame: &RgbImage,
+        confidence_threshold: f32,
+    ) -> Result<Vec<Detection>> {
         let input = preprocess(frame);
         let input_value = ort_err(Tensor::from_array(input), "failed to build input tensor")?;
 
@@ -112,7 +121,8 @@ impl Detector {
 /// letterboxed inputs, not stretched ones.
 fn preprocess(frame: &RgbImage) -> Array4<f32> {
     let (src_w, src_h) = frame.dimensions();
-    let scale = (MODEL_INPUT_SIZE as f32 / src_w as f32).min(MODEL_INPUT_SIZE as f32 / src_h as f32);
+    let scale =
+        (MODEL_INPUT_SIZE as f32 / src_w as f32).min(MODEL_INPUT_SIZE as f32 / src_h as f32);
     let new_w = (src_w as f32 * scale).round() as u32;
     let new_h = (src_h as f32 * scale).round() as u32;
 
@@ -149,7 +159,8 @@ fn postprocess(shape: &Shape, data: &[f32], confidence_threshold: f32) -> Vec<De
     let view = ndarray::ArrayView2::from_shape((84, num_anchors), data)
         .expect("output tensor size should match its own reported shape");
 
-    let mut best_per_class: std::collections::HashMap<usize, f32> = std::collections::HashMap::new();
+    let mut best_per_class: std::collections::HashMap<usize, f32> =
+        std::collections::HashMap::new();
 
     for anchor in 0..num_anchors {
         let scores = view.slice(s![4..84, anchor]);

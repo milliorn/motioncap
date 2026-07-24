@@ -2,7 +2,7 @@ use std::io::Write;
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use serde::Serialize;
 
 use crate::buffer::{TimestampedAudio, TimestampedFrame};
@@ -76,8 +76,12 @@ impl RecordingEvent {
         let audio_tmp_path = final_clip_path.with_extension("audio.tmp.pcm");
 
         let ffmpeg_video = spawn_video_encoder(&video_tmp_path, width, height, frame_rate)?;
-        let audio_file = std::fs::File::create(&audio_tmp_path)
-            .with_context(|| format!("failed to create temp audio file {}", audio_tmp_path.display()))?;
+        let audio_file = std::fs::File::create(&audio_tmp_path).with_context(|| {
+            format!(
+                "failed to create temp audio file {}",
+                audio_tmp_path.display()
+            )
+        })?;
 
         let now = Instant::now();
 
@@ -150,7 +154,10 @@ impl RecordingEvent {
     /// reading only the latest frame each poll silently skips over whatever
     /// arrived and was superseded in between, which produces a visible jump
     /// in the subject's position despite otherwise-correct frame timing.
-    pub fn drain_frames(&mut self, ring_buffer: &std::sync::Mutex<crate::buffer::RingBuffer>) -> Result<()> {
+    pub fn drain_frames(
+        &mut self,
+        ring_buffer: &std::sync::Mutex<crate::buffer::RingBuffer>,
+    ) -> Result<()> {
         let new_frames = {
             let buf = ring_buffer.lock().expect("ring buffer lock poisoned");
             buf.frames_since(self.last_frame_drain_at)
@@ -165,7 +172,7 @@ impl RecordingEvent {
 
         for frame in &new_frames {
             let due = next_due.unwrap_or(frame.timestamp);
-            
+
             if frame.timestamp >= due {
                 self.write_frame(&frame.image)?;
                 next_due = Some(due + tick);
@@ -181,7 +188,10 @@ impl RecordingEvent {
     /// started, for the first call). Must be polled periodically while the
     /// event is active so live audio keeps accumulating for the clip's full
     /// duration, not just the pre-buffer window written in `start`.
-    pub fn drain_audio(&mut self, ring_buffer: &std::sync::Mutex<crate::buffer::RingBuffer>) -> Result<()> {
+    pub fn drain_audio(
+        &mut self,
+        ring_buffer: &std::sync::Mutex<crate::buffer::RingBuffer>,
+    ) -> Result<()> {
         let new_chunks = {
             let buf = ring_buffer.lock().expect("ring buffer lock poisoned");
             buf.audio_since(self.last_audio_drain_at)
@@ -245,8 +255,11 @@ impl RecordingEvent {
     pub fn finish(mut self) -> Result<()> {
         drop(self.ffmpeg_video.stdin.take());
 
-        let status = self.ffmpeg_video.wait().context("ffmpeg video encoder failed")?;
-        
+        let status = self
+            .ffmpeg_video
+            .wait()
+            .context("ffmpeg video encoder failed")?;
+
         if !status.success() {
             bail!("ffmpeg video encoder exited with {status}");
         }
@@ -260,7 +273,7 @@ impl RecordingEvent {
             self.audio_sample_rate,
             self.audio_channels,
         )?;
-        
+
         let _ = std::fs::remove_file(&self.video_tmp_path);
         let _ = std::fs::remove_file(&self.audio_tmp_path);
 
@@ -268,8 +281,9 @@ impl RecordingEvent {
             detections: self.detections,
         };
 
-        let sidecar_json = serde_json::to_string_pretty(&sidecar).context("failed to serialize sidecar")?;
-        
+        let sidecar_json =
+            serde_json::to_string_pretty(&sidecar).context("failed to serialize sidecar")?;
+
         std::fs::write(sidecar_path(&self.final_clip_path), sidecar_json)
             .context("failed to write sidecar file")?;
 
@@ -287,7 +301,7 @@ fn spawn_video_encoder(
     use std::os::unix::process::CommandExt;
 
     let mut command = Command::new("ffmpeg");
-    
+
     command
         .args(["-y", "-f", "rawvideo", "-pixel_format", "rgb24"])
         .args(["-video_size", &format!("{width}x{height}")])
@@ -310,7 +324,9 @@ fn spawn_video_encoder(
     #[cfg(unix)]
     command.process_group(0);
 
-    command.spawn().context("failed to spawn ffmpeg video encoder")
+    command
+        .spawn()
+        .context("failed to spawn ffmpeg video encoder")
 }
 
 /// Muxes the buffered raw audio into the encoded video. `-shortest` is
@@ -330,7 +346,14 @@ fn mux_audio_into_video(
     let status = Command::new("ffmpeg")
         .args(["-y", "-i"])
         .arg(video_path)
-        .args(["-f", "f32le", "-ar", &sample_rate.to_string(), "-ac", &channels.to_string()])
+        .args([
+            "-f",
+            "f32le",
+            "-ar",
+            &sample_rate.to_string(),
+            "-ac",
+            &channels.to_string(),
+        ])
         .arg("-i")
         .arg(audio_path)
         .args(["-c:v", "copy", "-af", "apad", "-c:a", "aac", "-shortest"])

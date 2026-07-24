@@ -39,15 +39,19 @@ fn resolve_camera_index(device: Option<&Path>) -> Result<CameraIndex> {
 
     for candidate in &cameras {
         let index = candidate.index().clone();
-        let format = RequestedFormat::new::<RgbFormat>(RequestedFormatType::AbsoluteHighestFrameRate);
-        
+        let format =
+            RequestedFormat::new::<RgbFormat>(RequestedFormatType::AbsoluteHighestFrameRate);
+
         match nokhwa::Camera::new(index.clone(), format) {
             Ok(_) => {
                 log::info!("Auto-selected camera: {} ({index})", candidate.human_name());
                 return Ok(index);
             }
             Err(err) => {
-                log::debug!("skipping camera {} ({index}): {err}", candidate.human_name());
+                log::debug!(
+                    "skipping camera {} ({index}): {err}",
+                    candidate.human_name()
+                );
             }
         }
     }
@@ -63,8 +67,7 @@ pub fn start_camera_capture(
     buffer: Arc<Mutex<RingBuffer>>,
 ) -> Result<CallbackCamera> {
     let index = resolve_camera_index(device)?;
-    let format =
-        RequestedFormat::new::<RgbFormat>(RequestedFormatType::AbsoluteHighestFrameRate);
+    let format = RequestedFormat::new::<RgbFormat>(RequestedFormatType::AbsoluteHighestFrameRate);
 
     let mut camera = CallbackCamera::new(index, format, move |raw_frame| {
         match raw_frame.decode_image::<RgbFormat>() {

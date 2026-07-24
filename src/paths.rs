@@ -7,7 +7,11 @@ use chrono::{DateTime, Local};
 /// for a recorded clip (ADR 4), creating the day's folder if needed. `classes`
 /// is deduplicated and sorted alphabetically so multi-subject clips get a
 /// stable, predictable filename regardless of detection order.
-pub fn clip_path(output_dir: &Path, started_at: DateTime<Local>, classes: &[&str]) -> Result<PathBuf> {
+pub fn clip_path(
+    output_dir: &Path,
+    started_at: DateTime<Local>,
+    classes: &[&str],
+) -> Result<PathBuf> {
     let day_dir = output_dir.join(started_at.format("%Y-%m-%d").to_string());
     std::fs::create_dir_all(&day_dir)
         .with_context(|| format!("failed to create output directory {}", day_dir.display()))?;
@@ -23,7 +27,7 @@ pub fn clip_path(output_dir: &Path, started_at: DateTime<Local>, classes: &[&str
         filename.push('_');
         filename.push_str(class);
     }
-    
+
     filename.push_str(".mp4");
 
     Ok(day_dir.join(filename))

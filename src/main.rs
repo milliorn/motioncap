@@ -193,7 +193,11 @@ fn run_recording_writer_loop(
 
         match taken {
             ActiveEvent::Pending(mut pending) => {
-                if let Err(err) = pending.event.seed(&pending.pre_frames, &pending.pre_audio, RECORDING_FRAME_RATE) {
+                if let Err(err) = pending.event.seed(
+                    &pending.pre_frames,
+                    &pending.pre_audio,
+                    RECORDING_FRAME_RATE,
+                ) {
                     log::error!("failed to seed pre-buffer into new recording: {err:?}");
                 }
                 *guard = ActiveEvent::Active(pending.event);
@@ -262,13 +266,16 @@ fn run_detection_loop(
 
     loop {
         if shutdown.load(Ordering::SeqCst) {
-            let event = active_event.lock().expect("active event lock poisoned").take();
+            let event = active_event
+                .lock()
+                .expect("active event lock poisoned")
+                .take();
 
             if let Some(event) = event {
                 event.finish()?;
                 log::info!("recording closed on shutdown");
             }
-            
+
             return Ok(());
         }
 
@@ -283,7 +290,10 @@ fn run_detection_loop(
             continue;
         };
 
-        let has_active_event = active_event.lock().expect("active event lock poisoned").is_some();
+        let has_active_event = active_event
+            .lock()
+            .expect("active event lock poisoned")
+            .is_some();
 
         if has_active_event {
             let motion_tripped = motion_gate.evaluate(&frame)?;
@@ -339,7 +349,10 @@ fn run_detection_loop(
 
         let detections = detector.detect(&frame, config.detection_confidence)?;
 
-        log::trace!("motion tripped; {} detections above threshold", detections.len());
+        log::trace!(
+            "motion tripped; {} detections above threshold",
+            detections.len()
+        );
 
         let Some(confirmed) = triggers::evaluate(detections) else {
             continue;
@@ -378,10 +391,11 @@ fn run_detection_loop(
 
         log::info!("recording started: {:?}", classes);
 
-        *active_event.lock().expect("active event lock poisoned") = ActiveEvent::Pending(PendingEvent {
-            event,
-            pre_frames,
-            pre_audio,
-        });
+        *active_event.lock().expect("active event lock poisoned") =
+            ActiveEvent::Pending(PendingEvent {
+                event,
+                pre_frames,
+                pre_audio,
+            });
     }
 }
