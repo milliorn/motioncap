@@ -4,6 +4,7 @@ mod config;
 mod detect;
 mod motion;
 mod paths;
+mod preview;
 mod recorder;
 mod startup;
 mod triggers;
