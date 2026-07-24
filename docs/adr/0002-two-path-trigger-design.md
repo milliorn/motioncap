@@ -1,56 +1,72 @@
-# 2. Two independent trigger paths for recording
+# 2. Single trigger path: motion gate + YOLO confirmation
 
 ## Status
 
-Accepted
+Accepted (supersedes an earlier version of this ADR that proposed a separate
+door-zone trigger path; see "Revision" below)
 
 ## Context
 
-The system needs to record when (a) a person or animal is present, and (b) when a
-door/structural event happens (e.g. a door opening), while explicitly not
-false-triggering on indoor sources of repetitive motion such as ceiling fans or
-flickering light. A single object detector (YOLO) can recognize living things but has
-no concept of "a door," since that's not an object class — it's a state change.
+The system needs to record real motion events — including someone opening or closing
+a door — while explicitly not false-triggering on indoor sources of repetitive motion
+such as ceiling fans or flickering light.
+
+An earlier version of this decision introduced a second, door-specific trigger path
+(a manually-configured "door zone" rectangle where motion alone, with no YOLO
+confirmation, would trigger recording). On review, that was unnecessary complexity:
+a door opening is not a distinct technical case requiring its own code path — it's
+simply real, non-repetitive motion, which the motion gate is already meant to catch
+and distinguish from repetitive motion like a fan. Adding a separate "door zone"
+concept solved a problem that didn't exist and required the user to manually measure
+and enter pixel coordinates for no real benefit over the existing gate.
 
 ## Decision
 
-Recording is triggered by two independent, differently-gated paths:
+There is one trigger path:
 
-1. **Living-thing path.** A background-subtraction motion gate (OpenCV MOG2/KNN) runs
-   continuously across the full frame. When it trips, YOLO inference runs to confirm
-   whether a living subject (person, or any COCO animal class) is actually present.
-   **Recording only starts on a confirmed YOLO classification** — never on the gate
-   alone. This means a ceiling fan, curtain flutter, or lighting flicker can trip the
-   gate all day without ever producing a recording, because YOLO has no trained
-   concept of a fan resembling a living thing. The gate's only purpose on this path is
-   avoiding wasted inference cycles on an empty room; correctness against false
-   positives comes entirely from the YOLO confirmation requirement.
+A background-subtraction motion gate (OpenCV MOG2/KNN) runs continuously across the
+full frame. When it trips, YOLO inference runs to confirm whether a living subject
+(person, or any COCO animal class) is actually present. **Recording only starts on a
+confirmed YOLO classification** — never on the gate alone.
 
-2. **Door-zone path.** Users configure rectangular "door zone" regions in frame
-   coordinates. Motion detected *within* a door zone triggers recording directly, with
-   no YOLO confirmation required. This is deliberately exempted from the
-   confirmation rule because a door swinging open is a large, distinct, non-repetitive
-   motion event unlikely to be confused with a fan, and because "door" isn't an object
-   class a detector recognizes in the first place — requiring YOLO confirmation here
-   would mean door-open events could never trigger a recording at all.
+This means:
 
-Detection scope for the living-thing path is not limited to person/cat/dog: it
-allowlists person plus every animal class already present in COCO (bird, cat, dog,
-horse, sheep, cow, elephant, bear, zebra, giraffe), since the goal is "every living
-thing," and COCO already covers this with no additional model training or engineering
-cost.
+- A ceiling fan, curtain flutter, or lighting flicker can trip the gate all day
+  without ever producing a recording, because YOLO has no trained concept of a fan
+  resembling a living thing.
+- A door opening or closing is exactly the kind of large, real, non-repetitive motion
+  the gate is designed to catch; no door-specific handling is needed for the gate
+  itself to register it as motion worth investigating. (Whether a door-open-with-
+  nobody-visible event should itself produce a recording without any living subject
+  present was not requested and remains out of scope — the current design only
+  records when YOLO confirms a subject.)
+
+The gate's only purpose is avoiding wasted inference cycles on an empty room;
+correctness against false positives comes entirely from the YOLO confirmation
+requirement.
+
+Detection scope is not limited to person/cat/dog: it allowlists person plus every
+animal class already present in COCO (bird, cat, dog, horse, sheep, cow, elephant,
+bear, zebra, giraffe), since the goal is "every living thing," and COCO already
+covers this with no additional model training or engineering cost.
+
+## Revision
+
+The original version of this ADR proposed a second "door-zone path": user-configured
+rectangular regions where motion alone (no YOLO confirmation) would trigger recording,
+intended to handle door-open/close events specifically. This was removed because it
+never actually detected a door — it only skipped YOLO confirmation within a
+manually-drawn rectangle, which added a config option, a struct, and validation code
+without solving a problem the motion gate didn't already solve. The stated goal
+("catch a door opening/closing, don't false-trigger on a fan") is fully met by the
+single motion-gate-plus-YOLO-confirmation design above.
 
 ## Consequences
 
-- The motion module (`motion.rs`) must report door-zone motion separately from
-  whole-frame motion, since they lead to different trigger behavior.
-- The JSON sidecar for each recorded clip must record which path triggered it
-  (door-zone vs. living-thing-confirmed), and for the living-thing path, which
-  classes were confirmed.
-- Door zones are a per-deployment configuration setting (room/camera-placement
-  specific) and cannot be auto-detected; they must be exposed via config.
-- A design risk accepted here: a person entering through a monitored door zone
-  produces two overlapping triggers (door-zone motion, then likely a living-thing
-  confirmation as they continue into frame). The recorder's event lifecycle (single
-  open file per event, extended by any new trigger within the post-buffer window)
-  naturally merges these into one clip rather than two.
+- The motion module (`motion.rs`) only needs to report whole-frame motion; there is
+  no separate zone-based reporting or configuration.
+- The JSON sidecar for each recorded clip records the confirmed classes and their
+  timestamps/confidence; there is no "trigger path" distinction to record since there
+  is only one path.
+- No per-deployment zone configuration (pixel coordinates, room-specific setup) is
+  required from the user.
