@@ -89,6 +89,44 @@ impl ActiveEvent {
     }
 }
 
+/// Finalizes whatever recording is in progress (if any) on shutdown.
+///
+/// Deliberately does *not* use `ActiveEvent::take`, which collapses
+/// `Pending`/`Active` down to a bare `RecordingEvent`: a `Pending` event has
+/// ffmpeg spawned but no frames/audio written yet -- that only happens once
+/// the writer thread picks it up (see `ActiveEvent`'s docs). Finishing it
+/// unseeded would hand `finish` an empty video/audio pair, producing a
+/// malformed mux instead of a usable (if short) clip, so it must be seeded
+/// here first, same as the writer thread would have done.
+fn finish_event_on_shutdown(active_event: &Mutex<ActiveEvent>) -> Result<()> {
+    let taken = std::mem::replace(
+        &mut *active_event.lock().expect("active event lock poisoned"),
+        ActiveEvent::None,
+    );
+
+    let event = match taken {
+        ActiveEvent::None => None,
+        ActiveEvent::Pending(mut pending) => {
+            if let Err(err) = pending.event.seed(
+                &pending.pre_frames,
+                &pending.pre_audio,
+                RECORDING_FRAME_RATE,
+            ) {
+                log::error!("failed to seed pre-buffer into new recording: {err:?}");
+            }
+            Some(pending.event)
+        }
+        ActiveEvent::Active(event) => Some(event),
+    };
+
+    if let Some(event) = event {
+        event.finish()?;
+        log::info!("recording closed on shutdown");
+    }
+
+    Ok(())
+}
+
 /// Motion-gate + YOLO evaluation cadence. Kept separate from the recording
 /// frame rate below since inference cost doesn't scale down usefully at
 /// higher polling rates -- 15fps is plenty for deciding whether a subject is
@@ -321,16 +359,7 @@ fn run_detection_loop(
 
     loop {
         if shutdown.load(Ordering::SeqCst) {
-            let event = active_event
-                .lock()
-                .expect("active event lock poisoned")
-                .take();
-
-            if let Some(event) = event {
-                event.finish()?;
-                log::info!("recording closed on shutdown");
-            }
-
+            finish_event_on_shutdown(&active_event)?;
             return Ok(());
         }
 

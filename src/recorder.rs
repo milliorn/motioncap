@@ -383,7 +383,7 @@ fn mux_audio_into_video(
     sample_rate: u32,
     channels: u16,
 ) -> Result<()> {
-    let status = Command::new("ffmpeg")
+    let output = Command::new("ffmpeg")
         .args(["-y", "-i"])
         .arg(video_path)
         .args([
@@ -399,12 +399,18 @@ fn mux_audio_into_video(
         .args(["-c:v", "copy", "-af", "apad", "-c:a", "aac", "-shortest"])
         .arg(output_path)
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
+        .stderr(Stdio::piped())
+        .output()
         .context("failed to spawn ffmpeg for audio muxing")?;
 
-    if !status.success() {
-        bail!("ffmpeg audio mux exited with {status}");
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        
+        bail!(
+            "ffmpeg audio mux exited with {}: {}",
+            output.status,
+            stderr.trim()
+        );
     }
 
     Ok(())

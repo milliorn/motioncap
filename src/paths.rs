@@ -3,10 +3,14 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use chrono::{DateTime, Local};
 
-/// Builds the `<output_dir>/<YYYY-MM-DD>/<HH-MM-SS>_<class1>_<class2>.mp4` path
-/// for a recorded clip (ADR 4), creating the day's folder if needed. `classes`
-/// is deduplicated and sorted alphabetically so multi-subject clips get a
-/// stable, predictable filename regardless of detection order.
+/// Builds the `<output_dir>/<YYYY-MM-DD>/<YYYY-MM-DD_HH-MM-SS>_<class1>_<class2>.mp4`
+/// path for a recorded clip (ADR 4), creating the day's folder if needed. The
+/// full date is repeated in the filename (not just the containing folder) so
+/// that filenames sort chronologically by name alone -- e.g. in a flat
+/// listing across multiple days' folders -- rather than only within a single
+/// day's folder. `classes` is deduplicated and sorted alphabetically so
+/// multi-subject clips get a stable, predictable filename regardless of
+/// detection order.
 pub fn clip_path(
     output_dir: &Path,
     started_at: DateTime<Local>,
@@ -21,7 +25,7 @@ pub fn clip_path(
     sorted_classes.sort_unstable();
     sorted_classes.dedup();
 
-    let mut filename = started_at.format("%H-%M-%S").to_string();
+    let mut filename = started_at.format("%Y-%m-%d_%H-%M-%S").to_string();
 
     for class in &sorted_classes {
         filename.push('_');
