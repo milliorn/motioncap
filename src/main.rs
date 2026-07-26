@@ -11,6 +11,8 @@ mod config;
 mod detect;
 /// Background-subtraction motion gate.
 mod motion;
+/// Shared `OpenCV` conversion helpers.
+mod opencv_utils;
 /// Output file/folder naming.
 mod paths;
 /// Opt-in live preview window.

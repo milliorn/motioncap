@@ -63,6 +63,10 @@ pub struct RecordingEvent {
     last_frame_drain_at: Instant,
     /// The next frame-rate tick due to be written, if any.
     next_frame_due: Option<Instant>,
+    /// The most recently written video frame, kept so `drain_frames` can
+    /// duplicate it to fill ticks the camera didn't deliver a new frame for
+    /// (see `drain_frames`'s docs).
+    last_written_frame: Option<image::RgbImage>,
     /// Every detection recorded so far during this clip.
     detections: Vec<DetectionRecord>,
 }
@@ -129,6 +133,7 @@ impl RecordingEvent {
             last_audio_drain_at: now,
             last_frame_drain_at: now,
             next_frame_due: None,
+            last_written_frame: None,
             detections: Vec::new(),
         })
     }
@@ -155,6 +160,7 @@ impl RecordingEvent {
 
         for frame in &selected {
             self.write_frame(&frame.image)?;
+            self.last_written_frame = Some(frame.image.clone());
         }
 
         if let Some(last) = selected.last() {
@@ -190,6 +196,17 @@ impl RecordingEvent {
     /// reading only the latest frame each poll silently skips over whatever
     /// arrived and was superseded in between, which produces a visible jump
     /// in the subject's position despite otherwise-correct frame timing.
+    ///
+    /// If the camera momentarily delivers *fewer* frames than `frame_rate`
+    /// (or stalls), the reverse problem applies: no buffered frame may cross
+    /// a given tick, so nothing gets written for it. Left unhandled, the
+    /// encoded video (ffmpeg's `-framerate` assumes uniform spacing) falls
+    /// behind wall-clock elapsed time, which plays back sped-up and leaves
+    /// the independently wall-clock-accumulated audio longer than the video
+    /// at mux time. To keep output duration aligned with real elapsed time,
+    /// any tick that's fully elapsed by wall-clock `Instant::now()` without a
+    /// new frame satisfying it gets filled by re-writing the last frame
+    /// actually written.
     pub fn drain_frames(
         &mut self,
         ring_buffer: &std::sync::Mutex<crate::buffer::RingBuffer>,
@@ -211,6 +228,7 @@ impl RecordingEvent {
 
             if frame.timestamp >= due {
                 self.write_frame(&frame.image)?;
+                self.last_written_frame = Some(frame.image.clone());
                 #[allow(
                     clippy::arithmetic_side_effects,
                     reason = "Instant + a sub-second Duration only overflows after ~584 billion years of process uptime"
@@ -218,6 +236,34 @@ impl RecordingEvent {
                 let new_due = due + tick;
                 next_due = Some(new_due);
             }
+        }
+
+        // Fill any ticks that have fully elapsed by wall-clock time but
+        // weren't satisfied above (the camera didn't deliver a qualifying
+        // frame this poll), duplicating the last frame actually written so
+        // encoded duration keeps pace with real elapsed time. Bounded by
+        // `now` so a long-stalled writer thread can't produce an unbounded
+        // catch-up burst.
+        let now = Instant::now();
+
+        while let Some(due) = next_due {
+            if due > now {
+                break;
+            }
+
+            let Some(last_frame) = self.last_written_frame.clone() else {
+                break;
+            };
+
+            self.write_frame(&last_frame)?;
+
+            #[allow(
+                clippy::arithmetic_side_effects,
+                reason = "Instant + a sub-second Duration only overflows after ~584 billion years of process uptime"
+            )]
+            let new_due = due + tick;
+            
+            next_due = Some(new_due);
         }
 
         self.next_frame_due = next_due;

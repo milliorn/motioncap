@@ -1,7 +1,9 @@
 use anyhow::{Context, Result};
 use image::RgbImage;
-use opencv::core::{Mat, MatTraitConst, ToInputArray, Vec3b};
+use opencv::core::{Mat, MatTraitConst, ToInputArray};
 use opencv::video::{BackgroundSubtractorTrait, create_background_subtractor_mog2};
+
+use crate::opencv_utils::rgb_image_to_bgr_mat;
 
 /// Background-subtraction motion gate (ADR 2). Its only job is deciding
 /// whether whole-frame motion exceeded the configured threshold; recording
@@ -28,7 +30,7 @@ impl MotionGate {
     /// Feeds one frame through the background model and reports whether the
     /// changed-pixel ratio exceeded the configured threshold.
     pub fn evaluate(&mut self, frame: &RgbImage) -> Result<bool> {
-        let mat = rgb_image_to_mat(frame)?;
+        let mat = rgb_image_to_bgr_mat(frame)?;
 
         let mut fgmask = Mat::default();
         self.subtractor
@@ -59,20 +61,4 @@ fn changed_ratio(mask: &(impl MatTraitConst + ToInputArray), total_pixels: f32) 
     )]
     let ratio = nonzero as f32 / total_pixels;
     Ok(ratio)
-}
-
-/// Converts an RGB image into an `OpenCV` BGR `Mat` for use with the background subtractor.
-fn rgb_image_to_mat(image: &RgbImage) -> Result<Mat> {
-    let (width, height) = image.dimensions();
-    let bgr: Vec<Vec3b> = image
-        .pixels()
-        .map(|p| Vec3b::from([p[2], p[1], p[0]]))
-        .collect();
-    #[allow(
-        clippy::cast_possible_wrap,
-        reason = "camera frame dimensions never approach i32::MAX"
-    )]
-    let borrowed = Mat::new_rows_cols_with_data(height as i32, width as i32, &bgr)
-        .context("failed to build Mat from frame")?;
-    borrowed.try_clone().context("failed to clone frame Mat")
 }
