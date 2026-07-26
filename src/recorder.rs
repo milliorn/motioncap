@@ -130,25 +130,25 @@ impl RecordingEvent {
     /// separate from event construction.
     ///
     /// The ring buffer accumulates frames at the camera's native capture
-    /// rate, which may be higher than `frame_rate` (the rate the video
-    /// encoder is configured for). Pre-buffered frames are resampled down to
-    /// `frame_rate` using their timestamps before writing, so the pre-buffer
-    /// portion of the clip plays back at the correct real-time duration
-    /// instead of being stretched by writing every captured frame 1:1.
+    /// rate, which may be higher than this event's configured `frame_rate`
+    /// (set in `start`, the rate the video encoder was spawned with).
+    /// Pre-buffered frames are resampled down to that rate using their
+    /// timestamps before writing, so the pre-buffer portion of the clip plays
+    /// back at the correct real-time duration instead of being stretched by
+    /// writing every captured frame 1:1.
     pub fn seed(
         &mut self,
         pre_frames: &[TimestampedFrame],
         pre_audio: &[TimestampedAudio],
-        frame_rate: u32,
     ) -> Result<()> {
-        let selected = resample_to_frame_rate(pre_frames, frame_rate);
+        let selected = resample_to_frame_rate(pre_frames, self.frame_rate);
 
         for frame in &selected {
             self.write_frame(&frame.image)?;
         }
 
         if let Some(last) = selected.last() {
-            let tick = Duration::from_secs_f64(1.0 / f64::from(frame_rate));
+            let tick = Duration::from_secs_f64(1.0 / f64::from(self.frame_rate));
 
             self.last_frame_drain_at = last.timestamp;
             #[allow(
@@ -257,7 +257,11 @@ impl RecordingEvent {
 
     /// Appends raw PCM samples to the temp audio file.
     pub fn write_audio(&mut self, samples: &[f32]) -> Result<()> {
-        let bytes: Vec<u8> = samples.iter().flat_map(|s| s.to_le_bytes()).collect();
+        let mut bytes = Vec::with_capacity(samples.len().saturating_mul(size_of::<f32>()));
+
+        for sample in samples {
+            bytes.extend_from_slice(&sample.to_le_bytes());
+        }
 
         self.audio_file
             .write_all(&bytes)
@@ -294,13 +298,22 @@ impl RecordingEvent {
     pub fn finish(mut self) -> Result<()> {
         drop(self.ffmpeg_video.stdin.take());
 
+        let mut stderr = String::new();
+        
+        if let Some(mut stderr_pipe) = self.ffmpeg_video.stderr.take() {
+            let _ = std::io::Read::read_to_string(&mut stderr_pipe, &mut stderr);
+        }
+
         let status = self
             .ffmpeg_video
             .wait()
             .context("ffmpeg video encoder failed")?;
 
         if !status.success() {
-            bail!("ffmpeg video encoder exited with {status}");
+            bail!(
+                "ffmpeg video encoder exited with {status}: {}",
+                stderr.trim()
+            );
         }
 
         drop(self.audio_file);
@@ -343,7 +356,8 @@ fn spawn_video_encoder(
     let mut command = Command::new("ffmpeg");
 
     command
-        .args(["-y", "-f", "rawvideo", "-pixel_format", "rgb24"])
+        .args(["-y", "-loglevel", "error"])
+        .args(["-f", "rawvideo", "-pixel_format", "rgb24"])
         .args(["-video_size", &format!("{width}x{height}")])
         .args(["-framerate", &frame_rate.to_string()])
         .args(["-i", "-"])
@@ -351,7 +365,7 @@ fn spawn_video_encoder(
         .arg(path)
         .stdin(Stdio::piped())
         .stdout(Stdio::null())
-        .stderr(Stdio::null());
+        .stderr(Stdio::piped());
 
     // Put ffmpeg in its own process group so a terminal SIGINT (Ctrl+C)
     // doesn't reach it directly -- it shares the foreground process group
@@ -405,7 +419,7 @@ fn mux_audio_into_video(
 
     if !output.status.success() {
         let stderr = String::from_utf8_lossy(&output.stderr);
-        
+
         bail!(
             "ffmpeg audio mux exited with {}: {}",
             output.status,

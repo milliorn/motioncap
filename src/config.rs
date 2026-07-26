@@ -6,7 +6,7 @@ use clap::Parser;
 #[derive(Parser, Debug)]
 #[command(name = "motioncap", version)]
 pub struct Config {
-    /// Directory recordings are written to (organized as `<date>/<time>_<classes>.mp4`)
+    /// Directory recordings are written to (organized as `<date>/<date>_<time>_<classes>.mp4`)
     #[arg(long, default_value = "./recordings")]
     pub output_dir: PathBuf,
 

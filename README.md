@@ -71,7 +71,7 @@ automatically; see
 ## Output layout
 
 ```sh
-<output_dir>/<YYYY-MM-DD>/<HH-MM-SS>_<class1>_<class2>.mp4
+<output_dir>/<YYYY-MM-DD>/<YYYY-MM-DD_HH-MM-SS>_<class1>_<class2>.mp4
 ```
 
 Each clip has a same-named `.json` sidecar recording per-detection offsets, classes,

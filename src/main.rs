@@ -107,11 +107,7 @@ fn finish_event_on_shutdown(active_event: &Mutex<ActiveEvent>) -> Result<()> {
     let event = match taken {
         ActiveEvent::None => None,
         ActiveEvent::Pending(mut pending) => {
-            if let Err(err) = pending.event.seed(
-                &pending.pre_frames,
-                &pending.pre_audio,
-                RECORDING_FRAME_RATE,
-            ) {
+            if let Err(err) = pending.event.seed(&pending.pre_frames, &pending.pre_audio) {
                 log::error!("failed to seed pre-buffer into new recording: {err:?}");
             }
             Some(pending.event)
@@ -275,11 +271,7 @@ fn run_recording_writer_loop(
 
         match taken {
             ActiveEvent::Pending(mut pending) => {
-                if let Err(err) = pending.event.seed(
-                    &pending.pre_frames,
-                    &pending.pre_audio,
-                    RECORDING_FRAME_RATE,
-                ) {
+                if let Err(err) = pending.event.seed(&pending.pre_frames, &pending.pre_audio) {
                     log::error!("failed to seed pre-buffer into new recording: {err:?}");
                 }
                 *guard = ActiveEvent::Active(pending.event);
