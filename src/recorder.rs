@@ -51,8 +51,10 @@ pub struct RecordingEvent {
     audio_channels: u16,
     /// Configured video frame rate for this clip.
     frame_rate: u32,
-    /// When this event was started.
-    clip_started: Instant,
+    /// Capture timestamp of the clip's first frame (the start of the
+    /// pre-buffer window, not the trigger instant), used as the zero point
+    /// for `DetectionRecord::offset_secs`.
+    clip_timeline_start: Instant,
     /// When the most recent triggering detection occurred (drives the post-buffer quiet window).
     last_trigger_at: Instant,
     /// Timestamp up to which audio has already been drained.
@@ -84,6 +86,13 @@ impl RecordingEvent {
     /// start of the clip once live writing resumes. Callers should invoke
     /// `seed` from whatever thread is responsible for steady-paced frame
     /// writing instead.
+    ///
+    /// `clip_timeline_start` should be the capture timestamp of the earliest
+    /// pre-buffer frame that will be seeded into this clip (i.e. the actual
+    /// start of the video file), not the trigger instant -- it's the zero
+    /// point `DetectionRecord::offset_secs` is measured from, so detections
+    /// recorded against footage that predates the trigger (the pre-buffer
+    /// window) get correct nonzero offsets instead of all reading ~0.
     pub fn start(
         final_clip_path: std::path::PathBuf,
         width: u32,
@@ -91,6 +100,7 @@ impl RecordingEvent {
         frame_rate: u32,
         audio_sample_rate: u32,
         audio_channels: u16,
+        clip_timeline_start: Instant,
     ) -> Result<Self> {
         let video_tmp_path = final_clip_path.with_extension("video.tmp.mp4");
         let audio_tmp_path = final_clip_path.with_extension("audio.tmp.pcm");
@@ -114,7 +124,7 @@ impl RecordingEvent {
             audio_sample_rate,
             audio_channels,
             frame_rate,
-            clip_started: now,
+            clip_timeline_start,
             last_trigger_at: now,
             last_audio_drain_at: now,
             last_frame_drain_at: now,
@@ -269,9 +279,20 @@ impl RecordingEvent {
         Ok(())
     }
 
-    /// Records a detection into the sidecar and resets the post-buffer quiet window.
-    pub fn record_detection(&mut self, class_name: &str, confidence: f32) {
-        let offset_secs = self.clip_started.elapsed().as_secs_f64();
+    /// Records a detection into the sidecar and resets the post-buffer quiet
+    /// window. `frame_timestamp` is the capture timestamp of the frame the
+    /// detection ran against (from the ring buffer), used to compute
+    /// `offset_secs` relative to the clip's actual timeline start rather than
+    /// wall-clock time at the moment this function happens to run.
+    pub fn record_detection(
+        &mut self,
+        class_name: &str,
+        confidence: f32,
+        frame_timestamp: Instant,
+    ) {
+        let offset_secs = frame_timestamp
+            .saturating_duration_since(self.clip_timeline_start)
+            .as_secs_f64();
 
         self.detections.push(DetectionRecord {
             offset_secs,
@@ -299,7 +320,7 @@ impl RecordingEvent {
         drop(self.ffmpeg_video.stdin.take());
 
         let mut stderr = String::new();
-        
+
         if let Some(mut stderr_pipe) = self.ffmpeg_video.stderr.take() {
             let _ = std::io::Read::read_to_string(&mut stderr_pipe, &mut stderr);
         }

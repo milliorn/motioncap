@@ -359,10 +359,11 @@ fn run_detection_loop(
 
         let latest_frame = {
             let buf = ring_buffer.lock().expect("ring buffer lock poisoned");
-            buf.latest_frame().map(|f| f.image.clone())
+
+            buf.latest_frame().map(|f| (f.image.clone(), f.timestamp))
         };
 
-        let Some(frame) = latest_frame else {
+        let Some((frame, frame_timestamp)) = latest_frame else {
             continue;
         };
 
@@ -396,7 +397,7 @@ fn run_detection_loop(
             if motion_tripped {
                 if let Some(confirmed) = &confirmed {
                     for d in confirmed {
-                        event.record_detection(d.class_name, d.confidence);
+                        event.record_detection(d.class_name, d.confidence, frame_timestamp);
                     }
                 } else {
                     // Motion continues but wasn't re-confirmed by YOLO on this
@@ -444,12 +445,14 @@ fn run_detection_loop(
             buf.snapshot()
         };
 
-        let Some((width, height)) = pre_frames.first().map(|f| f.image.dimensions()) else {
+        let Some(first_pre_frame) = pre_frames.first() else {
             // No buffered frames yet (e.g. trigger fired immediately at
             // startup, before the camera has produced anything); skip this
             // trigger rather than starting a recording with no video.
             continue;
         };
+        let (width, height) = first_pre_frame.image.dimensions();
+        let clip_timeline_start = first_pre_frame.timestamp;
 
         let path = clip_path(&config.output_dir, chrono::Local::now(), &classes)?;
         let mut event = RecordingEvent::start(
@@ -459,10 +462,11 @@ fn run_detection_loop(
             RECORDING_FRAME_RATE,
             audio_sample_rate,
             audio_channels,
+            clip_timeline_start,
         )?;
 
         for d in &confirmed {
-            event.record_detection(d.class_name, d.confidence);
+            event.record_detection(d.class_name, d.confidence, frame_timestamp);
         }
 
         log::info!("recording started: {classes:?}");
