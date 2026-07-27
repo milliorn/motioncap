@@ -223,7 +223,7 @@ impl RecordingEvent {
             let tick = Duration::from_secs_f64(1.0 / f64::from(self.frame_rate));
 
             self.last_frame_drain_at = last.timestamp;
-            
+
             #[allow(
                 clippy::arithmetic_side_effects,
                 reason = "Instant + a sub-second Duration only overflows after ~584 billion years of process uptime"
