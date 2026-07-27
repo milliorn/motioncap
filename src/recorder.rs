@@ -1,12 +1,14 @@
+use std::collections::BTreeSet;
 use std::io::Write;
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
+use chrono::{DateTime, Local};
 use serde::Serialize;
 
 use crate::buffer::{TimestampedAudio, TimestampedFrame};
-use crate::paths::sidecar_path;
+use crate::paths::{clip_path, sidecar_path};
 
 /// One recorded detection, written into a clip's `.json` sidecar (ADR 4).
 #[derive(Serialize)]
@@ -26,6 +28,36 @@ pub struct Sidecar {
     pub detections: Vec<DetectionRecord>,
 }
 
+/// Construction parameters for `RecordingEvent::start`, grouped into a
+/// struct since the individual values (video dimensions, audio format,
+/// path-naming inputs, timeline anchor) don't share a natural owner.
+pub struct RecordingEventParams {
+    /// Where the finished, muxed clip is written, before any class-list
+    /// rename (see `RecordingEvent::all_classes`).
+    pub final_clip_path: std::path::PathBuf,
+    /// Directory recordings are written under (ADR 4), needed alongside
+    /// `started_at` to recompute the filename at `finish` if the class list
+    /// grows over the clip's lifetime.
+    pub output_dir: std::path::PathBuf,
+    /// Wall-clock time the clip started; must match what `final_clip_path`
+    /// was built from via `clip_path`.
+    pub started_at: DateTime<Local>,
+    /// Video frame width in pixels.
+    pub width: u32,
+    /// Video frame height in pixels.
+    pub height: u32,
+    /// Configured video frame rate the encoder is spawned with.
+    pub frame_rate: u32,
+    /// Sample rate of the audio that will be written, needed to mux correctly.
+    pub audio_sample_rate: u32,
+    /// Channel count of the audio that will be written, needed to mux correctly.
+    pub audio_channels: u16,
+    /// Capture timestamp of the clip's first frame (the start of the
+    /// pre-buffer window, not the trigger instant), used as the zero point
+    /// for `DetectionRecord::offset_secs`.
+    pub clip_timeline_start: Instant,
+}
+
 /// Manages the lifecycle of a single recorded clip: seeds the file with the
 /// pre-event buffer, accepts live frames as they arrive, and tracks the
 /// post-event quiet window so the caller knows when to close it (ADR 2, ADR 4).
@@ -41,8 +73,16 @@ pub struct RecordingEvent {
     audio_tmp_path: std::path::PathBuf,
     /// Open handle to `audio_tmp_path`, written to as audio arrives.
     audio_file: std::fs::File,
-    /// Where the finished, muxed clip is written on `finish`.
+    /// Where the finished, muxed clip is written on `finish`, before any
+    /// class-list rename (see `all_classes`).
     final_clip_path: std::path::PathBuf,
+    /// Directory recordings are written under, needed to recompute
+    /// `final_clip_path` at `finish` if `all_classes` grew since `start`.
+    output_dir: std::path::PathBuf,
+    /// Wall-clock time the clip started, needed (alongside `output_dir`) to
+    /// recompute `final_clip_path` at `finish` via the same `clip_path`
+    /// naming convention it was originally built with.
+    started_at: DateTime<Local>,
     /// Path to the temporary video-only file ffmpeg encodes into.
     video_tmp_path: std::path::PathBuf,
     /// Sample rate of the buffered audio, needed to mux correctly.
@@ -67,6 +107,10 @@ pub struct RecordingEvent {
     /// duplicate it to fill ticks the camera didn't deliver a new frame for
     /// (see `drain_frames`'s docs).
     last_written_frame: Option<image::RgbImage>,
+    /// Every distinct class detected so far during this clip (ADR 4: the
+    /// final filename must reflect every class seen over the clip's
+    /// lifetime, not just the classes that triggered it).
+    all_classes: BTreeSet<String>,
     /// Every detection recorded so far during this clip.
     detections: Vec<DetectionRecord>,
 }
@@ -97,15 +141,24 @@ impl RecordingEvent {
     /// point `DetectionRecord::offset_secs` is measured from, so detections
     /// recorded against footage that predates the trigger (the pre-buffer
     /// window) get correct nonzero offsets instead of all reading ~0.
-    pub fn start(
-        final_clip_path: std::path::PathBuf,
-        width: u32,
-        height: u32,
-        frame_rate: u32,
-        audio_sample_rate: u32,
-        audio_channels: u16,
-        clip_timeline_start: Instant,
-    ) -> Result<Self> {
+    ///
+    /// `output_dir`/`started_at` must be the same values `final_clip_path`
+    /// was originally built from via `clip_path`, so `finish` can recompute
+    /// the filename with the full class list accumulated over the clip's
+    /// lifetime (ADR 4) and rename to it if it grew since `start`.
+    pub fn start(params: RecordingEventParams) -> Result<Self> {
+        let RecordingEventParams {
+            final_clip_path,
+            output_dir,
+            started_at,
+            width,
+            height,
+            frame_rate,
+            audio_sample_rate,
+            audio_channels,
+            clip_timeline_start,
+        } = params;
+
         let video_tmp_path = final_clip_path.with_extension("video.tmp.mp4");
         let audio_tmp_path = final_clip_path.with_extension("audio.tmp.pcm");
 
@@ -124,6 +177,8 @@ impl RecordingEvent {
             audio_tmp_path,
             audio_file,
             final_clip_path,
+            output_dir,
+            started_at,
             video_tmp_path,
             audio_sample_rate,
             audio_channels,
@@ -134,6 +189,7 @@ impl RecordingEvent {
             last_frame_drain_at: now,
             next_frame_due: None,
             last_written_frame: None,
+            all_classes: BTreeSet::new(),
             detections: Vec::new(),
         })
     }
@@ -262,7 +318,7 @@ impl RecordingEvent {
                 reason = "Instant + a sub-second Duration only overflows after ~584 billion years of process uptime"
             )]
             let new_due = due + tick;
-            
+
             next_due = Some(new_due);
         }
 
@@ -340,6 +396,8 @@ impl RecordingEvent {
             .saturating_duration_since(self.clip_timeline_start)
             .as_secs_f64();
 
+        self.all_classes.insert(class_name.to_string());
+
         self.detections.push(DetectionRecord {
             offset_secs,
             class_name: class_name.to_string(),
@@ -395,6 +453,20 @@ impl RecordingEvent {
 
         let _ = std::fs::remove_file(&self.video_tmp_path);
         let _ = std::fs::remove_file(&self.audio_tmp_path);
+
+        let all_classes: Vec<&str> = self.all_classes.iter().map(String::as_str).collect();
+        let renamed_path = clip_path(&self.output_dir, self.started_at, &all_classes)?;
+
+        if renamed_path != self.final_clip_path {
+            std::fs::rename(&self.final_clip_path, &renamed_path).with_context(|| {
+                format!(
+                    "failed to rename clip {} to {} (reflecting every class detected during the clip, per ADR 4)",
+                    self.final_clip_path.display(),
+                    renamed_path.display()
+                )
+            })?;
+            self.final_clip_path = renamed_path;
+        }
 
         let sidecar = Sidecar {
             detections: self.detections,

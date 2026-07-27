@@ -66,8 +66,19 @@ impl Detector {
             "failed to set optimization level",
         )?;
 
-        if !force_cpu {
-            builder = ort_err(
+        builder = if force_cpu {
+            // Register only CPU, rather than skipping registration
+            // entirely: with no execution providers explicitly registered,
+            // ONNX Runtime falls back to its own default provider selection,
+            // which (depending on how the linked ONNX Runtime build was
+            // configured) isn't guaranteed to be CPU-only -- silently
+            // defeating what `--force-cpu` promises.
+            ort_err(
+                builder.with_execution_providers([CPUExecutionProvider::default().build()]),
+                "failed to register CPU execution provider",
+            )?
+        } else {
+            ort_err(
                 builder.with_execution_providers([
                     CUDAExecutionProvider::default().build(),
                     ROCmExecutionProvider::default().build(),
@@ -75,8 +86,8 @@ impl Detector {
                     CPUExecutionProvider::default().build(),
                 ]),
                 "failed to register execution providers",
-            )?;
-        }
+            )?
+        };
 
         let session = ort_err(
             builder.commit_from_file(model_path),

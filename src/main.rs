@@ -37,7 +37,7 @@ use detect::Detector;
 use motion::MotionGate;
 use paths::clip_path;
 use preview::PreviewWindow;
-use recorder::RecordingEvent;
+use recorder::{RecordingEvent, RecordingEventParams};
 
 /// An event that's been started (ffmpeg spawned) but whose pre-event buffer
 /// hasn't been written yet. Kept separate from `RecordingEvent` construction
@@ -456,16 +456,19 @@ fn run_detection_loop(
         let (width, height) = first_pre_frame.image.dimensions();
         let clip_timeline_start = first_pre_frame.timestamp;
 
-        let path = clip_path(&config.output_dir, chrono::Local::now(), &classes)?;
-        let mut event = RecordingEvent::start(
-            path,
+        let started_at = chrono::Local::now();
+        let path = clip_path(&config.output_dir, started_at, &classes)?;
+        let mut event = RecordingEvent::start(RecordingEventParams {
+            final_clip_path: path,
+            output_dir: config.output_dir.clone(),
+            started_at,
             width,
             height,
-            RECORDING_FRAME_RATE,
+            frame_rate: RECORDING_FRAME_RATE,
             audio_sample_rate,
             audio_channels,
             clip_timeline_start,
-        )?;
+        })?;
 
         for d in &confirmed {
             event.record_detection(d.class_name, d.confidence, frame_timestamp);
