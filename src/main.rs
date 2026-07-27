@@ -100,7 +100,21 @@ impl ActiveEvent {
 /// unseeded would hand `finish` an empty video/audio pair, producing a
 /// malformed mux instead of a usable (if short) clip, so it must be seeded
 /// here first, same as the writer thread would have done.
-fn finish_event_on_shutdown(active_event: &Mutex<ActiveEvent>) -> Result<()> {
+fn finish_event_on_shutdown(
+    active_event: &Mutex<ActiveEvent>,
+    writer_drained: &AtomicBool,
+) -> Result<()> {
+    // The writer thread does its own last-chance drain on shutdown (see
+    // `run_recording_writer_loop`) so trailing footage captured while this
+    // thread was mid-inference still lands in the clip. Wait for that drain
+    // to actually happen before taking/finishing the event -- otherwise this
+    // thread can race the writer thread and finish the clip first, in which
+    // case the writer's later drain finds `ActiveEvent::None` and silently
+    // drops that trailing footage instead of writing it.
+    while !writer_drained.load(Ordering::SeqCst) {
+        thread::sleep(Duration::from_millis(5));
+    }
+
     let taken = std::mem::replace(
         &mut *active_event.lock().expect("active event lock poisoned"),
         ActiveEvent::None,
@@ -203,15 +217,23 @@ fn main() -> Result<()> {
     // safe to drive from a background thread) and runs its own fast display
     // loop pulling directly from the ring buffer, so a slow detection pass
     // never causes the visible feed to stutter.
+    // Set by the writer thread after its post-shutdown last-chance drain
+    // completes; the detection loop's shutdown path waits on this before
+    // finishing the active event, so the writer's final drain is guaranteed
+    // to land before the clip is finalized instead of racing it.
+    let writer_drained = Arc::new(AtomicBool::new(false));
+
     let worker_shutdown = Arc::clone(&shutdown);
     let worker_ring_buffer = Arc::clone(&ring_buffer);
     let worker_active_event = Arc::clone(&active_event);
+    let worker_writer_drained = Arc::clone(&writer_drained);
     let worker_handle = thread::spawn(move || {
         if let Err(err) = run_detection_loop(
             config,
             worker_ring_buffer,
             worker_shutdown,
             worker_active_event,
+            worker_writer_drained,
             audio_sample_rate,
             audio_channels,
         ) {
@@ -223,7 +245,12 @@ fn main() -> Result<()> {
     let writer_ring_buffer = Arc::clone(&ring_buffer);
     let writer_active_event = Arc::clone(&active_event);
     let writer_handle = thread::spawn(move || {
-        run_recording_writer_loop(writer_ring_buffer, writer_active_event, writer_shutdown);
+        run_recording_writer_loop(
+            writer_ring_buffer,
+            writer_active_event,
+            writer_shutdown,
+            writer_drained,
+        );
     });
 
     log::info!("motioncap started; watching for motion");
@@ -294,6 +321,7 @@ fn run_recording_writer_loop(
     ring_buffer: Arc<Mutex<RingBuffer>>,
     active_event: Arc<Mutex<ActiveEvent>>,
     shutdown: Arc<AtomicBool>,
+    writer_drained: Arc<AtomicBool>,
 ) {
     loop {
         if shutdown.load(Ordering::SeqCst) {
@@ -303,8 +331,13 @@ fn run_recording_writer_loop(
             // completes. Draining once more here before exiting means
             // whatever the camera/mic captured up to this instant still
             // makes it into the clip instead of being silently dropped from
-            // the tail end of the recording.
+            // the tail end of the recording. `writer_drained` is set
+            // strictly after this drain completes, and `finish_event_on_shutdown`
+            // waits on it before taking/finishing the event, so this drain is
+            // guaranteed to land before the clip is finalized rather than
+            // racing it.
             seed_and_drain_active_event(&ring_buffer, &active_event);
+            writer_drained.store(true, Ordering::SeqCst);
             return;
         }
 
@@ -363,6 +396,7 @@ fn run_detection_loop(
     ring_buffer: Arc<Mutex<RingBuffer>>,
     shutdown: Arc<AtomicBool>,
     active_event: Arc<Mutex<ActiveEvent>>,
+    writer_drained: Arc<AtomicBool>,
     audio_sample_rate: u32,
     audio_channels: u16,
 ) -> Result<()> {
@@ -373,7 +407,7 @@ fn run_detection_loop(
 
     loop {
         if shutdown.load(Ordering::SeqCst) {
-            finish_event_on_shutdown(&active_event)?;
+            finish_event_on_shutdown(&active_event, &writer_drained)?;
             return Ok(());
         }
 
@@ -473,7 +507,7 @@ fn run_detection_loop(
             // trigger rather than starting a recording with no video.
             continue;
         };
-        
+
         let (width, height) = first_pre_frame.image.dimensions();
         let clip_timeline_start = first_pre_frame.timestamp;
 
