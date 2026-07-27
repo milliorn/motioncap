@@ -25,7 +25,7 @@ mod startup;
 mod triggers;
 
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 use std::time::Duration;
 
@@ -91,6 +91,37 @@ impl ActiveEvent {
     }
 }
 
+/// Signals when the writer thread has completed its post-shutdown
+/// last-chance drain (see `run_recording_writer_loop`), so the detection
+/// loop's shutdown path can block on it instead of finalizing the active
+/// event prematurely. A condvar rather than a busy-polled flag, since this
+/// is a one-shot handshake during shutdown, not a recurring cadence.
+#[derive(Default)]
+struct WriterDrained {
+    /// Set to `true` once the writer thread's final drain has completed.
+    done: Mutex<bool>,
+    /// Notified when `done` is set, to wake `wait`'s blocked receiver.
+    condvar: Condvar,
+}
+
+impl WriterDrained {
+    /// Marks the final drain as complete and wakes any thread blocked in `wait`.
+    fn signal(&self) {
+        *self.done.lock().expect("writer-drained lock poisoned") = true;
+        self.condvar.notify_one();
+    }
+
+    /// Blocks until `signal` has been called.
+    fn wait(&self) {
+        let guard = self.done.lock().expect("writer-drained lock poisoned");
+        drop(
+            self.condvar
+                .wait_while(guard, |done| !*done)
+                .expect("writer-drained lock poisoned"),
+        );
+    }
+}
+
 /// Finalizes whatever recording is in progress (if any) on shutdown.
 ///
 /// Deliberately does *not* use `ActiveEvent::take`, which collapses
@@ -102,7 +133,7 @@ impl ActiveEvent {
 /// here first, same as the writer thread would have done.
 fn finish_event_on_shutdown(
     active_event: &Mutex<ActiveEvent>,
-    writer_drained: &AtomicBool,
+    writer_drained: &WriterDrained,
 ) -> Result<()> {
     // The writer thread does its own last-chance drain on shutdown (see
     // `run_recording_writer_loop`) so trailing footage captured while this
@@ -111,9 +142,7 @@ fn finish_event_on_shutdown(
     // thread can race the writer thread and finish the clip first, in which
     // case the writer's later drain finds `ActiveEvent::None` and silently
     // drops that trailing footage instead of writing it.
-    while !writer_drained.load(Ordering::SeqCst) {
-        thread::sleep(Duration::from_millis(5));
-    }
+    writer_drained.wait();
 
     let taken = std::mem::replace(
         &mut *active_event.lock().expect("active event lock poisoned"),
@@ -217,11 +246,11 @@ fn main() -> Result<()> {
     // safe to drive from a background thread) and runs its own fast display
     // loop pulling directly from the ring buffer, so a slow detection pass
     // never causes the visible feed to stutter.
-    // Set by the writer thread after its post-shutdown last-chance drain
-    // completes; the detection loop's shutdown path waits on this before
-    // finishing the active event, so the writer's final drain is guaranteed
-    // to land before the clip is finalized instead of racing it.
-    let writer_drained = Arc::new(AtomicBool::new(false));
+    // Signaled by the writer thread after its post-shutdown last-chance
+    // drain completes; the detection loop's shutdown path waits on this
+    // before finishing the active event, so the writer's final drain is
+    // guaranteed to land before the clip is finalized instead of racing it.
+    let writer_drained = Arc::new(WriterDrained::default());
 
     let worker_shutdown = Arc::clone(&shutdown);
     let worker_ring_buffer = Arc::clone(&ring_buffer);
@@ -321,7 +350,7 @@ fn run_recording_writer_loop(
     ring_buffer: Arc<Mutex<RingBuffer>>,
     active_event: Arc<Mutex<ActiveEvent>>,
     shutdown: Arc<AtomicBool>,
-    writer_drained: Arc<AtomicBool>,
+    writer_drained: Arc<WriterDrained>,
 ) {
     loop {
         if shutdown.load(Ordering::SeqCst) {
@@ -331,13 +360,13 @@ fn run_recording_writer_loop(
             // completes. Draining once more here before exiting means
             // whatever the camera/mic captured up to this instant still
             // makes it into the clip instead of being silently dropped from
-            // the tail end of the recording. `writer_drained` is set
+            // the tail end of the recording. `writer_drained` is signaled
             // strictly after this drain completes, and `finish_event_on_shutdown`
             // waits on it before taking/finishing the event, so this drain is
             // guaranteed to land before the clip is finalized rather than
             // racing it.
             seed_and_drain_active_event(&ring_buffer, &active_event);
-            writer_drained.store(true, Ordering::SeqCst);
+            writer_drained.signal();
             return;
         }
 
@@ -396,7 +425,7 @@ fn run_detection_loop(
     ring_buffer: Arc<Mutex<RingBuffer>>,
     shutdown: Arc<AtomicBool>,
     active_event: Arc<Mutex<ActiveEvent>>,
-    writer_drained: Arc<AtomicBool>,
+    writer_drained: Arc<WriterDrained>,
     audio_sample_rate: u32,
     audio_channels: u16,
 ) -> Result<()> {

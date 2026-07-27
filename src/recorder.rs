@@ -110,7 +110,7 @@ pub struct RecordingEvent {
     /// Every distinct class detected so far during this clip (ADR 4: the
     /// final filename must reflect every class seen over the clip's
     /// lifetime, not just the classes that triggered it).
-    all_classes: BTreeSet<String>,
+    all_classes: BTreeSet<&'static str>,
     /// Every detection recorded so far during this clip.
     detections: Vec<DetectionRecord>,
 }
@@ -223,11 +223,13 @@ impl RecordingEvent {
             let tick = Duration::from_secs_f64(1.0 / f64::from(self.frame_rate));
 
             self.last_frame_drain_at = last.timestamp;
+            
             #[allow(
                 clippy::arithmetic_side_effects,
                 reason = "Instant + a sub-second Duration only overflows after ~584 billion years of process uptime"
             )]
             let next_due = last.timestamp + tick;
+
             self.next_frame_due = Some(next_due);
         }
 
@@ -388,7 +390,7 @@ impl RecordingEvent {
     /// wall-clock time at the moment this function happens to run.
     pub fn record_detection(
         &mut self,
-        class_name: &str,
+        class_name: &'static str,
         confidence: f32,
         frame_timestamp: Instant,
     ) {
@@ -396,7 +398,7 @@ impl RecordingEvent {
             .saturating_duration_since(self.clip_timeline_start)
             .as_secs_f64();
 
-        self.all_classes.insert(class_name.to_string());
+        self.all_classes.insert(class_name);
 
         self.detections.push(DetectionRecord {
             offset_secs,
@@ -454,7 +456,7 @@ impl RecordingEvent {
         let _ = std::fs::remove_file(&self.video_tmp_path);
         let _ = std::fs::remove_file(&self.audio_tmp_path);
 
-        let all_classes: Vec<&str> = self.all_classes.iter().map(String::as_str).collect();
+        let all_classes: Vec<&str> = self.all_classes.iter().copied().collect();
         let renamed_path = clip_path(&self.output_dir, self.started_at, &all_classes)?;
 
         if renamed_path != self.final_clip_path {
