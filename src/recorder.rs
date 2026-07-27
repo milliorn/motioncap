@@ -297,9 +297,10 @@ impl RecordingEvent {
         // Fill any ticks that have fully elapsed by wall-clock time but
         // weren't satisfied above (the camera didn't deliver a qualifying
         // frame this poll), duplicating the last frame actually written so
-        // encoded duration keeps pace with real elapsed time. Bounded by
-        // `now` so a long-stalled writer thread can't produce an unbounded
-        // catch-up burst.
+        // encoded duration keeps pace with real elapsed time. The `now` bound
+        // caps this to one tick per elapsed stall duration, not a fixed
+        // count -- a camera stall of several seconds still produces a burst
+        // of that many synchronous writes here before the next poll.
         let now = Instant::now();
 
         while let Some(due) = next_due {
@@ -328,11 +329,10 @@ impl RecordingEvent {
     }
 
     /// Writes any audio captured since the last drain (or since the event
-    /// started, for the first call). Must be polled periodically while the
-    /// event is active so live audio keeps accumulating for the clip's full
-    /// duration, not just the pre-buffer window written in `start`.
-    /// Writes every audio chunk captured since the last drain (or since the
-    /// event started, for the first call) into the temp PCM file.
+    /// started, for the first call) into the temp PCM file. Must be polled
+    /// periodically while the event is active so live audio keeps
+    /// accumulating for the clip's full duration, not just the pre-buffer
+    /// window written in `start`.
     pub fn drain_audio(
         &mut self,
         ring_buffer: &std::sync::Mutex<crate::buffer::RingBuffer>,
