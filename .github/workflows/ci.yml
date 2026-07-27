@@ -39,6 +39,13 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v7
 
+      # cpal (audio capture) links against ALSA at build time regardless of
+      # whether OpenCV is cached, so this runs unconditionally on every run.
+      - name: Install runtime linkage dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends libasound2-dev
+
       - name: Cache OpenCV build
         id: cache-opencv
         uses: actions/cache@v4
