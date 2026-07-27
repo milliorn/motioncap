@@ -236,6 +236,52 @@ fn main() -> Result<()> {
     Ok(())
 }
 
+/// Seeds a `Pending` event's pre-buffer (promoting it to `Active`) and drains
+/// any newly-captured frames/audio into whichever event is active, if any.
+/// Shared between the writer thread's normal poll cadence and its
+/// shutdown path (see `run_recording_writer_loop`), so a shutdown that lands
+/// mid-inference in the detection loop still gets one last drain instead of
+/// silently dropping trailing footage the writer thread would otherwise
+/// never pick up.
+///
+/// The lock is deliberately held across the seed/drain calls below, not just
+/// the state-swap: `active_event` must reflect "a recording is in flight"
+/// continuously for the detection loop's shutdown path (which calls `take()`
+/// and finishes the event) and its `is_some()` check to observe consistent
+/// state. Releasing it mid-drain would open a window where a concurrent
+/// shutdown fails to finalize the in-flight clip.
+#[allow(
+    clippy::significant_drop_tightening,
+    reason = "guard must stay held across seed/drain so shutdown's take() can't race an in-flight event"
+)]
+fn seed_and_drain_active_event(ring_buffer: &Mutex<RingBuffer>, active_event: &Mutex<ActiveEvent>) {
+    let mut guard = active_event.lock().expect("active event lock poisoned");
+
+    let taken = std::mem::replace(&mut *guard, ActiveEvent::None);
+
+    match taken {
+        ActiveEvent::Pending(mut pending) => {
+            if let Err(err) = pending.event.seed(&pending.pre_frames, &pending.pre_audio) {
+                log::error!("failed to seed pre-buffer into new recording: {err:?}");
+            }
+            *guard = ActiveEvent::Active(pending.event);
+        }
+        other => *guard = other,
+    }
+
+    let Some(event) = guard.as_recording_mut() else {
+        return;
+    };
+
+    if let Err(err) = event.drain_frames(ring_buffer) {
+        log::error!("failed to drain frames into active recording: {err:?}");
+    }
+
+    if let Err(err) = event.drain_audio(ring_buffer) {
+        log::error!("failed to drain audio into active recording: {err:?}");
+    }
+}
+
 /// Writes frames/audio into the active recording (if any) on a steady clock,
 /// independent of how long motion-gate/YOLO evaluation takes in the
 /// detection loop. This is what keeps recorded clips at a uniform frame
@@ -244,10 +290,6 @@ fn main() -> Result<()> {
     clippy::needless_pass_by_value,
     reason = "Arc clones are moved into a spawned 'static thread closure, so they must be owned here"
 )]
-#[allow(
-    clippy::significant_drop_tightening,
-    reason = "guard must stay held across seed/drain so shutdown's take() can't race an in-flight event"
-)]
 fn run_recording_writer_loop(
     ring_buffer: Arc<Mutex<RingBuffer>>,
     active_event: Arc<Mutex<ActiveEvent>>,
@@ -255,42 +297,20 @@ fn run_recording_writer_loop(
 ) {
     loop {
         if shutdown.load(Ordering::SeqCst) {
+            // The detection loop may still be blocked in YOLO inference when
+            // shutdown fires and won't reach its own shutdown check (which
+            // is what finishes the clip) until that inference pass
+            // completes. Draining once more here before exiting means
+            // whatever the camera/mic captured up to this instant still
+            // makes it into the clip instead of being silently dropped from
+            // the tail end of the recording.
+            seed_and_drain_active_event(&ring_buffer, &active_event);
             return;
         }
 
         thread::sleep(RECORDING_POLL_INTERVAL);
 
-        // The lock is deliberately held across the seed/drain calls below,
-        // not just the state-swap: `active_event` must reflect "a recording
-        // is in flight" continuously for the detection loop's shutdown path
-        // (which calls `take()` and finishes the event) and its `is_some()`
-        // check to observe consistent state. Releasing it mid-drain would
-        // open a window where a concurrent shutdown fails to finalize the
-        // in-flight clip.
-        let mut guard = active_event.lock().expect("active event lock poisoned");
-
-        let taken = std::mem::replace(&mut *guard, ActiveEvent::None);
-
-        match taken {
-            ActiveEvent::Pending(mut pending) => {
-                if let Err(err) = pending.event.seed(&pending.pre_frames, &pending.pre_audio) {
-                    log::error!("failed to seed pre-buffer into new recording: {err:?}");
-                }
-                *guard = ActiveEvent::Active(pending.event);
-            }
-            other => *guard = other,
-        }
-
-        let Some(event) = guard.as_recording_mut() else {
-            continue;
-        };
-
-        if let Err(err) = event.drain_frames(&ring_buffer) {
-            log::error!("failed to drain frames into active recording: {err:?}");
-        }
-        if let Err(err) = event.drain_audio(&ring_buffer) {
-            log::error!("failed to drain audio into active recording: {err:?}");
-        }
+        seed_and_drain_active_event(&ring_buffer, &active_event);
     }
 }
 
@@ -453,6 +473,7 @@ fn run_detection_loop(
             // trigger rather than starting a recording with no video.
             continue;
         };
+        
         let (width, height) = first_pre_frame.image.dimensions();
         let clip_timeline_start = first_pre_frame.timestamp;
 
