@@ -1,0 +1,44 @@
+documentation:
+  - changed-files:
+      - any-glob-to-any-file: ["**/*.md", "LICENSE", "docs/adr/**"]
+
+dependencies:
+  - changed-files:
+      - any-glob-to-any-file:
+          ["Cargo.toml", "Cargo.lock", ".github/dependabot.yml"]
+
+github_actions:
+  - changed-files:
+      - any-glob-to-any-file: ".github/workflows/**"
+
+rust:
+  - changed-files:
+      - any-glob-to-any-file: ["src/**/*.rs", "build.rs"]
+
+capture:
+  - changed-files:
+      - any-glob-to-any-file: ["src/capture/**", "src/buffer.rs"]
+
+detection:
+  - changed-files:
+      - any-glob-to-any-file: ["src/detect.rs", "src/motion.rs", "src/triggers.rs"]
+
+recording:
+  - changed-files:
+      - any-glob-to-any-file: ["src/recorder.rs", "src/paths.rs"]
+
+startup:
+  - changed-files:
+      - any-glob-to-any-file: ["src/startup/**"]
+
+config:
+  - changed-files:
+      - any-glob-to-any-file: ["src/config.rs", "Cargo.toml", ".cargo/**"]
+
+preview:
+  - changed-files:
+      - any-glob-to-any-file: ["src/preview.rs"]
+
+ci:
+  - changed-files:
+      - any-glob-to-any-file: [".github/workflows/**", ".github/*.yml"]
