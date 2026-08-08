@@ -10,6 +10,14 @@ use serde::Serialize;
 use crate::buffer::{TimestampedAudio, TimestampedFrame};
 use crate::paths::{clip_path, sidecar_path};
 
+/// How long the camera may go without delivering a real frame before
+/// `camera_stalled` reports true. Must be well above ordinary jitter between
+/// detection-loop polls (camera delivery timing, YOLO inference duration can
+/// both momentarily exceed one tick) so normal operation never false-trips
+/// this, while still being short enough that a genuinely dead camera ends
+/// the recording within a couple of seconds rather than dragging on.
+const MAX_FRAME_STALL: Duration = Duration::from_millis(1500);
+
 /// One recorded detection, written into a clip's `.json` sidecar (ADR 4).
 #[derive(Serialize)]
 pub struct DetectionRecord {
@@ -304,18 +312,13 @@ impl RecordingEvent {
         Ok(())
     }
 
-    /// True once a frame-rate tick is due (by wall-clock time) that the
-    /// camera hasn't delivered a real frame for. Callers should treat this as
-    /// an immediate signal to end the recording -- `drain_frames` never
-    /// fabricates a frame to cover for the camera, and the motion gate has
-    /// nothing new to evaluate once frames stop arriving, so nothing else
-    /// will naturally close the clip.
+    /// True once the camera has gone `MAX_FRAME_STALL` without delivering a
+    /// real frame. Callers should treat this as a signal to end the
+    /// recording -- `drain_frames` never fabricates a frame to cover for the
+    /// camera, and the motion gate has nothing new to evaluate once frames
+    /// stop arriving, so nothing else will naturally close the clip.
     pub fn camera_stalled(&self) -> bool {
-        let Some(due) = self.next_frame_due else {
-            return false;
-        };
-
-        due <= Instant::now() && self.last_real_frame_at.elapsed() >= self.frame_tick()
+        self.last_real_frame_at.elapsed() >= MAX_FRAME_STALL
     }
 
     /// Duration of one frame-rate tick at this event's configured `frame_rate`.
