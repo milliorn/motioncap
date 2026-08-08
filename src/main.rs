@@ -25,7 +25,7 @@ mod startup;
 mod triggers;
 
 use std::sync::atomic::{AtomicBool, Ordering};
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::thread;
 use std::time::Duration;
 
@@ -412,6 +412,40 @@ fn run_preview_loop(
     }
 }
 
+/// Closes the active recording if either close condition is met: the camera
+/// has stalled (see `RecordingEvent::camera_stalled`), which the motion gate
+/// can never detect on its own since a stalled camera means no new frames
+/// ever reach it to evaluate; or the post-buffer quiet window has elapsed
+/// with no fresh trigger. No-ops if neither condition holds.
+///
+/// Takes the `MutexGuard` by value so it can be dropped before `finish`
+/// (which waits on ffmpeg) runs -- the lock must not be held across that.
+fn close_event_if_done(
+    mut guard: MutexGuard<'_, ActiveEvent>,
+    post_buffer: Duration,
+) -> Result<()> {
+    let Some(event) = guard.as_recording_mut() else {
+        return Ok(());
+    };
+
+    let stalled = event.camera_stalled();
+    let quiet_timed_out = event.quiet_for() >= post_buffer;
+
+    if stalled || quiet_timed_out {
+        let event = guard.take().expect("checked Some above");
+        drop(guard);
+        event.finish()?;
+
+        if stalled {
+            log::warn!("recording closed: camera stopped delivering frames");
+        } else {
+            log::info!("recording closed");
+        }
+    }
+
+    Ok(())
+}
+
 /// Polls the ring buffer at `DETECTION_FRAME_RATE`, runs the motion gate and
 /// (on trip) YOLO confirmation, and owns the recording lifecycle: starting a
 /// new `ActiveEvent::Pending` on a confirmed detection and closing it once
@@ -419,6 +453,10 @@ fn run_preview_loop(
 #[allow(
     clippy::needless_pass_by_value,
     reason = "config and Arc clones are moved into a spawned 'static thread closure, so they must be owned here"
+)]
+#[allow(
+    clippy::significant_drop_tightening,
+    reason = "guard is moved into close_event_if_done, which drops it itself before the slow finish() call"
 )]
 fn run_detection_loop(
     config: Config,
@@ -492,12 +530,7 @@ fn run_detection_loop(
                 }
             }
 
-            if event.quiet_for() >= post_buffer {
-                let event = guard.take().expect("checked Some above");
-                drop(guard);
-                event.finish()?;
-                log::info!("recording closed");
-            }
+            close_event_if_done(guard, post_buffer)?;
             continue;
         }
 

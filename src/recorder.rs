@@ -103,10 +103,12 @@ pub struct RecordingEvent {
     last_frame_drain_at: Instant,
     /// The next frame-rate tick due to be written, if any.
     next_frame_due: Option<Instant>,
-    /// The most recently written video frame, kept so `drain_frames` can
-    /// duplicate it to fill ticks the camera didn't deliver a new frame for
-    /// (see `drain_frames`'s docs).
-    last_written_frame: Option<image::RgbImage>,
+    /// Wall-clock time a real, camera-delivered frame was last written. Used
+    /// by `camera_stalled` to detect when the camera has stopped delivering
+    /// frames -- a security recording must never paper over a gap by
+    /// fabricating footage, so unlike a naive resampler this never duplicates
+    /// a frame to fill a missed tick; it reports the stall instead.
+    last_real_frame_at: Instant,
     /// Every distinct class detected so far during this clip (ADR 4: the
     /// final filename must reflect every class seen over the clip's
     /// lifetime, not just the classes that triggered it).
@@ -188,7 +190,7 @@ impl RecordingEvent {
             last_audio_drain_at: now,
             last_frame_drain_at: now,
             next_frame_due: None,
-            last_written_frame: None,
+            last_real_frame_at: now,
             all_classes: BTreeSet::new(),
             detections: Vec::new(),
         })
@@ -216,19 +218,20 @@ impl RecordingEvent {
 
         for frame in &selected {
             self.write_frame(&frame.image)?;
-            self.last_written_frame = Some(frame.image.clone());
+        }
+
+        if !selected.is_empty() {
+            self.last_real_frame_at = Instant::now();
         }
 
         if let Some(last) = selected.last() {
-            let tick = Duration::from_secs_f64(1.0 / f64::from(self.frame_rate));
-
             self.last_frame_drain_at = last.timestamp;
 
             #[allow(
                 clippy::arithmetic_side_effects,
                 reason = "Instant + a sub-second Duration only overflows after ~584 billion years of process uptime"
             )]
-            let next_due = last.timestamp + tick;
+            let next_due = last.timestamp + self.frame_tick();
 
             self.next_frame_due = Some(next_due);
         }
@@ -255,16 +258,13 @@ impl RecordingEvent {
     /// arrived and was superseded in between, which produces a visible jump
     /// in the subject's position despite otherwise-correct frame timing.
     ///
-    /// If the camera momentarily delivers *fewer* frames than `frame_rate`
-    /// (or stalls), the reverse problem applies: no buffered frame may cross
-    /// a given tick, so nothing gets written for it. Left unhandled, the
-    /// encoded video (ffmpeg's `-framerate` assumes uniform spacing) falls
-    /// behind wall-clock elapsed time, which plays back sped-up and leaves
-    /// the independently wall-clock-accumulated audio longer than the video
-    /// at mux time. To keep output duration aligned with real elapsed time,
-    /// any tick that's fully elapsed by wall-clock `Instant::now()` without a
-    /// new frame satisfying it gets filled by re-writing the last frame
-    /// actually written.
+    /// This is a security recording: it must never paper over a gap in
+    /// coverage by fabricating footage. If the camera doesn't deliver a real
+    /// frame for a tick that's already due by wall-clock `Instant::now()`,
+    /// this does *not* duplicate the last frame to fill it -- it stops
+    /// writing and leaves `camera_stalled` reporting true so the caller ends
+    /// the recording instead of the clip silently containing footage that
+    /// was never actually captured.
     pub fn drain_frames(
         &mut self,
         ring_buffer: &std::sync::Mutex<crate::buffer::RingBuffer>,
@@ -278,7 +278,11 @@ impl RecordingEvent {
             self.last_frame_drain_at = last.timestamp;
         }
 
-        let tick = Duration::from_secs_f64(1.0 / f64::from(self.frame_rate));
+        if !new_frames.is_empty() {
+            self.last_real_frame_at = Instant::now();
+        }
+
+        let tick = self.frame_tick();
         let mut next_due = self.next_frame_due;
 
         for frame in &new_frames {
@@ -286,7 +290,6 @@ impl RecordingEvent {
 
             if frame.timestamp >= due {
                 self.write_frame(&frame.image)?;
-                self.last_written_frame = Some(frame.image.clone());
                 #[allow(
                     clippy::arithmetic_side_effects,
                     reason = "Instant + a sub-second Duration only overflows after ~584 billion years of process uptime"
@@ -296,38 +299,28 @@ impl RecordingEvent {
             }
         }
 
-        // Fill any ticks that have fully elapsed by wall-clock time but
-        // weren't satisfied above (the camera didn't deliver a qualifying
-        // frame this poll), duplicating the last frame actually written so
-        // encoded duration keeps pace with real elapsed time. The `now` bound
-        // caps this to one tick per elapsed stall duration, not a fixed
-        // count -- a camera stall of several seconds still produces a burst
-        // of that many synchronous writes here before the next poll.
-        let now = Instant::now();
-
-        while let Some(due) = next_due {
-            if due > now {
-                break;
-            }
-
-            let Some(last_frame) = self.last_written_frame.clone() else {
-                break;
-            };
-
-            self.write_frame(&last_frame)?;
-
-            #[allow(
-                clippy::arithmetic_side_effects,
-                reason = "Instant + a sub-second Duration only overflows after ~584 billion years of process uptime"
-            )]
-            let new_due = due + tick;
-
-            next_due = Some(new_due);
-        }
-
         self.next_frame_due = next_due;
 
         Ok(())
+    }
+
+    /// True once a frame-rate tick is due (by wall-clock time) that the
+    /// camera hasn't delivered a real frame for. Callers should treat this as
+    /// an immediate signal to end the recording -- `drain_frames` never
+    /// fabricates a frame to cover for the camera, and the motion gate has
+    /// nothing new to evaluate once frames stop arriving, so nothing else
+    /// will naturally close the clip.
+    pub fn camera_stalled(&self) -> bool {
+        let Some(due) = self.next_frame_due else {
+            return false;
+        };
+
+        due <= Instant::now() && self.last_real_frame_at.elapsed() >= self.frame_tick()
+    }
+
+    /// Duration of one frame-rate tick at this event's configured `frame_rate`.
+    fn frame_tick(&self) -> Duration {
+        Duration::from_secs_f64(1.0 / f64::from(self.frame_rate))
     }
 
     /// Writes any audio captured since the last drain (or since the event
