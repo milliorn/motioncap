@@ -2,16 +2,58 @@
 name = "motioncap"
 version = "0.1.0"
 edition = "2024"
+description = "Webcam-based security motion-capture tool with motion detection, YOLO confirmation, and H.264+AAC recording"
+license = "MIT"
+repository = "https://github.com/milliorn/motioncap"
+readme = "README.md"
+keywords = ["security", "surveillance", "motion-detection", "camera", "yolo"]
+categories = ["multimedia::video", "command-line-utilities"]
 
 [dependencies]
 anyhow = "1.0.104"
 chrono = "0.4.45"
 clap = { version = "4.6.4", features = ["derive"] }
 cpal = "0.18.1"
-crossbeam-channel = "0.5.16"
+ctrlc = "3.5.2"
+env_logger = "0.11.11"
 image = { version = "0.25.10", default-features = false, features = ["jpeg", "png", "rayon"] }
-nokhwa = { version = "0.10.11", features = ["input-v4l", "decoding"] }
+log = "0.4.33"
+ndarray = "0.17.2"
+nokhwa = { version = "0.10.11", features = ["input-v4l", "decoding", "output-threaded"] }
 opencv = { version = "0.99.0", default-features = false, features = ["clang-runtime", "video", "videoio", "imgproc", "imgcodecs", "highgui"] }
 ort = { version = "2.0.0-rc.12", features = ["cuda", "load-dynamic", "ndarray", "openvino", "rocm"] }
 serde = { version = "1.0.229", features = ["derive"] }
 serde_json = "1.0.151"
+
+[lints.rust]
+unsafe_code = "deny"
+missing_debug_implementations = "warn"
+missing_docs = "deny"
+
+[lints.rustdoc]
+all = { level = "deny", priority = -1 }
+
+[lints.clippy]
+all = { level = "deny", priority = -1 }
+pedantic = { level = "deny", priority = -1 }
+nursery = { level = "deny", priority = -1 }
+cargo = { level = "deny", priority = -1 }
+multiple_crate_versions = "allow"
+unwrap_used = "deny"
+panic = "deny"
+print_stdout = "deny"
+dbg_macro = "deny"
+unreachable = "deny"
+todo = "deny"
+unimplemented = "deny"
+indexing_slicing = "deny"
+arithmetic_side_effects = "deny"
+missing_docs_in_private_items = "deny"
+missing_errors_doc = "deny"
+missing_panics_doc = "deny"
+doc_markdown = "deny"
+too_long_first_doc_paragraph = "deny"
+doc_link_with_quotes = "deny"
+doc_comment_double_space_linebreaks = "deny"
+doc_link_code = "deny"
+doc_include_without_cfg = "deny"
