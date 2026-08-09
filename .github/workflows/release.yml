@@ -1,50 +1,24 @@
 name: Release
 
-# Run only on pushes to main that touch source or the crate manifest/lockfile.
-# Version-only bumps to unrelated files (docs, workflows) don't need a release run.
+# Run on every push to main. release-please itself decides whether that push
+# means "update the pending release PR" or "a release PR was just merged, cut
+# the release" -- no paths filter, since a commit's Conventional Commits type
+# (not which files changed) is what release-please uses to decide.
 on:
   push:
     branches:
       - main
-    paths:
-      - "src/**"
-      - "Cargo.toml"
-      - "Cargo.lock"
 
 permissions:
   contents: write
+  issues: write
   pull-requests: write
 
 jobs:
-  release:
+  release-please:
     runs-on: ubuntu-latest
-
     steps:
-      - name: Checkout repository
-        uses: actions/checkout@v7
+      - uses: googleapis/release-please-action@v4
         with:
-          fetch-depth: 0
-
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
-
-      - name: Cache cargo registry and build artifacts
-        uses: actions/cache@v6
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: cargo-${{ runner.os }}-${{ hashFiles('Cargo.lock') }}
-          restore-keys: |
-            cargo-${{ runner.os }}-
-
-      - name: Configure Git
-        run: |
-          git config --global user.name "github-actions[bot]"
-          git config --global user.email "github-actions[bot]@users.noreply.github.com"
-
-      # Requires cargo-release (or similar) to be installed and configured
-      # before this step will do anything -- not yet wired up in this repo.
-      - name: Run release
-        run: cargo release --execute --no-confirm
+          config-file: release-please-config.json
+          manifest-file: .release-please-manifest.json
