@@ -4,9 +4,7 @@ use std::path::Path;
 use anyhow::{Context, Result};
 use image::{RgbImage, imageops::FilterType};
 use ndarray::{Array4, s};
-use ort::ep::{
-    CPUExecutionProvider, CUDAExecutionProvider, OpenVINOExecutionProvider, ROCmExecutionProvider,
-};
+use ort::ep::{CPU, CUDA, OpenVINO, ROCm};
 use ort::session::Session;
 use ort::session::builder::GraphOptimizationLevel;
 use ort::value::{Shape, Tensor};
@@ -74,16 +72,16 @@ impl Detector {
             // configured) isn't guaranteed to be CPU-only -- silently
             // defeating what `--force-cpu` promises.
             ort_err(
-                builder.with_execution_providers([CPUExecutionProvider::default().build()]),
+                builder.with_execution_providers([CPU::default().build()]),
                 "failed to register CPU execution provider",
             )?
         } else {
             ort_err(
                 builder.with_execution_providers([
-                    CUDAExecutionProvider::default().build(),
-                    ROCmExecutionProvider::default().build(),
-                    OpenVINOExecutionProvider::default().build(),
-                    CPUExecutionProvider::default().build(),
+                    CUDA::default().build(),
+                    ROCm::default().build(),
+                    OpenVINO::default().build(),
+                    CPU::default().build(),
                 ]),
                 "failed to register execution providers",
             )?
