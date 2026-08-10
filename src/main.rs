@@ -225,12 +225,8 @@ impl std::io::Write for TeeWriter {
 /// `env_logger::init()` would otherwise. `output_dir` is created if it
 /// doesn't exist yet, since this may run before anything else has created it.
 fn init_logging(output_dir: &std::path::Path) -> Result<()> {
-    std::fs::create_dir_all(output_dir).with_context(|| {
-        format!(
-            "failed to create output directory {}",
-            output_dir.display()
-        )
-    })?;
+    std::fs::create_dir_all(output_dir)
+        .with_context(|| format!("failed to create output directory {}", output_dir.display()))?;
 
     let log_path = output_dir.join(LOG_FILE_NAME);
     let file = std::fs::OpenOptions::new()
