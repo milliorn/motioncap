@@ -430,11 +430,11 @@ impl RecordingEvent {
         self.last_trigger_at = Instant::now();
     }
 
-    /// Records a motion-gate trip into the sidecar. Unlike `record_detection`,
-    /// this does not reset the post-buffer quiet window itself -- callers
-    /// that also want that should call `touch`/`record_detection` alongside
-    /// it, since a motion trip alone (without YOLO confirmation) is exactly
-    /// the case ADR 2 says must not by itself keep a recording alive.
+    /// Records a motion-gate trip into the sidecar for later audit (e.g.
+    /// distinguishing a fan/curtain repeatedly tripping the gate from an
+    /// actual subject). Purely diagnostic bookkeeping -- does not itself
+    /// touch the post-buffer quiet window; callers already call
+    /// `touch`/`record_detection` for that as needed.
     pub fn record_motion(&mut self, changed_ratio: f32, frame_timestamp: Instant) {
         let offset_secs = frame_timestamp
             .saturating_duration_since(self.clip_timeline_start)
