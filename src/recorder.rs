@@ -139,6 +139,8 @@ pub struct RecordingEvent {
     all_classes: BTreeSet<&'static str>,
     /// Every detection recorded so far during this clip.
     detections: Vec<DetectionRecord>,
+    /// Every motion-gate trip recorded so far during this clip.
+    motion_events: Vec<MotionEvent>,
 }
 
 impl RecordingEvent {
