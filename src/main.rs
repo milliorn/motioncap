@@ -194,12 +194,64 @@ const PREVIEW_FRAME_RATE: u32 = 30;
 /// Poll interval derived from `PREVIEW_FRAME_RATE`.
 const PREVIEW_POLL_INTERVAL: Duration = Duration::from_millis(1000 / PREVIEW_FRAME_RATE as u64);
 
+/// Log file name written under `--output-dir` (see `init_logging`).
+const LOG_FILE_NAME: &str = "motioncap.log";
+
+/// Writes every log line to both the given file and stderr, since this
+/// process runs long-lived and unattended (per `CLAUDE.md`) -- stderr alone
+/// is lost the moment the terminal/session that launched it goes away, but
+/// keeping stderr too means interactive/`--preview` runs still see live
+/// diagnostics without needing to tail the file.
+struct TeeWriter {
+    /// The persistent log file under `--output-dir`.
+    file: std::fs::File,
+}
+
+impl std::io::Write for TeeWriter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.file.write_all(buf)?;
+        std::io::stderr().write_all(buf)?;
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        self.file.flush()?;
+        std::io::stderr().flush()
+    }
+}
+
+/// Initializes logging to write every line to both `<output_dir>/motioncap.log`
+/// and stderr (see `TeeWriter`), honoring `RUST_LOG` exactly as a bare
+/// `env_logger::init()` would otherwise. `output_dir` is created if it
+/// doesn't exist yet, since this may run before anything else has created it.
+fn init_logging(output_dir: &std::path::Path) -> Result<()> {
+    std::fs::create_dir_all(output_dir).with_context(|| {
+        format!(
+            "failed to create output directory {}",
+            output_dir.display()
+        )
+    })?;
+
+    let log_path = output_dir.join(LOG_FILE_NAME);
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&log_path)
+        .with_context(|| format!("failed to open log file {}", log_path.display()))?;
+
+    env_logger::Builder::from_env(env_logger::Env::default())
+        .target(env_logger::Target::Pipe(Box::new(TeeWriter { file })))
+        .init();
+
+    Ok(())
+}
+
 /// Starts capture, the detection worker, the recording writer, and (if
 /// `--preview` is set) the preview loop, then blocks on the preview loop
 /// until shutdown.
 fn main() -> Result<()> {
-    env_logger::init();
     let config = Config::parse_args();
+    init_logging(&config.output_dir)?;
 
     startup::check_dependencies(&config)?;
 
