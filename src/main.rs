@@ -496,13 +496,13 @@ fn run_detection_loop(
             .is_some();
 
         if has_active_event {
-            let motion_tripped = motion_gate.evaluate(&frame)?;
+            let motion = motion_gate.evaluate(&frame)?;
 
             // `detector.detect` runs without holding the event lock since
             // YOLO inference is the slow step; the recording writer thread
             // must be free to keep writing frames/audio at a steady pace
             // while this runs, not blocked waiting on this lock.
-            let confirmed = if motion_tripped {
+            let confirmed = if motion.tripped {
                 let detections = detector.detect(&frame, config.detection_confidence)?;
                 triggers::evaluate(detections)
             } else {
@@ -517,7 +517,9 @@ fn run_detection_loop(
                 continue;
             };
 
-            if motion_tripped {
+            if motion.tripped {
+                event.record_motion(motion.changed_ratio, frame_timestamp);
+
                 if let Some(confirmed) = &confirmed {
                     for d in confirmed {
                         event.record_detection(d.class_name, d.confidence, frame_timestamp);
@@ -534,11 +536,11 @@ fn run_detection_loop(
             continue;
         }
 
-        let motion_tripped = motion_gate.evaluate(&frame)?;
+        let motion = motion_gate.evaluate(&frame)?;
 
-        log::trace!("frame received; motion_tripped={motion_tripped}");
+        log::trace!("frame received; motion_tripped={}", motion.tripped);
 
-        if !motion_tripped {
+        if !motion.tripped {
             continue;
         }
 
