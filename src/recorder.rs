@@ -16,7 +16,10 @@ use crate::paths::{clip_path, sidecar_path};
 /// both momentarily exceed one tick) so normal operation never false-trips
 /// this, while still being short enough that a genuinely dead camera ends
 /// the recording within a couple of seconds rather than dragging on.
-const MAX_FRAME_STALL: Duration = Duration::from_millis(1500);
+///
+/// Also reused by `main`'s pre-trigger staleness check so both paths agree on
+/// what counts as a stalled camera.
+pub const MAX_FRAME_STALL: Duration = Duration::from_millis(1500);
 
 /// One recorded detection, written into a clip's `.json` sidecar (ADR 4).
 #[derive(Serialize)]

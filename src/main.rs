@@ -504,6 +504,51 @@ fn close_event_if_done(
     Ok(())
 }
 
+/// Tracks the most recent frame timestamp `run_detection_loop` has evaluated,
+/// and how long that timestamp has been unchanged, to detect a stalled camera
+/// before any recording has started (see `frame_liveness_advanced`).
+struct FrameLiveness {
+    /// The last frame timestamp actually evaluated.
+    timestamp: std::time::Instant,
+    /// When `timestamp` was first observed to still be the latest frame.
+    unchanged_since: std::time::Instant,
+}
+
+/// Updates `last_seen` for a newly-polled `latest_frame` timestamp and
+/// reports whether the loop should proceed with it. Returns `false` (and logs
+/// once) once the same timestamp has recurred for `recorder::MAX_FRAME_STALL`
+/// -- i.e. `latest_frame()` is returning a frame the camera delivered a while
+/// ago, not a fresh one, which otherwise would get silently re-run through
+/// motion/YOLO on every poll and cascade into duplicate recordings. A
+/// same-timestamp recurrence shorter than that is ordinary jitter between
+/// polls and camera delivery, not a stall, so it's allowed through unlogged.
+fn frame_liveness_advanced(
+    last_seen: &mut Option<FrameLiveness>,
+    frame_timestamp: std::time::Instant,
+) -> bool {
+    let now = std::time::Instant::now();
+
+    match last_seen {
+        Some(seen) if seen.timestamp == frame_timestamp => {
+            if now.duration_since(seen.unchanged_since) >= recorder::MAX_FRAME_STALL {
+                log::warn!(
+                    "camera appears stalled: no new frame since {:?}; skipping detection tick",
+                    seen.timestamp
+                );
+                return false;
+            }
+            true
+        }
+        _ => {
+            *last_seen = Some(FrameLiveness {
+                timestamp: frame_timestamp,
+                unchanged_since: now,
+            });
+            true
+        }
+    }
+}
+
 /// Polls the ring buffer at `DETECTION_FRAME_RATE`, runs the motion gate and
 /// (on trip) YOLO confirmation, and owns the recording lifecycle: starting a
 /// new `ActiveEvent::Pending` on a confirmed detection and closing it once
@@ -530,6 +575,14 @@ fn run_detection_loop(
     let mut motion_gate = MotionGate::new(config.motion_threshold)?;
     let mut detector = Detector::load(config.model_path(), config.force_cpu)?;
 
+    // Tracks the last frame timestamp this loop actually evaluated, plus when
+    // that tracking last changed, so a stalled camera (`latest_frame()` keeps
+    // returning the same frame forever, e.g. after a USB drop) is detected
+    // rather than silently re-run through motion/YOLO on every poll -- which
+    // would otherwise cascade into an unbounded stream of duplicate
+    // recordings each time the post-buffer window elapses.
+    let mut last_frame_seen: Option<FrameLiveness> = None;
+
     loop {
         if shutdown.load(Ordering::SeqCst) {
             finish_event_on_shutdown(&active_event, &writer_drained)?;
@@ -547,6 +600,10 @@ fn run_detection_loop(
         let Some((frame, frame_timestamp)) = latest_frame else {
             continue;
         };
+
+        if !frame_liveness_advanced(&mut last_frame_seen, frame_timestamp) {
+            continue;
+        }
 
         let has_active_event = active_event
             .lock()
