@@ -29,11 +29,27 @@ pub struct DetectionRecord {
     pub confidence: f32,
 }
 
+/// One recorded motion-gate trip, written into a clip's `.json` sidecar.
+/// Logged for every trip during an active recording, whether or not YOLO
+/// went on to confirm a living-thing class that same tick -- this is what
+/// lets a clip that kept extending (via the post-buffer quiet window) be
+/// audited after the fact for what actually kept triggering it.
+#[derive(Serialize)]
+pub struct MotionEvent {
+    /// Seconds from the start of the clip when the gate tripped.
+    pub offset_secs: f64,
+    /// Fraction of pixels (0.0-1.0) the background model marked as changed.
+    pub changed_ratio: f32,
+}
+
 /// A clip's `.json` sidecar contents (ADR 4).
 #[derive(Serialize)]
 pub struct Sidecar {
     /// Every detection recorded during the clip, in chronological order.
     pub detections: Vec<DetectionRecord>,
+    /// Every motion-gate trip recorded during the clip, in chronological
+    /// order, including ones YOLO never confirmed as a living thing.
+    pub motion_events: Vec<MotionEvent>,
 }
 
 /// Construction parameters for `RecordingEvent::start`, grouped into a
