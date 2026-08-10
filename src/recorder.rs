@@ -412,9 +412,7 @@ impl RecordingEvent {
         confidence: f32,
         frame_timestamp: Instant,
     ) {
-        let offset_secs = frame_timestamp
-            .saturating_duration_since(self.clip_timeline_start)
-            .as_secs_f64();
+        let offset_secs = self.offset_secs(frame_timestamp);
 
         self.all_classes.insert(class_name);
 
@@ -439,14 +437,21 @@ impl RecordingEvent {
     /// touch the post-buffer quiet window; callers already call
     /// `touch`/`record_detection` for that as needed.
     pub fn record_motion(&mut self, changed_ratio: f32, frame_timestamp: Instant) {
-        let offset_secs = frame_timestamp
-            .saturating_duration_since(self.clip_timeline_start)
-            .as_secs_f64();
+        let offset_secs = self.offset_secs(frame_timestamp);
 
         self.motion_events.push(MotionEvent {
             offset_secs,
             changed_ratio,
         });
+    }
+
+    /// Seconds from the clip's actual timeline start (not wall-clock time at
+    /// the moment the caller happens to run) to `frame_timestamp`, the
+    /// capture timestamp of the frame being recorded against.
+    fn offset_secs(&self, frame_timestamp: Instant) -> f64 {
+        frame_timestamp
+            .saturating_duration_since(self.clip_timeline_start)
+            .as_secs_f64()
     }
 
     /// How long it's been since the last trigger/touch.

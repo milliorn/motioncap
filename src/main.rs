@@ -207,26 +207,24 @@ struct TeeWriter {
     file: std::fs::File,
 }
 
+/// Runs both fallible sink operations unconditionally -- never short-circuit
+/// with `?` after just the first -- and propagates the first error, if any.
+/// One sink failing (e.g. a full disk, or stderr closed under a supervisor)
+/// must never silently suppress the other from being attempted.
+fn both<T>(a: std::io::Result<T>, b: std::io::Result<T>) -> std::io::Result<()> {
+    a?;
+    b?;
+    Ok(())
+}
+
 impl std::io::Write for TeeWriter {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        // Both writes are attempted unconditionally, rather than using `?`
-        // after the first: if the file write fails (e.g. a full disk),
-        // stderr must still receive the line, and vice versa if stderr is
-        // closed/broken (e.g. under a supervisor that doesn't keep it open)
-        // -- one sink failing must never silently suppress the other.
-        let file_result = self.file.write_all(buf);
-        let stderr_result = std::io::stderr().write_all(buf);
-        file_result?;
-        stderr_result?;
+        both(self.file.write_all(buf), std::io::stderr().write_all(buf))?;
         Ok(buf.len())
     }
 
     fn flush(&mut self) -> std::io::Result<()> {
-        let file_result = self.file.flush();
-        let stderr_result = std::io::stderr().flush();
-        file_result?;
-        stderr_result?;
-        Ok(())
+        both(self.file.flush(), std::io::stderr().flush())
     }
 }
 
@@ -558,6 +556,62 @@ fn frame_liveness_advanced(
     }
 }
 
+/// Runs the motion gate and (on trip) YOLO confirmation against `frame` for
+/// an already-active recording, records the result into its sidecar, and
+/// closes the event if either close condition in `close_event_if_done` is
+/// met. Split out of `run_detection_loop` purely to keep that function under
+/// clippy's line-count lint; there is exactly one call site.
+#[allow(
+    clippy::significant_drop_tightening,
+    reason = "guard is moved into close_event_if_done, which drops it itself before the slow finish() call"
+)]
+fn evaluate_active_event(
+    config: &Config,
+    motion_gate: &mut MotionGate,
+    detector: &mut Detector,
+    active_event: &Arc<Mutex<ActiveEvent>>,
+    frame: &image::RgbImage,
+    frame_timestamp: std::time::Instant,
+    post_buffer: Duration,
+) -> Result<()> {
+    let motion = motion_gate.evaluate(frame)?;
+
+    // `detector.detect` runs without holding the event lock since YOLO
+    // inference is the slow step; the recording writer thread must be free
+    // to keep writing frames/audio at a steady pace while this runs, not
+    // blocked waiting on this lock.
+    let confirmed = if motion.tripped {
+        let detections = detector.detect(frame, config.detection_confidence)?;
+        triggers::evaluate(detections)
+    } else {
+        None
+    };
+
+    let mut guard = active_event.lock().expect("active event lock poisoned");
+    let Some(event) = guard.as_recording_mut() else {
+        // Recording was closed elsewhere (e.g. shutdown) while inference was
+        // running above, or the writer thread hasn't finished seeding it yet.
+        return Ok(());
+    };
+
+    if motion.tripped {
+        event.record_motion(motion.changed_ratio, frame_timestamp);
+
+        if let Some(confirmed) = &confirmed {
+            for d in confirmed {
+                event.record_detection(d.class_name, d.confidence, frame_timestamp);
+            }
+        } else {
+            // Motion continues but wasn't re-confirmed by YOLO on this exact
+            // frame; still reset the quiet-window so a subject that briefly
+            // stops moving doesn't get cut off early.
+            event.touch();
+        }
+    }
+
+    close_event_if_done(guard, post_buffer)
+}
+
 /// Polls the ring buffer at `DETECTION_FRAME_RATE`, runs the motion gate and
 /// (on trip) YOLO confirmation, and owns the recording lifecycle: starting a
 /// new `ActiveEvent::Pending` on a confirmed detection and closing it once
@@ -610,9 +664,7 @@ fn run_detection_loop(
             continue;
         };
 
-        if !frame_liveness_advanced(&mut last_frame_seen, frame_timestamp) {
-            continue;
-        }
+        let frame_is_live = frame_liveness_advanced(&mut last_frame_seen, frame_timestamp);
 
         let has_active_event = active_event
             .lock()
@@ -620,43 +672,33 @@ fn run_detection_loop(
             .is_some();
 
         if has_active_event {
-            let motion = motion_gate.evaluate(&frame)?;
+            // Even when the polled frame is stale (camera stalled), the
+            // recording lifecycle must still be checked every tick -- a
+            // stalled camera is exactly the condition `camera_stalled` (via
+            // `close_event_if_done`) exists to close, and the post-buffer
+            // quiet window is wall-clock-based and must keep expiring
+            // regardless of whether fresh frames are arriving.
+            if !frame_is_live {
+                let guard = active_event.lock().expect("active event lock poisoned");
 
-            // `detector.detect` runs without holding the event lock since
-            // YOLO inference is the slow step; the recording writer thread
-            // must be free to keep writing frames/audio at a steady pace
-            // while this runs, not blocked waiting on this lock.
-            let confirmed = if motion.tripped {
-                let detections = detector.detect(&frame, config.detection_confidence)?;
-                triggers::evaluate(detections)
-            } else {
-                None
-            };
+                close_event_if_done(guard, post_buffer)?;
 
-            let mut guard = active_event.lock().expect("active event lock poisoned");
-            let Some(event) = guard.as_recording_mut() else {
-                // Recording was closed elsewhere (e.g. shutdown) while
-                // inference was running above, or the writer thread hasn't
-                // finished seeding it yet.
                 continue;
-            };
-
-            if motion.tripped {
-                event.record_motion(motion.changed_ratio, frame_timestamp);
-
-                if let Some(confirmed) = &confirmed {
-                    for d in confirmed {
-                        event.record_detection(d.class_name, d.confidence, frame_timestamp);
-                    }
-                } else {
-                    // Motion continues but wasn't re-confirmed by YOLO on this
-                    // exact frame; still reset the quiet-window so a subject
-                    // that briefly stops moving doesn't get cut off early.
-                    event.touch();
-                }
             }
 
-            close_event_if_done(guard, post_buffer)?;
+            evaluate_active_event(
+                &config,
+                &mut motion_gate,
+                &mut detector,
+                &active_event,
+                &frame,
+                frame_timestamp,
+                post_buffer,
+            )?;
+            continue;
+        }
+
+        if !frame_is_live {
             continue;
         }
 
