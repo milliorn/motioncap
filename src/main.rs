@@ -209,14 +209,24 @@ struct TeeWriter {
 
 impl std::io::Write for TeeWriter {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        self.file.write_all(buf)?;
-        std::io::stderr().write_all(buf)?;
+        // Both writes are attempted unconditionally, rather than using `?`
+        // after the first: if the file write fails (e.g. a full disk),
+        // stderr must still receive the line, and vice versa if stderr is
+        // closed/broken (e.g. under a supervisor that doesn't keep it open)
+        // -- one sink failing must never silently suppress the other.
+        let file_result = self.file.write_all(buf);
+        let stderr_result = std::io::stderr().write_all(buf);
+        file_result?;
+        stderr_result?;
         Ok(buf.len())
     }
 
     fn flush(&mut self) -> std::io::Result<()> {
-        self.file.flush()?;
-        std::io::stderr().flush()
+        let file_result = self.file.flush();
+        let stderr_result = std::io::stderr().flush();
+        file_result?;
+        stderr_result?;
+        Ok(())
     }
 }
 
@@ -636,6 +646,8 @@ fn run_detection_loop(
             audio_channels,
             clip_timeline_start,
         })?;
+
+        event.record_motion(motion.changed_ratio, frame_timestamp);
 
         for d in &confirmed {
             event.record_detection(d.class_name, d.confidence, frame_timestamp);
