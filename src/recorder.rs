@@ -503,6 +503,7 @@ impl RecordingEvent {
 
         let sidecar = Sidecar {
             detections: self.detections,
+            motion_events: self.motion_events,
         };
 
         let sidecar_json =
