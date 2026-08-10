@@ -512,16 +512,21 @@ struct FrameLiveness {
     timestamp: std::time::Instant,
     /// When `timestamp` was first observed to still be the latest frame.
     unchanged_since: std::time::Instant,
+    /// Whether the stall warning has already been logged for this
+    /// `timestamp`, so a still-stalled camera logs once per episode instead
+    /// of once per poll.
+    warned: bool,
 }
 
 /// Updates `last_seen` for a newly-polled `latest_frame` timestamp and
-/// reports whether the loop should proceed with it. Returns `false` (and logs
-/// once) once the same timestamp has recurred for `recorder::MAX_FRAME_STALL`
-/// -- i.e. `latest_frame()` is returning a frame the camera delivered a while
-/// ago, not a fresh one, which otherwise would get silently re-run through
+/// reports whether the loop should proceed with it. Returns `false` once the
+/// same timestamp has recurred for `recorder::MAX_FRAME_STALL` -- i.e.
+/// `latest_frame()` is returning a frame the camera delivered a while ago,
+/// not a fresh one, which otherwise would get silently re-run through
 /// motion/YOLO on every poll and cascade into duplicate recordings. A
 /// same-timestamp recurrence shorter than that is ordinary jitter between
 /// polls and camera delivery, not a stall, so it's allowed through unlogged.
+/// The stall is logged once (not once per poll) when it's first detected.
 fn frame_liveness_advanced(
     last_seen: &mut Option<FrameLiveness>,
     frame_timestamp: std::time::Instant,
@@ -530,19 +535,23 @@ fn frame_liveness_advanced(
 
     match last_seen {
         Some(seen) if seen.timestamp == frame_timestamp => {
-            if now.duration_since(seen.unchanged_since) >= recorder::MAX_FRAME_STALL {
+            if now.duration_since(seen.unchanged_since) < recorder::MAX_FRAME_STALL {
+                return true;
+            }
+            if !seen.warned {
                 log::warn!(
-                    "camera appears stalled: no new frame since {:?}; skipping detection tick",
+                    "camera appears stalled: no new frame since {:?}; skipping detection ticks until it recovers",
                     seen.timestamp
                 );
-                return false;
+                seen.warned = true;
             }
-            true
+            false
         }
         _ => {
             *last_seen = Some(FrameLiveness {
                 timestamp: frame_timestamp,
                 unchanged_since: now,
+                warned: false,
             });
             true
         }
