@@ -16,7 +16,10 @@ use crate::paths::{clip_path, sidecar_path};
 /// both momentarily exceed one tick) so normal operation never false-trips
 /// this, while still being short enough that a genuinely dead camera ends
 /// the recording within a couple of seconds rather than dragging on.
-const MAX_FRAME_STALL: Duration = Duration::from_millis(1500);
+///
+/// Also reused by `main`'s pre-trigger staleness check so both paths agree on
+/// what counts as a stalled camera.
+pub const MAX_FRAME_STALL: Duration = Duration::from_millis(1500);
 
 /// One recorded detection, written into a clip's `.json` sidecar (ADR 4).
 #[derive(Serialize)]
@@ -29,11 +32,27 @@ pub struct DetectionRecord {
     pub confidence: f32,
 }
 
+/// One recorded motion-gate trip, written into a clip's `.json` sidecar.
+/// Logged for every trip during an active recording, whether or not YOLO
+/// went on to confirm a living-thing class that same tick -- this is what
+/// lets a clip that kept extending (via the post-buffer quiet window) be
+/// audited after the fact for what actually kept triggering it.
+#[derive(Serialize)]
+pub struct MotionEvent {
+    /// Seconds from the start of the clip when the gate tripped.
+    pub offset_secs: f64,
+    /// Fraction of pixels (0.0-1.0) the background model marked as changed.
+    pub changed_ratio: f32,
+}
+
 /// A clip's `.json` sidecar contents (ADR 4).
 #[derive(Serialize)]
 pub struct Sidecar {
     /// Every detection recorded during the clip, in chronological order.
     pub detections: Vec<DetectionRecord>,
+    /// Every motion-gate trip recorded during the clip, in chronological
+    /// order, including ones YOLO never confirmed as a living thing.
+    pub motion_events: Vec<MotionEvent>,
 }
 
 /// Construction parameters for `RecordingEvent::start`, grouped into a
@@ -123,6 +142,8 @@ pub struct RecordingEvent {
     all_classes: BTreeSet<&'static str>,
     /// Every detection recorded so far during this clip.
     detections: Vec<DetectionRecord>,
+    /// Every motion-gate trip recorded so far during this clip.
+    motion_events: Vec<MotionEvent>,
 }
 
 impl RecordingEvent {
@@ -201,6 +222,7 @@ impl RecordingEvent {
             last_real_frame_at: now,
             all_classes: BTreeSet::new(),
             detections: Vec::new(),
+            motion_events: Vec::new(),
         })
     }
 
@@ -390,9 +412,7 @@ impl RecordingEvent {
         confidence: f32,
         frame_timestamp: Instant,
     ) {
-        let offset_secs = frame_timestamp
-            .saturating_duration_since(self.clip_timeline_start)
-            .as_secs_f64();
+        let offset_secs = self.offset_secs(frame_timestamp);
 
         self.all_classes.insert(class_name);
 
@@ -409,6 +429,29 @@ impl RecordingEvent {
     /// (e.g. motion continues but wasn't re-confirmed by YOLO this tick).
     pub fn touch(&mut self) {
         self.last_trigger_at = Instant::now();
+    }
+
+    /// Records a motion-gate trip into the sidecar for later audit (e.g.
+    /// distinguishing a fan/curtain repeatedly tripping the gate from an
+    /// actual subject). Purely diagnostic bookkeeping -- does not itself
+    /// touch the post-buffer quiet window; callers already call
+    /// `touch`/`record_detection` for that as needed.
+    pub fn record_motion(&mut self, changed_ratio: f32, frame_timestamp: Instant) {
+        let offset_secs = self.offset_secs(frame_timestamp);
+
+        self.motion_events.push(MotionEvent {
+            offset_secs,
+            changed_ratio,
+        });
+    }
+
+    /// Seconds from the clip's actual timeline start (not wall-clock time at
+    /// the moment the caller happens to run) to `frame_timestamp`, the
+    /// capture timestamp of the frame being recorded against.
+    fn offset_secs(&self, frame_timestamp: Instant) -> f64 {
+        frame_timestamp
+            .saturating_duration_since(self.clip_timeline_start)
+            .as_secs_f64()
     }
 
     /// How long it's been since the last trigger/touch.
@@ -468,6 +511,7 @@ impl RecordingEvent {
 
         let sidecar = Sidecar {
             detections: self.detections,
+            motion_events: self.motion_events,
         };
 
         let sidecar_json =

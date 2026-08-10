@@ -194,12 +194,68 @@ const PREVIEW_FRAME_RATE: u32 = 30;
 /// Poll interval derived from `PREVIEW_FRAME_RATE`.
 const PREVIEW_POLL_INTERVAL: Duration = Duration::from_millis(1000 / PREVIEW_FRAME_RATE as u64);
 
+/// Log file name written under `--output-dir` (see `init_logging`).
+const LOG_FILE_NAME: &str = "motioncap.log";
+
+/// Writes every log line to both the given file and stderr, since this
+/// process runs long-lived and unattended (per `CLAUDE.md`) -- stderr alone
+/// is lost the moment the terminal/session that launched it goes away, but
+/// keeping stderr too means interactive/`--preview` runs still see live
+/// diagnostics without needing to tail the file.
+struct TeeWriter {
+    /// The persistent log file under `--output-dir`.
+    file: std::fs::File,
+}
+
+/// Runs both fallible sink operations unconditionally -- never short-circuit
+/// with `?` after just the first -- and propagates the first error, if any.
+/// One sink failing (e.g. a full disk, or stderr closed under a supervisor)
+/// must never silently suppress the other from being attempted.
+fn both(a: std::io::Result<()>, b: std::io::Result<()>) -> std::io::Result<()> {
+    a?;
+    b?;
+    Ok(())
+}
+
+impl std::io::Write for TeeWriter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        both(self.file.write_all(buf), std::io::stderr().write_all(buf))?;
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        both(self.file.flush(), std::io::stderr().flush())
+    }
+}
+
+/// Initializes logging to write every line to both `<output_dir>/motioncap.log`
+/// and stderr (see `TeeWriter`), honoring `RUST_LOG` exactly as a bare
+/// `env_logger::init()` would otherwise. `output_dir` is created if it
+/// doesn't exist yet, since this may run before anything else has created it.
+fn init_logging(output_dir: &std::path::Path) -> Result<()> {
+    std::fs::create_dir_all(output_dir)
+        .with_context(|| format!("failed to create output directory {}", output_dir.display()))?;
+
+    let log_path = output_dir.join(LOG_FILE_NAME);
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(&log_path)
+        .with_context(|| format!("failed to open log file {}", log_path.display()))?;
+
+    env_logger::Builder::from_env(env_logger::Env::default())
+        .target(env_logger::Target::Pipe(Box::new(TeeWriter { file })))
+        .init();
+
+    Ok(())
+}
+
 /// Starts capture, the detection worker, the recording writer, and (if
 /// `--preview` is set) the preview loop, then blocks on the preview loop
 /// until shutdown.
 fn main() -> Result<()> {
-    env_logger::init();
     let config = Config::parse_args();
+    init_logging(&config.output_dir)?;
 
     startup::check_dependencies(&config)?;
 
@@ -446,6 +502,116 @@ fn close_event_if_done(
     Ok(())
 }
 
+/// Tracks the most recent frame timestamp `run_detection_loop` has evaluated,
+/// and how long that timestamp has been unchanged, to detect a stalled camera
+/// before any recording has started (see `frame_liveness_advanced`).
+struct FrameLiveness {
+    /// The last frame timestamp actually evaluated.
+    timestamp: std::time::Instant,
+    /// When `timestamp` was first observed to still be the latest frame.
+    unchanged_since: std::time::Instant,
+    /// Whether the stall warning has already been logged for this
+    /// `timestamp`, so a still-stalled camera logs once per episode instead
+    /// of once per poll.
+    warned: bool,
+}
+
+/// Updates `last_seen` for a newly-polled `latest_frame` timestamp and
+/// reports whether the loop should proceed with it. Returns `false` once the
+/// same timestamp has recurred for `recorder::MAX_FRAME_STALL` -- i.e.
+/// `latest_frame()` is returning a frame the camera delivered a while ago,
+/// not a fresh one, which otherwise would get silently re-run through
+/// motion/YOLO on every poll and cascade into duplicate recordings. A
+/// same-timestamp recurrence shorter than that is ordinary jitter between
+/// polls and camera delivery, not a stall, so it's allowed through unlogged.
+/// The stall is logged once (not once per poll) when it's first detected.
+fn frame_liveness_advanced(
+    last_seen: &mut Option<FrameLiveness>,
+    frame_timestamp: std::time::Instant,
+) -> bool {
+    let now = std::time::Instant::now();
+
+    match last_seen {
+        Some(seen) if seen.timestamp == frame_timestamp => {
+            if now.duration_since(seen.unchanged_since) < recorder::MAX_FRAME_STALL {
+                return true;
+            }
+            if !seen.warned {
+                log::warn!(
+                    "camera appears stalled: no new frame since {:?}; skipping detection ticks until it recovers",
+                    seen.timestamp
+                );
+                seen.warned = true;
+            }
+            false
+        }
+        _ => {
+            *last_seen = Some(FrameLiveness {
+                timestamp: frame_timestamp,
+                unchanged_since: now,
+                warned: false,
+            });
+            true
+        }
+    }
+}
+
+/// Runs the motion gate and (on trip) YOLO confirmation against `frame` for
+/// an already-active recording, records the result into its sidecar, and
+/// closes the event if either close condition in `close_event_if_done` is
+/// met. Kept separate from `run_detection_loop`'s no-active-event path since
+/// the two have no logic in common beyond polling the same frame.
+#[allow(
+    clippy::significant_drop_tightening,
+    reason = "guard is moved into close_event_if_done, which drops it itself before the slow finish() call"
+)]
+fn evaluate_active_event(
+    config: &Config,
+    motion_gate: &mut MotionGate,
+    detector: &mut Detector,
+    active_event: &Arc<Mutex<ActiveEvent>>,
+    frame: &image::RgbImage,
+    frame_timestamp: std::time::Instant,
+    post_buffer: Duration,
+) -> Result<()> {
+    let motion = motion_gate.evaluate(frame)?;
+
+    // `detector.detect` runs without holding the event lock since YOLO
+    // inference is the slow step; the recording writer thread must be free
+    // to keep writing frames/audio at a steady pace while this runs, not
+    // blocked waiting on this lock.
+    let confirmed = if motion.tripped {
+        let detections = detector.detect(frame, config.detection_confidence)?;
+        triggers::evaluate(detections)
+    } else {
+        None
+    };
+
+    let mut guard = active_event.lock().expect("active event lock poisoned");
+    let Some(event) = guard.as_recording_mut() else {
+        // Recording was closed elsewhere (e.g. shutdown) while inference was
+        // running above, or the writer thread hasn't finished seeding it yet.
+        return Ok(());
+    };
+
+    if motion.tripped {
+        event.record_motion(motion.changed_ratio, frame_timestamp);
+
+        if let Some(confirmed) = &confirmed {
+            for d in confirmed {
+                event.record_detection(d.class_name, d.confidence, frame_timestamp);
+            }
+        } else {
+            // Motion continues but wasn't re-confirmed by YOLO on this exact
+            // frame; still reset the quiet-window so a subject that briefly
+            // stops moving doesn't get cut off early.
+            event.touch();
+        }
+    }
+
+    close_event_if_done(guard, post_buffer)
+}
+
 /// Polls the ring buffer at `DETECTION_FRAME_RATE`, runs the motion gate and
 /// (on trip) YOLO confirmation, and owns the recording lifecycle: starting a
 /// new `ActiveEvent::Pending` on a confirmed detection and closing it once
@@ -472,6 +638,14 @@ fn run_detection_loop(
     let mut motion_gate = MotionGate::new(config.motion_threshold)?;
     let mut detector = Detector::load(config.model_path(), config.force_cpu)?;
 
+    // Tracks the last frame timestamp this loop actually evaluated, plus when
+    // that tracking last changed, so a stalled camera (`latest_frame()` keeps
+    // returning the same frame forever, e.g. after a USB drop) is detected
+    // rather than silently re-run through motion/YOLO on every poll -- which
+    // would otherwise cascade into an unbounded stream of duplicate
+    // recordings each time the post-buffer window elapses.
+    let mut last_frame_seen: Option<FrameLiveness> = None;
+
     loop {
         if shutdown.load(Ordering::SeqCst) {
             finish_event_on_shutdown(&active_event, &writer_drained)?;
@@ -490,55 +664,42 @@ fn run_detection_loop(
             continue;
         };
 
+        let frame_is_live = frame_liveness_advanced(&mut last_frame_seen, frame_timestamp);
+
+        // Even when the polled frame is stale (camera stalled), the recording
+        // lifecycle must still be checked every tick -- a stalled camera is
+        // exactly the condition `camera_stalled` (via `close_event_if_done`)
+        // exists to close, and the post-buffer quiet window is wall-clock-based
+        // and must keep expiring regardless of whether fresh frames are arriving.
+        if !frame_is_live {
+            let guard = active_event.lock().expect("active event lock poisoned");
+            close_event_if_done(guard, post_buffer)?;
+            continue;
+        }
+
         let has_active_event = active_event
             .lock()
             .expect("active event lock poisoned")
             .is_some();
 
         if has_active_event {
-            let motion_tripped = motion_gate.evaluate(&frame)?;
-
-            // `detector.detect` runs without holding the event lock since
-            // YOLO inference is the slow step; the recording writer thread
-            // must be free to keep writing frames/audio at a steady pace
-            // while this runs, not blocked waiting on this lock.
-            let confirmed = if motion_tripped {
-                let detections = detector.detect(&frame, config.detection_confidence)?;
-                triggers::evaluate(detections)
-            } else {
-                None
-            };
-
-            let mut guard = active_event.lock().expect("active event lock poisoned");
-            let Some(event) = guard.as_recording_mut() else {
-                // Recording was closed elsewhere (e.g. shutdown) while
-                // inference was running above, or the writer thread hasn't
-                // finished seeding it yet.
-                continue;
-            };
-
-            if motion_tripped {
-                if let Some(confirmed) = &confirmed {
-                    for d in confirmed {
-                        event.record_detection(d.class_name, d.confidence, frame_timestamp);
-                    }
-                } else {
-                    // Motion continues but wasn't re-confirmed by YOLO on this
-                    // exact frame; still reset the quiet-window so a subject
-                    // that briefly stops moving doesn't get cut off early.
-                    event.touch();
-                }
-            }
-
-            close_event_if_done(guard, post_buffer)?;
+            evaluate_active_event(
+                &config,
+                &mut motion_gate,
+                &mut detector,
+                &active_event,
+                &frame,
+                frame_timestamp,
+                post_buffer,
+            )?;
             continue;
         }
 
-        let motion_tripped = motion_gate.evaluate(&frame)?;
+        let motion = motion_gate.evaluate(&frame)?;
 
-        log::trace!("frame received; motion_tripped={motion_tripped}");
+        log::trace!("frame received; motion_tripped={}", motion.tripped);
 
-        if !motion_tripped {
+        if !motion.tripped {
             continue;
         }
 
@@ -586,6 +747,8 @@ fn run_detection_loop(
             audio_channels,
             clip_timeline_start,
         })?;
+
+        event.record_motion(motion.changed_ratio, frame_timestamp);
 
         for d in &confirmed {
             event.record_detection(d.class_name, d.confidence, frame_timestamp);
