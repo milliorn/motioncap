@@ -16,6 +16,14 @@ pub struct MotionGate {
     threshold: f32,
 }
 
+/// The result of one `MotionGate::evaluate` call.
+pub struct MotionReading {
+    /// Fraction of pixels (0.0-1.0) the background model marked as changed.
+    pub changed_ratio: f32,
+    /// Whether `changed_ratio` exceeded the gate's configured threshold.
+    pub tripped: bool,
+}
+
 impl MotionGate {
     /// Creates a motion gate with a fresh MOG2 background model.
     pub fn new(threshold: f32) -> Result<Self> {
@@ -27,9 +35,11 @@ impl MotionGate {
         })
     }
 
-    /// Feeds one frame through the background model and reports whether the
-    /// changed-pixel ratio exceeded the configured threshold.
-    pub fn evaluate(&mut self, frame: &RgbImage) -> Result<bool> {
+    /// Feeds one frame through the background model and reports the
+    /// changed-pixel ratio alongside whether it exceeded the configured
+    /// threshold -- callers that need to log/record motion activity (not
+    /// just gate on it) need the underlying ratio, not just the bool.
+    pub fn evaluate(&mut self, frame: &RgbImage) -> Result<MotionReading> {
         let mat = rgb_image_to_bgr_mat(frame)?;
 
         let mut fgmask = Mat::default();
@@ -43,7 +53,11 @@ impl MotionGate {
             reason = "camera frame dimensions never approach u32::MAX / f32's 24-bit exact-integer range"
         )]
         let total_pixels = (frame.width() * frame.height()) as f32;
-        Ok(changed_ratio(&fgmask, total_pixels)? > self.threshold)
+        let changed_ratio = changed_ratio(&fgmask, total_pixels)?;
+        Ok(MotionReading {
+            changed_ratio,
+            tripped: changed_ratio > self.threshold,
+        })
     }
 }
 
