@@ -219,6 +219,7 @@ impl RecordingEvent {
             last_real_frame_at: now,
             all_classes: BTreeSet::new(),
             detections: Vec::new(),
+            motion_events: Vec::new(),
         })
     }
 
