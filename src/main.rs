@@ -211,7 +211,7 @@ struct TeeWriter {
 /// with `?` after just the first -- and propagates the first error, if any.
 /// One sink failing (e.g. a full disk, or stderr closed under a supervisor)
 /// must never silently suppress the other from being attempted.
-fn both<T>(a: std::io::Result<T>, b: std::io::Result<T>) -> std::io::Result<()> {
+fn both(a: std::io::Result<()>, b: std::io::Result<()>) -> std::io::Result<()> {
     a?;
     b?;
     Ok(())
@@ -559,8 +559,8 @@ fn frame_liveness_advanced(
 /// Runs the motion gate and (on trip) YOLO confirmation against `frame` for
 /// an already-active recording, records the result into its sidecar, and
 /// closes the event if either close condition in `close_event_if_done` is
-/// met. Split out of `run_detection_loop` purely to keep that function under
-/// clippy's line-count lint; there is exactly one call site.
+/// met. Kept separate from `run_detection_loop`'s no-active-event path since
+/// the two have no logic in common beyond polling the same frame.
 #[allow(
     clippy::significant_drop_tightening,
     reason = "guard is moved into close_event_if_done, which drops it itself before the slow finish() call"
@@ -666,26 +666,23 @@ fn run_detection_loop(
 
         let frame_is_live = frame_liveness_advanced(&mut last_frame_seen, frame_timestamp);
 
+        // Even when the polled frame is stale (camera stalled), the recording
+        // lifecycle must still be checked every tick -- a stalled camera is
+        // exactly the condition `camera_stalled` (via `close_event_if_done`)
+        // exists to close, and the post-buffer quiet window is wall-clock-based
+        // and must keep expiring regardless of whether fresh frames are arriving.
+        if !frame_is_live {
+            let guard = active_event.lock().expect("active event lock poisoned");
+            close_event_if_done(guard, post_buffer)?;
+            continue;
+        }
+
         let has_active_event = active_event
             .lock()
             .expect("active event lock poisoned")
             .is_some();
 
         if has_active_event {
-            // Even when the polled frame is stale (camera stalled), the
-            // recording lifecycle must still be checked every tick -- a
-            // stalled camera is exactly the condition `camera_stalled` (via
-            // `close_event_if_done`) exists to close, and the post-buffer
-            // quiet window is wall-clock-based and must keep expiring
-            // regardless of whether fresh frames are arriving.
-            if !frame_is_live {
-                let guard = active_event.lock().expect("active event lock poisoned");
-
-                close_event_if_done(guard, post_buffer)?;
-
-                continue;
-            }
-
             evaluate_active_event(
                 &config,
                 &mut motion_gate,
@@ -695,10 +692,6 @@ fn run_detection_loop(
                 frame_timestamp,
                 post_buffer,
             )?;
-            continue;
-        }
-
-        if !frame_is_live {
             continue;
         }
 
