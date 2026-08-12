@@ -666,6 +666,28 @@ fn maybe_reconnect_camera(
     }
 }
 
+/// Called after `maybe_reconnect_camera` rebuilds the stream, in place of
+/// clearing `last_seen` to `None`.
+///
+/// The ring buffer only evicts frames on `push_frame`, so `latest_frame()`
+/// can keep returning the pre-reconnect stale frame until the rebuilt stream
+/// delivers its first one. Clearing to `None` would let
+/// `frame_liveness_advanced` treat that same stale frame as freshly "live" on
+/// the very next tick (its `_` match arm resets unconditionally), skipping
+/// the `MAX_FRAME_STALL` grace period entirely and re-running motion/YOLO on
+/// stale data. Keeping `timestamp` as-is means a still-stale frame is still
+/// recognized as unchanged, while resetting `unchanged_since` to now restarts
+/// both the `MAX_FRAME_STALL` pause clock and (via `stalled_for`) the
+/// `CAMERA_RECONNECT_STALL` clock, so a rebuilt stream that stalls again
+/// immediately doesn't instantly qualify for another reconnect attempt.
+/// `warned` is also reset so the next stall episode logs again.
+fn reset_liveness_after_reconnect(last_seen: &mut Option<FrameLiveness>) {
+    if let Some(seen) = last_seen {
+        seen.unchanged_since = std::time::Instant::now();
+        seen.warned = false;
+    }
+}
+
 /// Runs the motion gate and (on trip) YOLO confirmation against `frame` for
 /// an already-active recording, records the result into its sidecar, and
 /// closes the event if either close condition in `close_event_if_done` is
@@ -821,7 +843,7 @@ fn run_detection_loop(
                 camera.device.as_deref(),
                 &ring_buffer,
             ) {
-                last_frame_seen = None;
+                reset_liveness_after_reconnect(&mut last_frame_seen);
             }
 
             continue;
