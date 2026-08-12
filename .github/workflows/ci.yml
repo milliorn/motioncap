@@ -115,10 +115,11 @@ jobs:
           restore-keys: |
             cargo-${{ runner.os }}-
 
-      # The push-to-main trigger exists only to warm the caches above for the next
-      # PR -- the code was already fully validated by the PR's own pull_request-
-      # triggered run before it was merged, so re-running lint/build here would
-      # just double CI minutes on every merge for no new information.
+      # Skipped on push-to-main: that run's only job is warming the caches above for
+      # the next PR (see the `on:` comment) -- the code was already fully validated
+      # by the PR's own pull_request-triggered run before it was merged, so fmt/clippy
+      # add nothing here. `cargo build` below still runs on both triggers, since it's
+      # what actually populates the cargo cache this job exists to warm on push.
       - name: Check formatting
         if: github.event_name == 'pull_request'
         run: cargo fmt --all -- --check
@@ -128,5 +129,4 @@ jobs:
         run: cargo clippy --all-targets -- -D warnings
 
       - name: Build
-        if: github.event_name == 'pull_request'
         run: cargo build --all-targets
