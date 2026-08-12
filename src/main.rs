@@ -618,7 +618,7 @@ fn maybe_reconnect_camera(
     };
 
     let now = std::time::Instant::now();
-    
+
     if now.duration_since(seen.unchanged_since) < CAMERA_RECONNECT_STALL {
         return false;
     }
