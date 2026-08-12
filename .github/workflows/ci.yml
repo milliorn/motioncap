@@ -26,6 +26,9 @@ on:
       - "src/**"
       - "Cargo.toml"
       - "Cargo.lock"
+  # Lets the OpenCV cache be warmed on demand -- e.g. right after this workflow
+  # itself changes -- instead of waiting on the next source-touching push to main.
+  workflow_dispatch: {}
 
 # Cancel any in-progress run for the same ref when a new commit is pushed.
 # Prevents paying for stale runs that are no longer relevant.
@@ -47,7 +50,7 @@ jobs:
   # -- the `ci` job below builds OpenCV itself on a cache miss.
   warm-opencv-cache:
     name: Warm OpenCV cache
-    if: github.event_name == 'push'
+    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
     runs-on: ubuntu-latest
     permissions:
       contents: read
@@ -83,7 +86,7 @@ jobs:
 
   ci:
     name: Lint and Build
-    if: github.event_name == 'pull_request'
+    if: github.event_name != 'workflow_dispatch'
     runs-on: ubuntu-latest
     # Least-privilege: only read access to the repository contents is needed.
     permissions:
