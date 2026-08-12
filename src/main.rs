@@ -197,6 +197,26 @@ const PREVIEW_POLL_INTERVAL: Duration = Duration::from_millis(1000 / PREVIEW_FRA
 /// Log file name written under `--output-dir` (see `init_logging`).
 const LOG_FILE_NAME: &str = "motioncap.log";
 
+/// How long a camera stall (see `FrameLiveness`) must persist before
+/// `run_detection_loop` tears down and rebuilds the capture stream, rather
+/// than continuing to wait for it to recover on its own.
+///
+/// Deliberately much longer than `recorder::MAX_FRAME_STALL` (1.5s): that
+/// threshold exists to stop feeding stale frames into detection/recording
+/// within a couple of seconds, which is far too trigger-happy to also gate
+/// tearing down and reopening the OS camera handle -- doing that on every
+/// brief stall would thrash the device and could itself induce more stalls.
+/// This threshold instead assumes the camera is genuinely gone (see
+/// `capture::camera::reconnect_camera_stream`'s doc comment for why nokhwa
+/// never recovers from this on its own) and a full stream rebuild is
+/// warranted.
+const CAMERA_RECONNECT_STALL: Duration = Duration::from_secs(15);
+
+/// Minimum time between reconnect attempts once the camera is believed dead,
+/// so a camera that fails to reopen (e.g. genuinely unplugged) doesn't get a
+/// reopen attempt on every single detection poll while it's absent.
+const CAMERA_RECONNECT_COOLDOWN: Duration = Duration::from_secs(10);
+
 /// Writes every log line to both the given file and stderr, since this
 /// process runs long-lived and unattended (per `CLAUDE.md`) -- stderr alone
 /// is lost the moment the terminal/session that launched it goes away, but
@@ -262,10 +282,15 @@ fn main() -> Result<()> {
     let pre_buffer = Duration::from_secs(u64::from(config.pre_buffer_secs));
     let ring_buffer = Arc::new(Mutex::new(RingBuffer::new(pre_buffer)));
 
-    let _camera = capture::camera::start_camera_capture(
+    let camera = capture::camera::start_camera_capture(
         config.camera_device.as_deref(),
         Arc::clone(&ring_buffer),
     )?;
+    // Shared with the detection worker so it can rebuild the stream in place
+    // when `CAMERA_RECONNECT_STALL` trips (see `FrameLiveness`); held here
+    // too so the capture thread stays alive for the process lifetime even
+    // between reconnects.
+    let camera = Arc::new(Mutex::new(camera));
 
     let audio_info = capture::audio::start_audio_capture(Arc::clone(&ring_buffer))?;
     let audio_sample_rate = audio_info.sample_rate;
@@ -312,6 +337,16 @@ fn main() -> Result<()> {
     let worker_ring_buffer = Arc::clone(&ring_buffer);
     let worker_active_event = Arc::clone(&active_event);
     let worker_writer_drained = Arc::clone(&writer_drained);
+    let worker_camera = DetectionCamera {
+        handle: Arc::clone(&camera),
+        device: config.camera_device.clone(),
+    };
+
+    let worker_audio = AudioParams {
+        sample_rate: audio_sample_rate,
+        channels: audio_channels,
+    };
+
     let worker_handle = thread::spawn(move || {
         if let Err(err) = run_detection_loop(
             config,
@@ -319,8 +354,8 @@ fn main() -> Result<()> {
             worker_shutdown,
             worker_active_event,
             worker_writer_drained,
-            audio_sample_rate,
-            audio_channels,
+            worker_audio,
+            worker_camera,
         ) {
             log::error!("detection worker exited with error: {err:?}");
         }
@@ -556,6 +591,63 @@ fn frame_liveness_advanced(
     }
 }
 
+/// If the current stall (tracked by `last_seen`) has persisted past
+/// `CAMERA_RECONNECT_STALL`, tears down and rebuilds the capture stream (see
+/// `capture::camera::reconnect_camera_stream`), respecting
+/// `CAMERA_RECONNECT_COOLDOWN` between attempts so a camera that stays absent
+/// doesn't get reopened on every single poll tick while it's gone.
+/// `last_reconnect_attempt` is updated on every attempt (success or failure),
+/// so the cooldown also applies after a success -- if the rebuilt stream
+/// stalls again immediately, this still waits out the cooldown rather than
+/// retrying in a tight loop.
+///
+/// Returns `true` on a successful rebuild, so the caller can reset
+/// `last_seen`: the old stream's last timestamp is meaningless to compare
+/// the freshly rebuilt stream's frames against.
+fn maybe_reconnect_camera(
+    last_seen: Option<&FrameLiveness>,
+    last_reconnect_attempt: &mut Option<std::time::Instant>,
+    camera: &Mutex<nokhwa::threaded::CallbackCamera>,
+    camera_device: Option<&std::path::Path>,
+    ring_buffer: &Arc<Mutex<RingBuffer>>,
+) -> bool {
+    let Some(seen) = last_seen else {
+        return false;
+    };
+
+    let now = std::time::Instant::now();
+    
+    if now.duration_since(seen.unchanged_since) < CAMERA_RECONNECT_STALL {
+        return false;
+    }
+
+    if let Some(attempted_at) = last_reconnect_attempt
+        && now.duration_since(*attempted_at) < CAMERA_RECONNECT_COOLDOWN
+    {
+        return false;
+    }
+
+    *last_reconnect_attempt = Some(now);
+
+    log::warn!(
+        "camera has been stalled for over {CAMERA_RECONNECT_STALL:?}; attempting to rebuild the capture stream"
+    );
+
+    let rebuilt = capture::camera::reconnect_camera_stream(camera_device, Arc::clone(ring_buffer));
+
+    match rebuilt {
+        Ok(new_camera) => {
+            *camera.lock().expect("camera lock poisoned") = new_camera;
+            log::info!("camera stream rebuilt successfully");
+            true
+        }
+        Err(err) => {
+            log::error!("failed to rebuild camera stream: {err:?}");
+            false
+        }
+    }
+}
+
 /// Runs the motion gate and (on trip) YOLO confirmation against `frame` for
 /// an already-active recording, records the result into its sidecar, and
 /// closes the event if either close condition in `close_event_if_done` is
@@ -612,6 +704,27 @@ fn evaluate_active_event(
     close_event_if_done(guard, post_buffer)
 }
 
+/// The shared camera handle `run_detection_loop` polls liveness against and,
+/// on a prolonged stall, rebuilds via `maybe_reconnect_camera`. Bundled
+/// together since `camera_device` must be re-passed to
+/// `capture::camera::reconnect_camera_stream` on every reconnect attempt.
+struct DetectionCamera {
+    /// The live capture stream; swapped out in place on reconnect.
+    handle: Arc<Mutex<nokhwa::threaded::CallbackCamera>>,
+    /// The originally configured device (or `None` for auto-detect), reused
+    /// unchanged on every reconnect attempt.
+    device: Option<std::path::PathBuf>,
+}
+
+/// Audio stream parameters the recording writer needs to configure ffmpeg's
+/// input, captured once at startup and passed through unchanged.
+struct AudioParams {
+    /// Sample rate of the captured audio stream, in Hz.
+    sample_rate: u32,
+    /// Number of audio channels in the captured stream.
+    channels: u16,
+}
+
 /// Polls the ring buffer at `DETECTION_FRAME_RATE`, runs the motion gate and
 /// (on trip) YOLO confirmation, and owns the recording lifecycle: starting a
 /// new `ActiveEvent::Pending` on a confirmed detection and closing it once
@@ -630,8 +743,8 @@ fn run_detection_loop(
     shutdown: Arc<AtomicBool>,
     active_event: Arc<Mutex<ActiveEvent>>,
     writer_drained: Arc<WriterDrained>,
-    audio_sample_rate: u32,
-    audio_channels: u16,
+    audio: AudioParams,
+    camera: DetectionCamera,
 ) -> Result<()> {
     let post_buffer = Duration::from_secs(u64::from(config.post_buffer_secs));
 
@@ -645,6 +758,10 @@ fn run_detection_loop(
     // would otherwise cascade into an unbounded stream of duplicate
     // recordings each time the post-buffer window elapses.
     let mut last_frame_seen: Option<FrameLiveness> = None;
+    // When the last reconnect attempt was made, so a camera that stays
+    // stalled doesn't get the stream rebuilt on every single poll tick (see
+    // `maybe_reconnect_camera` / `CAMERA_RECONNECT_COOLDOWN`).
+    let mut last_reconnect_attempt: Option<std::time::Instant> = None;
 
     loop {
         if shutdown.load(Ordering::SeqCst) {
@@ -674,6 +791,17 @@ fn run_detection_loop(
         if !frame_is_live {
             let guard = active_event.lock().expect("active event lock poisoned");
             close_event_if_done(guard, post_buffer)?;
+
+            if maybe_reconnect_camera(
+                last_frame_seen.as_ref(),
+                &mut last_reconnect_attempt,
+                &camera.handle,
+                camera.device.as_deref(),
+                &ring_buffer,
+            ) {
+                last_frame_seen = None;
+            }
+
             continue;
         }
 
@@ -743,8 +871,8 @@ fn run_detection_loop(
             width,
             height,
             frame_rate: RECORDING_FRAME_RATE,
-            audio_sample_rate,
-            audio_channels,
+            audio_sample_rate: audio.sample_rate,
+            audio_channels: audio.channels,
             clip_timeline_start,
         })?;
 

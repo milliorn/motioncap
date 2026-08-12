@@ -87,3 +87,26 @@ pub fn start_camera_capture(
 
     Ok(camera)
 }
+
+/// Rebuilds the camera capture stream from scratch, for recovering from a
+/// stall that has persisted well past ordinary jitter (see
+/// `main::CAMERA_RECONNECT_STALL`).
+///
+/// nokhwa's threaded v4l backend can enter a state where its internal capture
+/// thread spins forever calling a failing `frame()` without ever surfacing an
+/// error or exiting (the thread only checks a die flag between attempts, see
+/// `nokhwa::threaded::camera_frame_thread_loop`) -- this happens with no
+/// corresponding USB/kernel-level disconnect, so nokhwa itself never notices
+/// and never recovers on its own. `CallbackCamera::stop_stream` cannot unstick
+/// this: it only clears the inner `Camera`'s stream handle, not the spinning
+/// background thread, so a subsequent `open_stream` on the *same* instance
+/// just fails with "Stream Already Open" -- the wedged thread outlives any
+/// in-place restart attempt. The only way to actually replace it is to drop
+/// the whole `CallbackCamera` (its `Drop` impl sets the thread's die flag)
+/// and construct a fresh one, exactly as if starting up for the first time.
+pub fn reconnect_camera_stream(
+    device: Option<&Path>,
+    buffer: Arc<Mutex<RingBuffer>>,
+) -> Result<CallbackCamera> {
+    start_camera_capture(device, buffer)
+}
