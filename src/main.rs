@@ -289,8 +289,10 @@ fn main() -> Result<()> {
     // Shared with the detection worker so it can rebuild the stream in place
     // when `CAMERA_RECONNECT_STALL` trips (see `FrameLiveness`); held here
     // too so the capture thread stays alive for the process lifetime even
-    // between reconnects.
-    let camera = Arc::new(Mutex::new(camera));
+    // between reconnects. Wrapped in `Option` so a reconnect can `take()` and
+    // drop the old stream (releasing the device node) before opening the
+    // replacement -- see `maybe_reconnect_camera`.
+    let camera = Arc::new(Mutex::new(Some(camera)));
 
     let audio_info = capture::audio::start_audio_capture(Arc::clone(&ring_buffer))?;
     let audio_sample_rate = audio_info.sample_rate;
@@ -607,7 +609,7 @@ fn frame_liveness_advanced(
 fn maybe_reconnect_camera(
     last_seen: Option<&FrameLiveness>,
     last_reconnect_attempt: &mut Option<std::time::Instant>,
-    camera: &Mutex<nokhwa::threaded::CallbackCamera>,
+    camera: &Mutex<Option<nokhwa::threaded::CallbackCamera>>,
     camera_device: Option<&std::path::Path>,
     ring_buffer: &Arc<Mutex<RingBuffer>>,
 ) -> bool {
@@ -633,11 +635,18 @@ fn maybe_reconnect_camera(
         "camera has been stalled for over {CAMERA_RECONNECT_STALL:?}; attempting to rebuild the capture stream"
     );
 
+    // The old stream must be torn down (dropping it sets the wedged capture
+    // thread's die flag -- see `reconnect_camera_stream`'s doc comment)
+    // *before* attempting to open a new one, since both hold the same
+    // underlying device node open; otherwise every reopen attempt fails with
+    // EBUSY for as long as the old instance is still alive.
+    drop(camera.lock().expect("camera lock poisoned").take());
+
     let rebuilt = capture::camera::reconnect_camera_stream(camera_device, Arc::clone(ring_buffer));
 
     match rebuilt {
         Ok(new_camera) => {
-            *camera.lock().expect("camera lock poisoned") = new_camera;
+            *camera.lock().expect("camera lock poisoned") = Some(new_camera);
             log::info!("camera stream rebuilt successfully");
             true
         }
@@ -709,8 +718,10 @@ fn evaluate_active_event(
 /// together since `camera_device` must be re-passed to
 /// `capture::camera::reconnect_camera_stream` on every reconnect attempt.
 struct DetectionCamera {
-    /// The live capture stream; swapped out in place on reconnect.
-    handle: Arc<Mutex<nokhwa::threaded::CallbackCamera>>,
+    /// The live capture stream; swapped out in place on reconnect. `None`
+    /// only for the brief window between dropping the old stream and
+    /// successfully opening the replacement -- see `maybe_reconnect_camera`.
+    handle: Arc<Mutex<Option<nokhwa::threaded::CallbackCamera>>>,
     /// The originally configured device (or `None` for auto-detect), reused
     /// unchanged on every reconnect attempt.
     device: Option<std::path::PathBuf>,
