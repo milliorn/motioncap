@@ -207,7 +207,7 @@ const LOG_FILE_NAME: &str = "motioncap.log";
 /// tearing down and reopening the OS camera handle -- doing that on every
 /// brief stall would thrash the device and could itself induce more stalls.
 /// This threshold instead assumes the camera is genuinely gone (see
-/// `capture::camera::reconnect_camera_stream`'s doc comment for why nokhwa
+/// `capture::camera::start_camera_capture`'s doc comment for why nokhwa
 /// never recovers from this on its own) and a full stream rebuild is
 /// warranted.
 const CAMERA_RECONNECT_STALL: Duration = Duration::from_secs(15);
@@ -343,7 +343,6 @@ fn main() -> Result<()> {
         handle: Arc::clone(&camera),
         device: config.camera_device.clone(),
     };
-
     let worker_audio = AudioParams {
         sample_rate: audio_sample_rate,
         channels: audio_channels,
@@ -553,6 +552,16 @@ struct FrameLiveness {
     warned: bool,
 }
 
+impl FrameLiveness {
+    /// How long `timestamp` has been the latest frame seen, as of `now`.
+    /// Shared by every threshold checked against this stall (see
+    /// `frame_liveness_advanced`, `maybe_reconnect_camera`) so they all read
+    /// one computation over `unchanged_since` instead of each re-deriving it.
+    fn stalled_for(&self, now: std::time::Instant) -> Duration {
+        now.duration_since(self.unchanged_since)
+    }
+}
+
 /// Updates `last_seen` for a newly-polled `latest_frame` timestamp and
 /// reports whether the loop should proceed with it. Returns `false` once the
 /// same timestamp has recurred for `recorder::MAX_FRAME_STALL` -- i.e.
@@ -570,7 +579,7 @@ fn frame_liveness_advanced(
 
     match last_seen {
         Some(seen) if seen.timestamp == frame_timestamp => {
-            if now.duration_since(seen.unchanged_since) < recorder::MAX_FRAME_STALL {
+            if seen.stalled_for(now) < recorder::MAX_FRAME_STALL {
                 return true;
             }
             if !seen.warned {
@@ -595,7 +604,7 @@ fn frame_liveness_advanced(
 
 /// If the current stall (tracked by `last_seen`) has persisted past
 /// `CAMERA_RECONNECT_STALL`, tears down and rebuilds the capture stream (see
-/// `capture::camera::reconnect_camera_stream`), respecting
+/// `capture::camera::start_camera_capture`'s doc comment), respecting
 /// `CAMERA_RECONNECT_COOLDOWN` between attempts so a camera that stays absent
 /// doesn't get reopened on every single poll tick while it's gone.
 /// `last_reconnect_attempt` is updated on every attempt (success or failure),
@@ -619,7 +628,7 @@ fn maybe_reconnect_camera(
 
     let now = std::time::Instant::now();
 
-    if now.duration_since(seen.unchanged_since) < CAMERA_RECONNECT_STALL {
+    if seen.stalled_for(now) < CAMERA_RECONNECT_STALL {
         return false;
     }
 
@@ -636,13 +645,13 @@ fn maybe_reconnect_camera(
     );
 
     // The old stream must be torn down (dropping it sets the wedged capture
-    // thread's die flag -- see `reconnect_camera_stream`'s doc comment)
-    // *before* attempting to open a new one, since both hold the same
-    // underlying device node open; otherwise every reopen attempt fails with
-    // EBUSY for as long as the old instance is still alive.
+    // thread's die flag -- see `start_camera_capture`'s doc comment) *before*
+    // attempting to open a new one, since both hold the same underlying
+    // device node open; otherwise every reopen attempt fails with EBUSY for
+    // as long as the old instance is still alive.
     drop(camera.lock().expect("camera lock poisoned").take());
 
-    let rebuilt = capture::camera::reconnect_camera_stream(camera_device, Arc::clone(ring_buffer));
+    let rebuilt = capture::camera::start_camera_capture(camera_device, Arc::clone(ring_buffer));
 
     match rebuilt {
         Ok(new_camera) => {
@@ -715,8 +724,10 @@ fn evaluate_active_event(
 
 /// The shared camera handle `run_detection_loop` polls liveness against and,
 /// on a prolonged stall, rebuilds via `maybe_reconnect_camera`. Bundled
-/// together since `camera_device` must be re-passed to
-/// `capture::camera::reconnect_camera_stream` on every reconnect attempt.
+/// together (rather than passed as two separate `run_detection_loop`
+/// parameters) both because they're always used as a pair at that call site
+/// and because `run_detection_loop` is already at clippy's argument-count
+/// limit.
 struct DetectionCamera {
     /// The live capture stream; swapped out in place on reconnect. `None`
     /// only for the brief window between dropping the old stream and
