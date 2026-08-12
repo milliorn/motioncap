@@ -13,18 +13,21 @@ name: CI
 on:
   pull_request:
     branches: ["main"]
-    # Only run when source code or dependencies change.
-    # Skips CI for docs, config, or workflow-only changes.
+    # Only run when source code, dependencies, or this workflow itself change.
+    # Skips CI for docs/config changes, but still runs on workflow edits so
+    # this file can be validated (and, on push, so main's caches stay warm).
     paths:
       - "src/**"
       - "Cargo.toml"
       - "Cargo.lock"
+      - ".github/workflows/ci.yml"
   push:
     branches: ["main"]
     paths:
       - "src/**"
       - "Cargo.toml"
       - "Cargo.lock"
+      - ".github/workflows/ci.yml"
 
 # Cancel any in-progress run for the same PR branch when a new commit is pushed.
 # Prevents paying for stale runs that are no longer relevant. Keyed by event name as
