@@ -27,9 +27,12 @@ on:
       - "Cargo.lock"
 
 # Cancel any in-progress run for the same PR branch when a new commit is pushed.
-# Prevents paying for stale runs that are no longer relevant.
+# Prevents paying for stale runs that are no longer relevant. Keyed by event name as
+# well as ref so that a push-to-main run (which exists solely to warm the cache) is
+# never cancelled by a later, unrelated push -- cancelling it mid-run would kill its
+# cache-save step before it completes, silently defeating the point of running it.
 concurrency:
-  group: ci-${{ github.ref }}
+  group: ci-${{ github.event_name }}-${{ github.ref }}
   cancel-in-progress: true
 
 env:
@@ -65,6 +68,8 @@ jobs:
         with:
           path: /usr/local/opencv
           key: opencv-${{ env.OPENCV_VERSION }}-${{ runner.os }}-core
+          restore-keys: |
+            opencv-${{ env.OPENCV_VERSION }}-${{ runner.os }}-
 
       # Only needed on a cache miss -- most runs restore the cache above instead.
       - name: Install OpenCV build dependencies
@@ -110,11 +115,18 @@ jobs:
           restore-keys: |
             cargo-${{ runner.os }}-
 
+      # The push-to-main trigger exists only to warm the caches above for the next
+      # PR -- the code was already fully validated by the PR's own pull_request-
+      # triggered run before it was merged, so re-running lint/build here would
+      # just double CI minutes on every merge for no new information.
       - name: Check formatting
+        if: github.event_name == 'pull_request'
         run: cargo fmt --all -- --check
 
       - name: Run clippy
+        if: github.event_name == 'pull_request'
         run: cargo clippy --all-targets -- -D warnings
 
       - name: Build
+        if: github.event_name == 'pull_request'
         run: cargo build --all-targets
