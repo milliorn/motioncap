@@ -65,6 +65,18 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y --no-install-recommends libasound2-dev
 
+      # actions/cache's restore step extracts the tarball as the unprivileged runner
+      # user (no sudo), but /usr/local is root-owned -- without this, every restore
+      # silently fails with "Cannot mkdir: Permission denied" on every file, leaving
+      # cache-hit reported as true while /usr/local/opencv ends up empty, so the build
+      # step below still ends up compiling from source on every run regardless of
+      # cache state. Pre-creating and chowning the directory to the runner user is
+      # what makes the tar extraction actually land.
+      - name: Prepare OpenCV install directory
+        run: |
+          sudo mkdir -p /usr/local/opencv
+          sudo chown "$(id -u):$(id -g)" /usr/local/opencv
+
       - name: Cache OpenCV build
         id: cache-opencv
         uses: actions/cache@v6
@@ -96,6 +108,10 @@ jobs:
             -DBUILD_opencv_apps=OFF -DBUILD_DOCS=OFF
           cmake --build /tmp/opencv/build --parallel "$(nproc)"
           sudo cmake --install /tmp/opencv/build
+          # Installing as root would flip /usr/local/opencv's ownership back to root,
+          # breaking the unprivileged tar extraction the next run's cache restore
+          # needs -- reclaim it for the runner user before the cache-save step runs.
+          sudo chown -R "$(id -u):$(id -g)" /usr/local/opencv
 
       - name: Point pkg-config at the cached/built OpenCV
         run: |
