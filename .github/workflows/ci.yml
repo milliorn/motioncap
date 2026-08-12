@@ -1,8 +1,16 @@
 name: CI
 
-# Run only on pull requests targeting main.
-# Push to main is omitted -- CI already ran on the PR before merge,
-# so re-running on push is a duplicate that costs extra minutes.
+# Lint/clippy/build run only on pull requests targeting main -- CI already ran
+# on the PR before merge, so re-running the full job on push is a duplicate
+# that costs extra minutes.
+#
+# The OpenCV cache is scoped per-ref by GitHub Actions: a PR can restore a
+# cache from its base branch, but never from another PR's ref. Since this
+# workflow previously never ran on push to main, no cache ever existed on
+# main for PRs to fall back to, so every PR rebuilt OpenCV from source
+# (~5-6 min of the ~7-9 min job) regardless of the cache step. The
+# warm-opencv-cache job below runs only on push to main to populate that
+# base-branch cache; PRs then restore-key fall back to it as a cache hit.
 on:
   pull_request:
     branches: ["main"]
@@ -12,8 +20,14 @@ on:
       - "src/**"
       - "Cargo.toml"
       - "Cargo.lock"
+  push:
+    branches: ["main"]
+    paths:
+      - "src/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
 
-# Cancel any in-progress run for the same PR branch when a new commit is pushed.
+# Cancel any in-progress run for the same ref when a new commit is pushed.
 # Prevents paying for stale runs that are no longer relevant.
 concurrency:
   group: ci-${{ github.ref }}
@@ -28,8 +42,48 @@ env:
   OPENCV_VERSION: "5.0.0"
 
 jobs:
+  # Runs only on push to main, to populate the OpenCV cache on a ref that PRs
+  # can actually restore from (see the `on:` comment above). Skipped for PRs
+  # -- the `ci` job below builds OpenCV itself on a cache miss.
+  warm-opencv-cache:
+    name: Warm OpenCV cache
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: read
+    steps:
+      - name: Cache OpenCV build
+        id: cache-opencv
+        uses: actions/cache@v6
+        with:
+          path: /usr/local/opencv
+          key: opencv-${{ env.OPENCV_VERSION }}-${{ runner.os }}-core
+
+      - name: Install OpenCV build dependencies
+        if: steps.cache-opencv.outputs.cache-hit != 'true'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential cmake git pkg-config \
+            libgtk-3-dev libavcodec-dev libavformat-dev libswscale-dev \
+            libv4l-dev libjpeg-dev libpng-dev libtiff-dev
+
+      - name: Build OpenCV ${{ env.OPENCV_VERSION }} from source
+        if: steps.cache-opencv.outputs.cache-hit != 'true'
+        run: |
+          git clone --branch "$OPENCV_VERSION" --depth 1 https://github.com/opencv/opencv.git /tmp/opencv
+          cmake -S /tmp/opencv -B /tmp/opencv/build \
+            -DCMAKE_BUILD_TYPE=Release \
+            -DCMAKE_INSTALL_PREFIX=/usr/local/opencv \
+            -DBUILD_LIST=core,imgproc,imgcodecs,videoio,highgui,video \
+            -DBUILD_EXAMPLES=OFF -DBUILD_TESTS=OFF -DBUILD_PERF_TESTS=OFF \
+            -DBUILD_opencv_apps=OFF -DBUILD_DOCS=OFF
+          cmake --build /tmp/opencv/build --parallel "$(nproc)"
+          sudo cmake --install /tmp/opencv/build
+
   ci:
     name: Lint and Build
+    if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
     # Least-privilege: only read access to the repository contents is needed.
     permissions:
