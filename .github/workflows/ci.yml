@@ -1,22 +1,41 @@
 name: CI
 
-# Run only on pull requests targeting main.
-# Push to main is omitted -- CI already ran on the PR before merge,
-# so re-running on push is a duplicate that costs extra minutes.
+# Runs on pull requests targeting main, plus pushes to main.
+#
+# The push-to-main trigger is NOT a redundant re-run of the PR's CI -- its job is to
+# warm the OpenCV/cargo actions/cache entries in main's cache scope. GitHub Actions
+# scopes a saved cache to the branch it was created on (falling back to the base
+# branch), so a cache saved on a PR branch is invisible to any *other* PR branch and
+# is lost once that branch is deleted at merge. Since this repo never ran anything on
+# main, every PR was building OpenCV from source from an always-cold cache. Pushing
+# to main after each merge means the next PR (branched from up-to-date main) can
+# actually restore a warm cache instead of rebuilding.
 on:
   pull_request:
     branches: ["main"]
-    # Only run when source code or dependencies change.
-    # Skips CI for docs, config, or workflow-only changes.
+    # Only run when source code, dependencies, or this workflow itself change.
+    # Skips CI for docs/config changes, but still runs on workflow edits so
+    # this file can be validated (and, on push, so main's caches stay warm).
     paths:
       - "src/**"
       - "Cargo.toml"
       - "Cargo.lock"
+      - ".github/workflows/ci.yml"
+  push:
+    branches: ["main"]
+    paths:
+      - "src/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - ".github/workflows/ci.yml"
 
 # Cancel any in-progress run for the same PR branch when a new commit is pushed.
-# Prevents paying for stale runs that are no longer relevant.
+# Prevents paying for stale runs that are no longer relevant. Keyed by event name as
+# well as ref so that a push-to-main run (which exists solely to warm the cache) is
+# never cancelled by a later, unrelated push -- cancelling it mid-run would kill its
+# cache-save step before it completes, silently defeating the point of running it.
 concurrency:
-  group: ci-${{ github.ref }}
+  group: ci-${{ github.event_name }}-${{ github.ref }}
   cancel-in-progress: true
 
 env:
@@ -52,6 +71,8 @@ jobs:
         with:
           path: /usr/local/opencv
           key: opencv-${{ env.OPENCV_VERSION }}-${{ runner.os }}-core
+          restore-keys: |
+            opencv-${{ env.OPENCV_VERSION }}-${{ runner.os }}-
 
       # Only needed on a cache miss -- most runs restore the cache above instead.
       - name: Install OpenCV build dependencies
@@ -97,10 +118,17 @@ jobs:
           restore-keys: |
             cargo-${{ runner.os }}-
 
+      # Skipped on push-to-main: that run's only job is warming the caches above for
+      # the next PR (see the `on:` comment) -- the code was already fully validated
+      # by the PR's own pull_request-triggered run before it was merged, so fmt/clippy
+      # add nothing here. `cargo build` below still runs on both triggers, since it's
+      # what actually populates the cargo cache this job exists to warm on push.
       - name: Check formatting
+        if: github.event_name == 'pull_request'
         run: cargo fmt --all -- --check
 
       - name: Run clippy
+        if: github.event_name == 'pull_request'
         run: cargo clippy --all-targets -- -D warnings
 
       - name: Build
