@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.4.0](https://github.com/milliorn/motioncap/compare/motioncap-v0.3.0...motioncap-v0.4.0) (2026-08-12)
+
+
+### Features
+
+* **ci:** warm OpenCV/cargo cache on push to main ([#15](https://github.com/milliorn/motioncap/issues/15)) ([24f0b54](https://github.com/milliorn/motioncap/commit/24f0b54b7a18e7946c6a3cf937f66a40c61362e3))
+
 ## [0.3.0](https://github.com/milliorn/motioncap/compare/motioncap-v0.2.0...motioncap-v0.3.0) (2026-08-10)
 
 
