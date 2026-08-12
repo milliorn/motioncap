@@ -1,13 +1,26 @@
 name: CI
 
-# Run only on pull requests targeting main.
-# Push to main is omitted -- CI already ran on the PR before merge,
-# so re-running on push is a duplicate that costs extra minutes.
+# Runs on pull requests targeting main, plus pushes to main.
+#
+# The push-to-main trigger is NOT a redundant re-run of the PR's CI -- its job is to
+# warm the OpenCV/cargo actions/cache entries in main's cache scope. GitHub Actions
+# scopes a saved cache to the branch it was created on (falling back to the base
+# branch), so a cache saved on a PR branch is invisible to any *other* PR branch and
+# is lost once that branch is deleted at merge. Since this repo never ran anything on
+# main, every PR was building OpenCV from source from an always-cold cache. Pushing
+# to main after each merge means the next PR (branched from up-to-date main) can
+# actually restore a warm cache instead of rebuilding.
 on:
   pull_request:
     branches: ["main"]
     # Only run when source code or dependencies change.
     # Skips CI for docs, config, or workflow-only changes.
+    paths:
+      - "src/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+  push:
+    branches: ["main"]
     paths:
       - "src/**"
       - "Cargo.toml"
