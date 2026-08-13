@@ -585,7 +585,10 @@ impl FrameLiveness {
 struct PendingConfirmation {
     /// The living-thing class seen on the first, unconfirmed poll.
     class_name: &'static str,
-    /// When the first poll observed `class_name`.
+    /// When `class_name` was last seen: the first, unconfirmed poll, or (once
+    /// confirmed) the most recent poll that re-confirmed it -- see
+    /// `confirm_pending`'s doc comment for why this refreshes on every
+    /// confirmed repeat rather than staying fixed at the first sighting.
     first_seen: std::time::Instant,
 }
 
@@ -654,9 +657,9 @@ fn confirm_pending(
     // No match for the currently-pending class (if any) anywhere in this
     // poll's detections -- only now does it get replaced. Checked against
     // every detection this poll, not just the first, so a still-present
-    // class isn't evicted just because a *different* class happens to sort
-    // first in the same poll's results (both can appear together, e.g. a
-    // person and a pet in frame at once).
+    // class isn't evicted just because a *different* class happens to come
+    // first in `detect::postprocess`'s fixed class-allowlist order (both can
+    // appear together, e.g. a person and a pet in frame at once).
     if let Some(first) = detections.first() {
         log::debug!(
             "detection '{}' not yet confirmed; awaiting repeat within {PENDING_CONFIRMATION_WINDOW:?}",
@@ -838,14 +841,14 @@ fn reset_liveness_after_reconnect(last_seen: &mut Option<FrameLiveness>) {
 /// window on noise alone long after the real subject has left frame.
 ///
 /// Separately, a bare motion-gate trip with no YOLO confirmation at all only
-/// extends the post-buffer window while `pending_confirmation` shows a class
-/// was confirmed recently -- never unconditionally. Per ADR 2, "correctness
-/// against false positives comes entirely from the YOLO confirmation
-/// requirement"; trusting motion alone here (the original behavior) let
-/// ordinary sensor jitter well below any living-thing detection -- observed
-/// directly: 100+ sub-threshold motion trips with zero confirmed detections
-/// anywhere in that stretch -- keep a clip open for minutes after the
-/// confirmed subject had actually left frame.
+/// extends the post-buffer window while `pending_confirmation` is `Some` --
+/// i.e. a class was seen recently, confirmed or not -- never unconditionally.
+/// Per ADR 2, "correctness against false positives comes entirely from the
+/// YOLO confirmation requirement"; trusting motion alone here (the original
+/// behavior) let ordinary sensor jitter well below any living-thing
+/// detection -- observed directly: 100+ sub-threshold motion trips with zero
+/// confirmed detections anywhere in that stretch -- keep a clip open for
+/// minutes after the confirmed subject had actually left frame.
 #[allow(
     clippy::significant_drop_tightening,
     reason = "guard is moved into close_event_if_done, which drops it itself before the slow finish() call"
@@ -894,10 +897,11 @@ fn evaluate_active_event(
             // Motion continues but wasn't re-confirmed by YOLO this frame;
             // still reset the quiet-window so a subject that briefly stops
             // moving doesn't get cut off early. Gated on `pending_confirmation`
-            // (a class was confirmed recently) rather than unconditional, so
-            // bare motion-gate noise with no recent YOLO confirmation at all
-            // can't extend the window on its own -- see this function's doc
-            // comment for the observed failure mode this prevents.
+            // being `Some` (a class was seen recently, confirmed or not)
+            // rather than unconditional, so bare motion-gate noise with no
+            // recent YOLO sighting at all can't extend the window on its own
+            // -- see this function's doc comment for the observed failure
+            // mode this prevents.
             event.touch();
         }
     }
@@ -1138,6 +1142,16 @@ fn try_start_recording(
             pre_frames,
             pre_audio,
         });
+
+    // Clear rather than leave populated: once this recording closes (e.g. a
+    // short post-buffer or a camera stall), the loop falls back to this same
+    // function with a fresh trigger. A leftover `pending_confirmation` from
+    // the sighting that just started *this* recording could otherwise let
+    // that unrelated next trigger pass the repeat-sighting gate on its very
+    // first poll if it happens to land within the window -- exactly the
+    // stale-state hazard `active_pending_confirmation` is kept separate from
+    // `pending_confirmation` to avoid on the active-event side.
+    *pending_confirmation = None;
 
     Ok(())
 }
