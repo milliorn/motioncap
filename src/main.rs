@@ -671,6 +671,30 @@ fn confirm_pending(
     None
 }
 
+/// Runs YOLO against `frame` and reduces the result through `confirm_pending`,
+/// on behalf of both `try_start_recording` and `evaluate_active_event` -- the
+/// two callers differ only in what they do with the resulting
+/// `Option<Vec<Detection>>`, not in how a poll gets from a tripped motion
+/// gate to a confirmed detection. `expire_stale_pending` runs unconditionally
+/// before returning regardless of which branch inside `confirm_pending` was
+/// taken (including when `triggers::evaluate` finds nothing and
+/// `confirm_pending` is never reached), so callers no longer need to
+/// remember that invariant themselves -- see `expire_stale_pending`'s doc
+/// comment for why skipping it on the no-detection path is the exact bug
+/// this gate exists to prevent.
+fn poll_confirmed_detections(
+    detector: &mut Detector,
+    config: &Config,
+    frame: &image::RgbImage,
+    pending: &mut Option<PendingConfirmation>,
+) -> Result<Option<Vec<detect::Detection>>> {
+    let now = std::time::Instant::now();
+    let detections = detector.detect(frame, config.detection_confidence)?;
+    let confirmed = triggers::evaluate(detections).and_then(|d| confirm_pending(pending, d, now));
+    expire_stale_pending(pending, now);
+    Ok(confirmed)
+}
+
 /// Updates `last_seen` for a newly-polled `latest_frame` timestamp and
 /// reports whether the loop should proceed with it. Returns `false` once the
 /// same timestamp has recurred for `recorder::MAX_FRAME_STALL` -- i.e.
@@ -847,18 +871,7 @@ fn evaluate_active_event(
     // to keep writing frames/audio at a steady pace while this runs, not
     // blocked waiting on this lock.
     let confirmed = if motion.tripped {
-        let now = std::time::Instant::now();
-        let detections = detector.detect(frame, config.detection_confidence)?;
-        let confirmed = triggers::evaluate(detections)
-            .and_then(|d| confirm_pending(pending_confirmation, d, now));
-        // Must run even when the line above short-circuited (YOLO found no
-        // living-thing class this poll, so confirm_pending was never
-        // called) -- otherwise a stale confirmation from before the subject
-        // left frame never ages out, and the `pending_confirmation.is_some()`
-        // check below keeps reading it as "recent" indefinitely. See
-        // `expire_stale_pending`'s doc comment.
-        expire_stale_pending(pending_confirmation, now);
-        confirmed
+        poll_confirmed_detections(detector, config, frame, pending_confirmation)?
     } else {
         None
     };
@@ -1072,26 +1085,8 @@ fn try_start_recording(
         return Ok(());
     }
 
-    let detections = detector.detect(frame, config.detection_confidence)?;
-
-    log::trace!(
-        "motion tripped; {} detections above threshold",
-        detections.len()
-    );
-
-    let now = std::time::Instant::now();
-
-    let Some(detections) = triggers::evaluate(detections) else {
-        // Even with nothing to confirm this poll, a stale `pending_confirmation`
-        // from an earlier, unrelated sighting must still age out here --
-        // otherwise a same-class hallucination long after the window should
-        // have expired could still "confirm" against it. See
-        // `expire_stale_pending`'s doc comment.
-        expire_stale_pending(pending_confirmation, now);
-        return Ok(());
-    };
-
-    let Some(confirmed) = confirm_pending(pending_confirmation, detections, now) else {
+    let Some(confirmed) = poll_confirmed_detections(detector, config, frame, pending_confirmation)?
+    else {
         return Ok(());
     };
 
