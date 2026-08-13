@@ -68,6 +68,50 @@ GPU acceleration is probed in order CUDA → ROCm → OpenVINO → CPU and falls
 automatically; see
 [`docs/adr/0003-gpu-execution-provider-strategy.md`](docs/adr/0003-gpu-execution-provider-strategy.md).
 
+### Enabling GPU acceleration (optional)
+
+Falling back to CPU is a normal, supported outcome — motioncap works either way, just
+slower on CPU. Nothing below is required to build or run it.
+
+GPU acceleration only activates if the ONNX Runtime shared library motioncap loads at
+startup was itself built with that GPU vendor's execution provider compiled in. A
+Linux distro's packaged `onnxruntime` (e.g. Arch's `extra/onnxruntime`) is commonly
+CPU-only — installing just the NVIDIA/AMD/Intel driver is **not** sufficient, and the
+fallback to CPU happens silently, with no warning or error.
+
+To enable NVIDIA CUDA specifically:
+
+1. Install a CUDA toolkit + cuDNN matching your driver (e.g. on Arch: `sudo pacman -S
+   cuda cudnn`). Check the
+   [ONNX Runtime CUDA execution provider requirements](https://onnxruntime.ai/docs/execution-providers/CUDA-ExecutionProvider.html)
+   for the CUDA/cuDNN version your ONNX Runtime release expects.
+2. Download the matching GPU release tarball from the
+   [ONNX Runtime releases page](https://github.com/microsoft/onnxruntime/releases)
+   (e.g. `onnxruntime-linux-x64-gpu_cuda13-<version>.tgz`) and extract it somewhere
+   local, such as `vendor/` in this repo (gitignored — not something you commit).
+3. Point motioncap at that build's `libonnxruntime.so` via the `ORT_DYLIB_PATH`
+   environment variable before running it:
+
+   ```fish
+   set -x ORT_DYLIB_PATH /path/to/onnxruntime-linux-x64-gpu_cuda13-<version>/lib/libonnxruntime.so
+   cargo run --release
+   ```
+
+   Set it permanently with `set -Ux ORT_DYLIB_PATH ...` (fish) if you want every
+   future run to use it without re-exporting it each session.
+4. Verify it actually took effect — the fallback is silent, so a successful launch
+   alone doesn't confirm GPU is in use. While motioncap is running, check:
+
+   ```fish
+   nvidia-smi --query-compute-apps=pid,process_name,used_memory --format=csv
+   ```
+
+   motioncap should appear in that list with nonzero GPU memory.
+
+ROCm and OpenVINO follow the same pattern (a GPU-enabled ONNX Runtime build,
+discoverable via `ORT_DYLIB_PATH`), against their own vendor's toolkit/runtime
+instead of CUDA.
+
 ## Output layout
 
 ```sh
