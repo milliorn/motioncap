@@ -589,6 +589,24 @@ struct PendingConfirmation {
     first_seen: std::time::Instant,
 }
 
+/// Clears `pending` once it's gone `PENDING_CONFIRMATION_WINDOW` without a
+/// fresh sighting. Called on *every* tripped-motion poll (not only polls
+/// where `confirm_pending` itself runs), since `triggers::evaluate` returning
+/// `None` -- motion tripped but YOLO found no living-thing class -- must not
+/// leave a stale confirmation sitting unexpired forever: `evaluate_active_event`
+/// reads `pending_confirmation.is_some()` on exactly that no-detection path to
+/// decide whether bare motion still extends the recording, so if this expiry
+/// never got a chance to run, a confirmation from minutes ago would keep
+/// reading as "recent" indefinitely -- reproducing the sub-threshold-motion
+/// clip-never-closes bug this whole gate exists to prevent.
+fn expire_stale_pending(pending: &mut Option<PendingConfirmation>, now: std::time::Instant) {
+    if let Some(p) = pending
+        && now.duration_since(p.first_seen) > PENDING_CONFIRMATION_WINDOW
+    {
+        *pending = None;
+    }
+}
+
 /// Reduces this poll's confirmed detections against `pending` (the previous
 /// unconfirmed or already-confirmed sighting, if any) into either a
 /// start/extend-worthy set of detections or an updated `pending` to carry
@@ -616,11 +634,7 @@ fn confirm_pending(
     detections: Vec<detect::Detection>,
     now: std::time::Instant,
 ) -> Option<Vec<detect::Detection>> {
-    if let Some(p) = pending
-        && now.duration_since(p.first_seen) > PENDING_CONFIRMATION_WINDOW
-    {
-        *pending = None;
-    }
+    expire_stale_pending(pending, now);
 
     let repeat_confirmed = pending
         .as_ref()
@@ -637,12 +651,17 @@ fn confirm_pending(
         return Some(detections);
     }
 
+    // No match for the currently-pending class (if any) anywhere in this
+    // poll's detections -- only now does it get replaced. Checked against
+    // every detection this poll, not just the first, so a still-present
+    // class isn't evicted just because a *different* class happens to sort
+    // first in the same poll's results (both can appear together, e.g. a
+    // person and a pet in frame at once).
     if let Some(first) = detections.first() {
         log::debug!(
             "detection '{}' not yet confirmed; awaiting repeat within {PENDING_CONFIRMATION_WINDOW:?}",
             first.class_name
         );
-        
         *pending = Some(PendingConfirmation {
             class_name: first.class_name,
             first_seen: now,
@@ -828,15 +847,23 @@ fn evaluate_active_event(
     // to keep writing frames/audio at a steady pace while this runs, not
     // blocked waiting on this lock.
     let confirmed = if motion.tripped {
+        let now = std::time::Instant::now();
         let detections = detector.detect(frame, config.detection_confidence)?;
-        triggers::evaluate(detections)
-            .and_then(|d| confirm_pending(pending_confirmation, d, std::time::Instant::now()))
+        let confirmed = triggers::evaluate(detections)
+            .and_then(|d| confirm_pending(pending_confirmation, d, now));
+        // Must run even when the line above short-circuited (YOLO found no
+        // living-thing class this poll, so confirm_pending was never
+        // called) -- otherwise a stale confirmation from before the subject
+        // left frame never ages out, and the `pending_confirmation.is_some()`
+        // check below keeps reading it as "recent" indefinitely. See
+        // `expire_stale_pending`'s doc comment.
+        expire_stale_pending(pending_confirmation, now);
+        confirmed
     } else {
         None
     };
 
     let mut guard = active_event.lock().expect("active event lock poisoned");
-    
     let Some(event) = guard.as_recording_mut() else {
         // Recording was closed elsewhere (e.g. shutdown) while inference was
         // running above, or the writer thread hasn't finished seeding it yet.
@@ -1052,13 +1079,19 @@ fn try_start_recording(
         detections.len()
     );
 
+    let now = std::time::Instant::now();
+
     let Some(detections) = triggers::evaluate(detections) else {
+        // Even with nothing to confirm this poll, a stale `pending_confirmation`
+        // from an earlier, unrelated sighting must still age out here --
+        // otherwise a same-class hallucination long after the window should
+        // have expired could still "confirm" against it. See
+        // `expire_stale_pending`'s doc comment.
+        expire_stale_pending(pending_confirmation, now);
         return Ok(());
     };
 
-    let Some(confirmed) =
-        confirm_pending(pending_confirmation, detections, std::time::Instant::now())
-    else {
+    let Some(confirmed) = confirm_pending(pending_confirmation, detections, now) else {
         return Ok(());
     };
 
