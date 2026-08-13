@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.5.1](https://github.com/milliorn/motioncap/compare/motioncap-v0.5.0...motioncap-v0.5.1) (2026-08-13)
+
+
+### Bug Fixes
+
+* **detection:** trigger release for repeat-sighting confirmation gate ([#18](https://github.com/milliorn/motioncap/issues/18)) ([cb0c3f0](https://github.com/milliorn/motioncap/commit/cb0c3f022d3e5b23ee127387e8d9e02d48d695a2))
+
 ## [0.5.0](https://github.com/milliorn/motioncap/compare/motioncap-v0.4.0...motioncap-v0.5.0) (2026-08-13)
 
 
