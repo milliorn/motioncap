@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.5.0](https://github.com/milliorn/motioncap/compare/motioncap-v0.4.0...motioncap-v0.5.0) (2026-08-13)
+
+
+### Features
+
+* **camera:** reconnect stalled camera stream automatically ([#13](https://github.com/milliorn/motioncap/issues/13)) ([7724f10](https://github.com/milliorn/motioncap/commit/7724f1004da7ef9702012a69009e79f4bb575945))
+
 ## [0.4.0](https://github.com/milliorn/motioncap/compare/motioncap-v0.3.0...motioncap-v0.4.0) (2026-08-12)
 
 
