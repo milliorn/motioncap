@@ -217,6 +217,21 @@ const CAMERA_RECONNECT_STALL: Duration = Duration::from_secs(15);
 /// reopen attempt on every single detection poll while it's absent.
 const CAMERA_RECONNECT_COOLDOWN: Duration = Duration::from_secs(10);
 
+/// How long a first, unconfirmed living-thing detection stays eligible for
+/// second-hit confirmation (see `PendingConfirmation`) before it's discarded
+/// as noise. `yolov8n` occasionally hallucinates a living-thing class at
+/// meaningful confidence on a single static frame of a cluttered/low-light
+/// scene with nothing alive in it (observed directly: confidences up to 0.83
+/// on an empty room, spanning the same range as genuine detections, so no
+/// `detection_confidence` value can separate the two by score alone). A real
+/// subject keeps tripping the motion gate and getting re-detected on
+/// subsequent polls for as long as it's in frame; a single hallucinated
+/// frame does not recur. This window is generous relative to
+/// `DETECTION_POLL_INTERVAL` because polls only reach YOLO when the motion
+/// gate trips, not every tick, so the second confirming poll may be a second
+/// or two behind the first rather than immediately after it.
+const PENDING_CONFIRMATION_WINDOW: Duration = Duration::from_secs(5);
+
 /// Writes every log line to both the given file and stderr, since this
 /// process runs long-lived and unattended (per `CLAUDE.md`) -- stderr alone
 /// is lost the moment the terminal/session that launched it goes away, but
@@ -562,6 +577,80 @@ impl FrameLiveness {
     }
 }
 
+/// A first, not-yet-confirmed living-thing detection while no recording is
+/// active, awaiting a second sighting of the same class within
+/// `PENDING_CONFIRMATION_WINDOW` before `run_detection_loop` will actually
+/// start a recording (see that constant's docs for why single-poll
+/// confirmation isn't trustworthy on its own).
+struct PendingConfirmation {
+    /// The living-thing class seen on the first, unconfirmed poll.
+    class_name: &'static str,
+    /// When the first poll observed `class_name`.
+    first_seen: std::time::Instant,
+}
+
+/// Reduces this poll's confirmed detections against `pending` (the previous
+/// unconfirmed or already-confirmed sighting, if any) into either a
+/// start/extend-worthy set of detections or an updated `pending` to carry
+/// into the next poll.
+///
+/// Once a class clears the repeat-sighting gate, `pending`'s `first_seen` is
+/// refreshed (not cleared) on every subsequent poll that still sees it, so a
+/// continuously-present real subject confirms on *every* poll after its
+/// first repeat rather than alternating pending/confirmed every other poll
+/// -- clearing `pending` back to `None` on each confirmation would force a
+/// fresh two-poll cycle every time, silently dropping every other detection
+/// for as long as the subject stays in frame (observed directly: a
+/// continuously-present person alternated "not yet confirmed" / "confirmed"
+/// on literally every poll under the first version of this gate). Only
+/// aging out after a full `PENDING_CONFIRMATION_WINDOW` with no sighting at
+/// all -- not resetting on every confirm -- is what actually distinguishes
+/// a persisting subject from one-off noise.
+///
+/// Only class identity is checked for the repeat, not exact detection
+/// equality, since YOLO's per-frame confidence for the same real subject
+/// naturally varies poll to poll -- requiring an identical score would make
+/// genuine repeats fail to match as often as it filters noise.
+fn confirm_pending(
+    pending: &mut Option<PendingConfirmation>,
+    detections: Vec<detect::Detection>,
+    now: std::time::Instant,
+) -> Option<Vec<detect::Detection>> {
+    if let Some(p) = pending
+        && now.duration_since(p.first_seen) > PENDING_CONFIRMATION_WINDOW
+    {
+        *pending = None;
+    }
+
+    let repeat_confirmed = pending
+        .as_ref()
+        .is_some_and(|p| detections.iter().any(|d| d.class_name == p.class_name));
+
+    if repeat_confirmed {
+        log::debug!("detection confirmed on repeat sighting");
+        // Refresh rather than clear: see doc comment above for why staying
+        // "live" (instead of resetting to scratch) is what lets a
+        // continuously-present subject confirm on every subsequent poll.
+        if let Some(p) = pending {
+            p.first_seen = now;
+        }
+        return Some(detections);
+    }
+
+    if let Some(first) = detections.first() {
+        log::debug!(
+            "detection '{}' not yet confirmed; awaiting repeat within {PENDING_CONFIRMATION_WINDOW:?}",
+            first.class_name
+        );
+        *pending = Some(PendingConfirmation {
+            class_name: first.class_name,
+            first_seen: now,
+        });
+    }
+
+    None
+}
+
 /// Updates `last_seen` for a newly-polled `latest_frame` timestamp and
 /// reports whether the loop should proceed with it. Returns `false` once the
 /// same timestamp has recurred for `recorder::MAX_FRAME_STALL` -- i.e.
@@ -693,9 +782,33 @@ fn reset_liveness_after_reconnect(last_seen: &mut Option<FrameLiveness>) {
 /// closes the event if either close condition in `close_event_if_done` is
 /// met. Kept separate from `run_detection_loop`'s no-active-event path since
 /// the two have no logic in common beyond polling the same frame.
+///
+/// A YOLO hit here goes through the same `confirm_pending` repeat-sighting
+/// gate as starting a new recording (see `PENDING_CONFIRMATION_WINDOW`),
+/// rather than being trusted on the first poll: an already-active recording
+/// doesn't make its own single-frame hits any more trustworthy, and without
+/// this gate a scene that keeps producing recurring (not just one-off)
+/// hallucinations -- observed directly: the same misclassified class
+/// recurring for minutes on an empty room once *something* had genuinely
+/// triggered the recording earlier -- can keep re-extending the post-buffer
+/// window on noise alone long after the real subject has left frame.
+///
+/// Separately, a bare motion-gate trip with no YOLO confirmation at all only
+/// extends the post-buffer window while `pending_confirmation` shows a class
+/// was confirmed recently -- never unconditionally. Per ADR 2, "correctness
+/// against false positives comes entirely from the YOLO confirmation
+/// requirement"; trusting motion alone here (the original behavior) let
+/// ordinary sensor jitter well below any living-thing detection -- observed
+/// directly: 100+ sub-threshold motion trips with zero confirmed detections
+/// anywhere in that stretch -- keep a clip open for minutes after the
+/// confirmed subject had actually left frame.
 #[allow(
     clippy::significant_drop_tightening,
     reason = "guard is moved into close_event_if_done, which drops it itself before the slow finish() call"
+)]
+#[allow(
+    clippy::too_many_arguments,
+    reason = "each parameter is independently threaded state from run_detection_loop's loop body, not a natural grouping (matches try_start_recording's identical justification)"
 )]
 fn evaluate_active_event(
     config: &Config,
@@ -705,6 +818,7 @@ fn evaluate_active_event(
     frame: &image::RgbImage,
     frame_timestamp: std::time::Instant,
     post_buffer: Duration,
+    pending_confirmation: &mut Option<PendingConfirmation>,
 ) -> Result<()> {
     let motion = motion_gate.evaluate(frame)?;
 
@@ -715,11 +829,13 @@ fn evaluate_active_event(
     let confirmed = if motion.tripped {
         let detections = detector.detect(frame, config.detection_confidence)?;
         triggers::evaluate(detections)
+            .and_then(|d| confirm_pending(pending_confirmation, d, std::time::Instant::now()))
     } else {
         None
     };
 
     let mut guard = active_event.lock().expect("active event lock poisoned");
+    
     let Some(event) = guard.as_recording_mut() else {
         // Recording was closed elsewhere (e.g. shutdown) while inference was
         // running above, or the writer thread hasn't finished seeding it yet.
@@ -733,10 +849,14 @@ fn evaluate_active_event(
             for d in confirmed {
                 event.record_detection(d.class_name, d.confidence, frame_timestamp);
             }
-        } else {
-            // Motion continues but wasn't re-confirmed by YOLO on this exact
-            // frame; still reset the quiet-window so a subject that briefly
-            // stops moving doesn't get cut off early.
+        } else if pending_confirmation.is_some() {
+            // Motion continues but wasn't re-confirmed by YOLO this frame;
+            // still reset the quiet-window so a subject that briefly stops
+            // moving doesn't get cut off early. Gated on `pending_confirmation`
+            // (a class was confirmed recently) rather than unconditional, so
+            // bare motion-gate noise with no recent YOLO confirmation at all
+            // can't extend the window on its own -- see this function's doc
+            // comment for the observed failure mode this prevents.
             event.touch();
         }
     }
@@ -806,6 +926,17 @@ fn run_detection_loop(
     // stalled doesn't get the stream rebuilt on every single poll tick (see
     // `maybe_reconnect_camera` / `CAMERA_RECONNECT_COOLDOWN`).
     let mut last_reconnect_attempt: Option<std::time::Instant> = None;
+    // A first, unconfirmed living-thing sighting awaiting a second one to
+    // start a recording (see `confirm_pending` / `PENDING_CONFIRMATION_WINDOW`).
+    let mut pending_confirmation: Option<PendingConfirmation> = None;
+    // The equivalent pending state for a recording already in progress (see
+    // `evaluate_active_event`). Kept separate from `pending_confirmation`
+    // rather than shared: they answer different questions (whether to start
+    // a new recording vs. whether to trust a hit enough to extend one
+    // already justified by an earlier confirmed detection), and sharing
+    // state across that boundary would let a stale pre-recording sighting
+    // spuriously confirm a hit against an event it had nothing to do with.
+    let mut active_pending_confirmation: Option<PendingConfirmation> = None;
 
     loop {
         if shutdown.load(Ordering::SeqCst) {
@@ -863,76 +994,121 @@ fn run_detection_loop(
                 &frame,
                 frame_timestamp,
                 post_buffer,
+                &mut active_pending_confirmation,
             )?;
             continue;
         }
 
-        let motion = motion_gate.evaluate(&frame)?;
+        active_pending_confirmation = None;
 
-        log::trace!("frame received; motion_tripped={}", motion.tripped);
-
-        if !motion.tripped {
-            continue;
-        }
-
-        let detections = detector.detect(&frame, config.detection_confidence)?;
-
-        log::trace!(
-            "motion tripped; {} detections above threshold",
-            detections.len()
-        );
-
-        let Some(confirmed) = triggers::evaluate(detections) else {
-            continue;
-        };
-
-        let mut classes: Vec<&str> = confirmed.iter().map(|d| d.class_name).collect();
-
-        classes.sort_unstable();
-        classes.dedup();
-
-        let (pre_frames, pre_audio) = {
-            let buf = ring_buffer.lock().expect("ring buffer lock poisoned");
-            buf.snapshot()
-        };
-
-        let Some(first_pre_frame) = pre_frames.first() else {
-            // No buffered frames yet (e.g. trigger fired immediately at
-            // startup, before the camera has produced anything); skip this
-            // trigger rather than starting a recording with no video.
-            continue;
-        };
-
-        let (width, height) = first_pre_frame.image.dimensions();
-        let clip_timeline_start = first_pre_frame.timestamp;
-
-        let started_at = chrono::Local::now();
-        let path = clip_path(&config.output_dir, started_at, &classes)?;
-        let mut event = RecordingEvent::start(RecordingEventParams {
-            final_clip_path: path,
-            output_dir: config.output_dir.clone(),
-            started_at,
-            width,
-            height,
-            frame_rate: RECORDING_FRAME_RATE,
-            audio_sample_rate: audio.sample_rate,
-            audio_channels: audio.channels,
-            clip_timeline_start,
-        })?;
-
-        event.record_motion(motion.changed_ratio, frame_timestamp);
-
-        for d in &confirmed {
-            event.record_detection(d.class_name, d.confidence, frame_timestamp);
-        }
-
-        log::info!("recording started: {classes:?}");
-
-        *active_event.lock().expect("active event lock poisoned") =
-            ActiveEvent::Pending(PendingEvent {
-                event,
-                pre_frames,
-                pre_audio,
-            });
+        try_start_recording(
+            &config,
+            &mut motion_gate,
+            &mut detector,
+            &ring_buffer,
+            &active_event,
+            &audio,
+            &frame,
+            frame_timestamp,
+            &mut pending_confirmation,
+        )?;
     }
+}
+
+/// Runs the motion gate and (on trip, then second-poll confirmation) YOLO
+/// detection against `frame` when no recording is currently active, starting
+/// a new `ActiveEvent::Pending` once `confirm_pending` accepts a repeat
+/// sighting. Kept separate from `run_detection_loop` purely to stay under
+/// clippy's function-length limit; it has no logic in common with
+/// `evaluate_active_event` beyond polling the same frame.
+#[allow(
+    clippy::too_many_arguments,
+    reason = "each parameter is independently threaded state from run_detection_loop's loop body, not a natural grouping"
+)]
+fn try_start_recording(
+    config: &Config,
+    motion_gate: &mut MotionGate,
+    detector: &mut Detector,
+    ring_buffer: &Arc<Mutex<RingBuffer>>,
+    active_event: &Arc<Mutex<ActiveEvent>>,
+    audio: &AudioParams,
+    frame: &image::RgbImage,
+    frame_timestamp: std::time::Instant,
+    pending_confirmation: &mut Option<PendingConfirmation>,
+) -> Result<()> {
+    let motion = motion_gate.evaluate(frame)?;
+
+    log::trace!("frame received; motion_tripped={}", motion.tripped);
+
+    if !motion.tripped {
+        return Ok(());
+    }
+
+    let detections = detector.detect(frame, config.detection_confidence)?;
+
+    log::trace!(
+        "motion tripped; {} detections above threshold",
+        detections.len()
+    );
+
+    let Some(detections) = triggers::evaluate(detections) else {
+        return Ok(());
+    };
+
+    let Some(confirmed) =
+        confirm_pending(pending_confirmation, detections, std::time::Instant::now())
+    else {
+        return Ok(());
+    };
+
+    let mut classes: Vec<&str> = confirmed.iter().map(|d| d.class_name).collect();
+
+    classes.sort_unstable();
+    classes.dedup();
+
+    let (pre_frames, pre_audio) = {
+        let buf = ring_buffer.lock().expect("ring buffer lock poisoned");
+        buf.snapshot()
+    };
+
+    let Some(first_pre_frame) = pre_frames.first() else {
+        // No buffered frames yet (e.g. trigger fired immediately at startup,
+        // before the camera has produced anything); skip this trigger rather
+        // than starting a recording with no video.
+        return Ok(());
+    };
+
+    let (width, height) = first_pre_frame.image.dimensions();
+    let clip_timeline_start = first_pre_frame.timestamp;
+
+    let started_at = chrono::Local::now();
+    let path = clip_path(&config.output_dir, started_at, &classes)?;
+    let mut event = RecordingEvent::start(RecordingEventParams {
+        final_clip_path: path,
+        output_dir: config.output_dir.clone(),
+        started_at,
+        width,
+        height,
+        frame_rate: RECORDING_FRAME_RATE,
+        audio_sample_rate: audio.sample_rate,
+        audio_channels: audio.channels,
+        clip_timeline_start,
+    })?;
+
+    event.record_motion(motion.changed_ratio, frame_timestamp);
+
+    for d in &confirmed {
+        event.record_detection(d.class_name, d.confidence, frame_timestamp);
+    }
+
+    log::info!("recording started: {classes:?}");
+
+    *active_event.lock().expect("active event lock poisoned") =
+        ActiveEvent::Pending(PendingEvent {
+            event,
+            pre_frames,
+            pre_audio,
+        });
+
+    Ok(())
 }
