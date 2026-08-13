@@ -642,6 +642,7 @@ fn confirm_pending(
             "detection '{}' not yet confirmed; awaiting repeat within {PENDING_CONFIRMATION_WINDOW:?}",
             first.class_name
         );
+        
         *pending = Some(PendingConfirmation {
             class_name: first.class_name,
             first_seen: now,
