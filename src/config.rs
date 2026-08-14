@@ -54,3 +54,77 @@ impl Config {
         &self.model_path
     }
 }
+
+#[cfg(test)]
+mod tests {
+    //! Unit tests for `Config`'s CLI flag defaults and overrides.
+    #![allow(
+        clippy::unwrap_used,
+        clippy::indexing_slicing,
+        clippy::missing_panics_doc,
+        reason = "test assertions favor unwrap/indexing for clarity; panics here fail the test, which is the intended behavior"
+    )]
+
+    use super::*;
+
+    #[test]
+    fn defaults_match_documented_values() {
+        let config = Config::try_parse_from(["motioncap"]).unwrap();
+
+        assert_eq!(config.output_dir, PathBuf::from("./recordings"));
+        assert_eq!(config.model_path, PathBuf::from("./models/yolov8n.onnx"));
+        assert_eq!(config.camera_device, None);
+        assert!(!config.force_cpu);
+        assert_eq!(config.pre_buffer_secs, 10);
+        assert_eq!(config.post_buffer_secs, 15);
+        assert!((config.detection_confidence - 0.3).abs() < f32::EPSILON);
+        assert!((config.motion_threshold - 0.01).abs() < f32::EPSILON);
+        assert!(!config.preview);
+    }
+
+    #[test]
+    fn flags_are_overridable() {
+        let config = Config::try_parse_from([
+            "motioncap",
+            "--output-dir",
+            "/tmp/out",
+            "--model-path",
+            "/tmp/model.onnx",
+            "--camera-device",
+            "/dev/video1",
+            "--force-cpu",
+            "--pre-buffer-secs",
+            "5",
+            "--post-buffer-secs",
+            "20",
+            "--detection-confidence",
+            "0.7",
+            "--motion-threshold",
+            "0.05",
+            "--preview",
+        ])
+        .unwrap();
+
+        assert_eq!(config.output_dir, PathBuf::from("/tmp/out"));
+        assert_eq!(config.model_path, PathBuf::from("/tmp/model.onnx"));
+        assert_eq!(config.camera_device, Some(PathBuf::from("/dev/video1")));
+        assert!(config.force_cpu);
+        assert_eq!(config.pre_buffer_secs, 5);
+        assert_eq!(config.post_buffer_secs, 20);
+        assert!((config.detection_confidence - 0.7).abs() < f32::EPSILON);
+        assert!((config.motion_threshold - 0.05).abs() < f32::EPSILON);
+        assert!(config.preview);
+    }
+
+    #[test]
+    fn invalid_numeric_flag_is_rejected() {
+        let result = Config::try_parse_from(["motioncap", "--pre-buffer-secs", "not-a-number"]);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn model_path_accessor_returns_configured_path() {
+        let config = Config::try_parse_from(["motioncap", "--model-path", "/x/y.onnx"]).unwrap();
+        assert_eq!(config.model_path(), Path::new("/x/y.onnx"));
+    }
+}

@@ -15,6 +15,20 @@ fn ort_err<T, E: Debug>(result: std::result::Result<T, E>, msg: &str) -> Result<
     result.map_err(|e| anyhow::anyhow!("{msg}: {e:?}"))
 }
 
+/// Serializes every `#[ignore]`d test across the crate that constructs a real
+/// `Detector`/ONNX Runtime session and/or a real `MotionGate` (both here and
+/// in `main.rs`'s test module). `cargo test`'s default parallelism ran
+/// multiple such tests concurrently and reliably produced a heap-corruption
+/// abort ("corrupted double-linked list") within a handful of runs. Neither
+/// `ort`'s `Session` nor `OpenCV`'s `BackgroundSubtractorMOG2` are documented
+/// as safe to construct/run concurrently across independent instances in
+/// separate threads, and this crate's production code never does so (YOLO
+/// inference and the motion gate both run single-threaded inside the
+/// detection worker). Every `#[ignore]`d test that touches either must
+/// acquire this lock for its full duration before doing anything else.
+#[cfg(test)]
+pub static MODEL_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 /// COCO class indices for "person" plus every animal class, per the
 /// "every living thing" detection scope decided during planning (ADR 2).
 const LIVING_THING_CLASSES: &[(usize, &str)] = &[
@@ -69,7 +83,7 @@ impl Detector {
             // entirely: with no execution providers explicitly registered,
             // ONNX Runtime falls back to its own default provider selection,
             // which (depending on how the linked ONNX Runtime build was
-            // configured) isn't guaranteed to be CPU-only -- silently
+            // configured) isn't guaranteed to be CPU-only, silently
             // defeating what `--force-cpu` promises.
             ort_err(
                 builder.with_execution_providers([CPU::default().build()]),
@@ -130,8 +144,8 @@ impl Detector {
 }
 
 /// Letterboxes the frame into a square canvas (preserving aspect ratio, padding
-/// with grey) and converts to an NCHW f32 tensor normalized to [0, 1] -- the
-/// standard `YOLOv8` preprocessing. A naive stretch-to-square resize distorts
+/// with grey) and converts to an NCHW f32 tensor normalized to [0, 1]. This is the
+/// standard `YOLOv8` preprocessing; a naive stretch-to-square resize distorts
 /// non-square camera frames (e.g. this webcam's 640x480) enough to
 /// meaningfully degrade detection confidence, since the model is trained on
 /// letterboxed inputs, not stretched ones.
@@ -255,4 +269,188 @@ fn postprocess(shape: &Shape, data: &[f32], confidence_threshold: f32) -> Vec<De
             })
         })
         .collect()
+}
+
+#[cfg(test)]
+mod tests {
+    //! Unit tests for `preprocess`/`postprocess`/`ort_err`, exercised without a
+    //! real ONNX Runtime session or model file.
+    #![allow(
+        clippy::unwrap_used,
+        clippy::indexing_slicing,
+        clippy::missing_panics_doc,
+        clippy::arithmetic_side_effects,
+        clippy::cast_possible_wrap,
+        reason = "test assertions favor unwrap/indexing/plain arithmetic for clarity over the \
+                   production-code proof-obligation style used elsewhere in this crate; test \
+                   data sizes are small hardcoded constants, so overflow/wrap is not reachable"
+    )]
+
+    use image::Rgb;
+    use ort::value::Shape;
+
+    use super::*;
+
+    /// Builds a synthetic `[1, 84, num_anchors]` YOLO output buffer where every
+    /// anchor's class scores are zero except the ones set via `scores`, a list
+    /// of `(anchor, class_idx, score)` triples (`class_idx` is 0-based over the
+    /// 80 COCO classes, matching `LIVING_THING_CLASSES`' indices).
+    fn synthetic_output(num_anchors: usize, scores: &[(usize, usize, f32)]) -> Vec<f32> {
+        let mut data = vec![0.0_f32; 84 * num_anchors];
+        for &(anchor, class_idx, score) in scores {
+            let row = 4 + class_idx;
+            data[row * num_anchors + anchor] = score;
+        }
+        data
+    }
+
+    #[test]
+    fn postprocess_filters_to_living_thing_classes_above_threshold() {
+        let num_anchors = 2;
+        // class_idx 0 = person (living-thing, above threshold);
+        // class_idx 1 = bicycle (not in LIVING_THING_CLASSES, ignored).
+        let data = synthetic_output(num_anchors, &[(0, 0, 0.9), (1, 1, 0.9)]);
+        let shape = Shape::from(vec![1_i64, 84, num_anchors as i64]);
+
+        let detections = postprocess(&shape, &data, 0.3);
+
+        assert_eq!(detections.len(), 1);
+        assert_eq!(detections[0].class_name, "person");
+        assert!((detections[0].confidence - 0.9).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn postprocess_excludes_scores_below_threshold() {
+        let num_anchors = 1;
+        let data = synthetic_output(num_anchors, &[(0, 0, 0.1)]);
+        let shape = Shape::from(vec![1_i64, 84, num_anchors as i64]);
+
+        let detections = postprocess(&shape, &data, 0.3);
+
+        assert!(detections.is_empty());
+    }
+
+    #[test]
+    fn postprocess_keeps_best_score_per_class_across_anchors() {
+        let num_anchors = 2;
+        let data = synthetic_output(num_anchors, &[(0, 0, 0.4), (1, 0, 0.95)]);
+        let shape = Shape::from(vec![1_i64, 84, num_anchors as i64]);
+
+        let detections = postprocess(&shape, &data, 0.3);
+
+        assert_eq!(detections.len(), 1);
+        assert!((detections[0].confidence - 0.95).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn postprocess_returns_empty_on_wrong_class_dim() {
+        let shape = Shape::from(vec![1_i64, 85, 10_i64]);
+        let data = vec![0.0_f32; 85 * 10];
+
+        assert!(postprocess(&shape, &data, 0.3).is_empty());
+    }
+
+    #[test]
+    fn postprocess_returns_empty_on_wrong_rank() {
+        let shape = Shape::from(vec![84_i64, 10_i64]);
+        let data = vec![0.0_f32; 84 * 10];
+
+        assert!(postprocess(&shape, &data, 0.3).is_empty());
+    }
+
+    #[test]
+    fn preprocess_pads_vertically_for_landscape_input() {
+        let frame = RgbImage::from_pixel(640, 480, Rgb([200, 200, 200]));
+        let tensor = preprocess(&frame);
+
+        // Landscape (wider than tall): scale is bound by width, so the resized
+        // image is shorter than MODEL_INPUT_SIZE and padding is added on the
+        // vertical axis only. The top row should be the grey pad fill, not a
+        // resized pixel.
+        let pad_value = 114.0 / 255.0;
+        assert!((tensor[[0, 0, 0, 0]] - pad_value).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn preprocess_pads_horizontally_for_portrait_input() {
+        let frame = RgbImage::from_pixel(480, 640, Rgb([200, 200, 200]));
+        let tensor = preprocess(&frame);
+
+        let pad_value = 114.0 / 255.0;
+        assert!((tensor[[0, 0, 0, 0]] - pad_value).abs() < f32::EPSILON);
+    }
+
+    #[test]
+    fn preprocess_adds_no_padding_for_square_input() {
+        let frame = RgbImage::from_pixel(640, 640, Rgb([10, 20, 30])); // deliberately non-grey
+        let tensor = preprocess(&frame);
+
+        // A square input needs no letterboxing: scale = 1.0, new_w = new_h =
+        // MODEL_INPUT_SIZE, so every pixel in the tensor comes from the
+        // resized image rather than the grey pad fill.
+        let pad_value = 114.0 / 255.0;
+        assert!((tensor[[0, 0, 0, 0]] - pad_value).abs() > 0.05);
+    }
+
+    #[test]
+    fn ort_err_passes_through_ok() {
+        let result: Result<u32, &str> = Ok(42);
+        assert_eq!(ort_err(result, "unused").unwrap(), 42);
+    }
+
+    #[test]
+    fn ort_err_wraps_error_with_message() {
+        let result: Result<u32, &str> = Err("boom");
+        let err = ort_err(result, "context message").unwrap_err();
+        let text = format!("{err}");
+        assert!(text.contains("context message"));
+        assert!(text.contains("boom"));
+    }
+
+    // --- Detector::load / Detector::detect (real ONNX Runtime + model) ---
+
+    #[test]
+    #[ignore = "requires models/yolov8n.onnx + a working ONNX Runtime build (see ORT_DYLIB_PATH in README); \
+                run explicitly with `cargo test -- --ignored` on a machine that has both"]
+    fn detector_loads_and_runs_inference_on_a_synthetic_frame() {
+        let _guard = MODEL_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let model_path = std::path::Path::new("models/yolov8n.onnx");
+        let mut detector = Detector::load(model_path, true)
+            .expect("failed to load model, is models/yolov8n.onnx present?");
+
+        let frame = RgbImage::from_pixel(640, 480, image::Rgb([128, 128, 128]));
+
+        // A synthetic grey frame has no real subject in it, so this only
+        // exercises Detector::load/detect's plumbing (session creation,
+        // preprocessing, running inference, extracting the output tensor);
+        // postprocess's actual filtering logic is already covered directly by
+        // the postprocess_* tests above with controlled synthetic tensors.
+        let detections = detector
+            .detect(&frame, 0.3)
+            .expect("inference should not error on a well-formed frame");
+
+        // No assertion on detections.len(): a blank grey frame may or may not
+        // produce spurious detections depending on the model build.
+        drop(detections);
+    }
+
+    #[test]
+    #[ignore = "requires models/yolov8n.onnx + a working ONNX Runtime build (see ORT_DYLIB_PATH in README); \
+                run explicitly with `cargo test -- --ignored` on a machine that has both"]
+    fn detector_load_registers_gpu_execution_providers_when_not_forced_to_cpu() {
+        let _guard = MODEL_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        // force_cpu=false exercises the CUDA/ROCm/OpenVINO/CPU registration
+        // branch (as opposed to the force_cpu=true test above, which only
+        // exercises the CPU-only branch); ort probes each provider at
+        // runtime and falls through to whichever is actually available
+        // (ADR 3), so this should succeed identically on hardware with none
+        // of those accelerators, same as the force_cpu=true case.
+        let model_path = std::path::Path::new("models/yolov8n.onnx");
+        Detector::load(model_path, false)
+            .expect("failed to load model, is models/yolov8n.onnx present?");
+    }
 }
