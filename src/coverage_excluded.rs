@@ -1,4 +1,4 @@
-//! Holds the three functions in this crate that cannot be exercised by an
+//! Holds the functions in this crate that cannot be exercised by an
 //! automated test under any circumstances, split out from `main.rs` so that
 //! file remains fully unit-testable and `cargo-llvm-cov`'s coverage gate can
 //! stay at (true) 100% there. `cargo-llvm-cov` on stable Rust only supports
@@ -9,8 +9,8 @@
 //! handful of untestable functions into `main.rs` alongside dozens of
 //! thoroughly-tested ones meant the only available exclusion mechanism was
 //! all-or-nothing: either accept `main.rs`'s reported coverage sitting in the
-//! 50s (correct but discouraging, and looks identical to "nobody tried") --
-//! or exclude the whole file and lose the ability to detect a regression in
+//! 50s (correct but discouraging, and looks identical to "nobody tried") or
+//! exclude the whole file and lose the ability to detect a regression in
 //! its real, tested logic. Isolating the untestable functions here instead keeps
 //! `main.rs` at genuine 100% and makes exactly what's excluded, and why,
 //! visible in one place.
@@ -30,15 +30,26 @@
 //!   body ever runs, so even exercising just its shutdown path would
 //!   require the same hardware/model dependency the `#[ignore]`d tests in
 //!   `detect.rs` already isolate as local-only.
+//! - [`run_recording_writer_loop`] and [`run_preview_loop`] are testable up
+//!   to their shutdown-check branch (a plain `AtomicBool`, no hardware
+//!   needed; see the tests below), but their steady-state loop body waits
+//!   on real wall-clock time (`thread::sleep`) and then either drains real
+//!   ring-buffer/ffmpeg state or drives `PreviewWindow`, which needs a real
+//!   `OpenCV` highgui display. A test can exercise the shutdown branch, not
+//!   the loop actually running.
+//! - [`maybe_reconnect_camera`] calls `capture::camera::start_camera_capture`
+//!   once past its threshold/cooldown guard, opening a real `/dev/videoN`
+//!   device. The guard itself (`should_reconnect`) is pure and stays in
+//!   `main.rs`, tested directly there.
 //!
-//! None of these functions contain meaningful decision logic of their own --
-//! every branch `run_detection_loop`'s loop takes is a call into a function
-//! defined in `main.rs` and unit-tested there (`try_start_recording`,
-//! `evaluate_active_event`, `frame_liveness_advanced`, `maybe_reconnect_camera`,
-//! `finish_event_on_shutdown`, ...). This module is deliberately kept to pure
-//! sequencing/wiring for exactly that reason; if a function here starts
-//! accumulating real logic, that logic belongs in `main.rs` where it can be
-//! tested, not here.
+//! None of these functions contain meaningful decision logic of their own;
+//! every branch they take is either a real I/O call or a call into a
+//! function defined in `main.rs` and unit-tested there (`try_start_recording`,
+//! `evaluate_active_event`, `frame_liveness_advanced`, `should_reconnect`,
+//! `seed_and_drain_active_event`, `finish_event_on_shutdown`, ...). This
+//! module is deliberately kept to pure sequencing/wiring/I/O for exactly
+//! that reason; if a function here starts accumulating real decision logic,
+//! that logic belongs in `main.rs` where it can be tested, not here.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -51,13 +62,23 @@ use crate::buffer::RingBuffer;
 use crate::config::Config;
 use crate::detect::Detector;
 use crate::motion::MotionGate;
+use crate::preview::PreviewWindow;
 use crate::{
-    ActiveEvent, AudioParams, DETECTION_POLL_INTERVAL, DetectionCamera, FrameLiveness,
-    LOG_FILE_NAME, PendingConfirmation, TeeWriter, WriterDrained, capture, close_event_if_done,
-    evaluate_active_event, finish_event_on_shutdown, frame_liveness_advanced,
-    maybe_reconnect_camera, reset_liveness_after_reconnect, run_preview_loop,
-    run_recording_writer_loop, startup, try_start_recording,
+    ActiveEvent, AudioParams, CAMERA_RECONNECT_STALL, DETECTION_POLL_INTERVAL, DetectionCamera,
+    FrameLiveness, LOG_FILE_NAME, PendingConfirmation, RECORDING_FRAME_RATE, TeeWriter,
+    WriterDrained, capture, close_event_if_done, evaluate_active_event, finish_event_on_shutdown,
+    frame_liveness_advanced, reset_liveness_after_reconnect, seed_and_drain_active_event,
+    should_reconnect, startup, try_start_recording,
 };
+
+/// Poll interval derived from `RECORDING_FRAME_RATE`, used by
+/// `run_recording_writer_loop`.
+const RECORDING_POLL_INTERVAL: Duration = Duration::from_millis(1000 / RECORDING_FRAME_RATE as u64);
+
+/// Live preview window refresh rate (diagnostic only; see `preview.rs`).
+const PREVIEW_FRAME_RATE: u32 = 30;
+/// Poll interval derived from `PREVIEW_FRAME_RATE`.
+const PREVIEW_POLL_INTERVAL: Duration = Duration::from_millis(1000 / PREVIEW_FRAME_RATE as u64);
 
 /// Initializes logging to write every line to both `<output_dir>/motioncap.log`
 /// and stderr (see `TeeWriter`), honoring `RUST_LOG` exactly as a bare
@@ -319,5 +340,181 @@ fn run_detection_loop(
             frame_timestamp,
             &mut pending_confirmation,
         )?;
+    }
+}
+
+/// Writes frames/audio into the active recording (if any) on a steady clock,
+/// independent of how long motion-gate/YOLO evaluation takes in the
+/// detection loop. This is what keeps recorded clips at a uniform frame
+/// rate even while YOLO inference is running on the same tick elsewhere.
+#[allow(
+    clippy::needless_pass_by_value,
+    reason = "Arc clones are moved into a spawned 'static thread closure, so they must be owned here"
+)]
+fn run_recording_writer_loop(
+    ring_buffer: Arc<Mutex<RingBuffer>>,
+    active_event: Arc<Mutex<ActiveEvent>>,
+    shutdown: Arc<AtomicBool>,
+    writer_drained: Arc<WriterDrained>,
+) {
+    loop {
+        if shutdown.load(Ordering::SeqCst) {
+            // The detection loop may still be blocked in YOLO inference when
+            // shutdown fires and won't reach its own shutdown check (which
+            // is what finishes the clip) until that inference pass
+            // completes. Draining once more here before exiting means
+            // whatever the camera/mic captured up to this instant still
+            // makes it into the clip instead of being silently dropped from
+            // the tail end of the recording. `writer_drained` is signaled
+            // strictly after this drain completes, and `finish_event_on_shutdown`
+            // waits on it before taking/finishing the event, so this drain is
+            // guaranteed to land before the clip is finalized rather than
+            // racing it.
+            seed_and_drain_active_event(&ring_buffer, &active_event);
+            writer_drained.signal();
+            return;
+        }
+
+        thread::sleep(RECORDING_POLL_INTERVAL);
+
+        seed_and_drain_active_event(&ring_buffer, &active_event);
+    }
+}
+
+/// Displays the latest ring-buffer frame in a live preview window, if
+/// `--preview` was passed. Runs on the main thread since `OpenCV`'s highgui
+/// event loop isn't safe to drive from a background thread.
+fn run_preview_loop(
+    ring_buffer: &Arc<Mutex<RingBuffer>>,
+    shutdown: &Arc<AtomicBool>,
+    show_preview: bool,
+) -> Result<()> {
+    let mut preview = if show_preview {
+        Some(PreviewWindow::open()?)
+    } else {
+        None
+    };
+
+    loop {
+        if shutdown.load(Ordering::SeqCst) {
+            return Ok(());
+        }
+
+        thread::sleep(PREVIEW_POLL_INTERVAL);
+
+        let Some(preview) = preview.as_mut() else {
+            continue;
+        };
+
+        let latest_frame = {
+            let buf = ring_buffer.lock().expect("ring buffer lock poisoned");
+            buf.latest_frame().map(|f| f.image.clone())
+        };
+
+        if let Some(frame) = latest_frame {
+            preview.show(&frame)?;
+        }
+    }
+}
+
+/// If the current stall (tracked by `last_seen`) has persisted past
+/// `CAMERA_RECONNECT_STALL`, tears down and rebuilds the capture stream (see
+/// `capture::camera::start_camera_capture`'s doc comment), respecting
+/// `CAMERA_RECONNECT_COOLDOWN` between attempts so a camera that stays absent
+/// doesn't get reopened on every single poll tick while it's gone.
+/// `last_reconnect_attempt` is updated on every attempt (success or failure),
+/// so the cooldown also applies after a success. If the rebuilt stream
+/// stalls again immediately, this still waits out the cooldown rather than
+/// retrying in a tight loop.
+///
+/// Returns `true` on a successful rebuild, so the caller can reset
+/// `last_seen`: the old stream's last timestamp is meaningless to compare
+/// the freshly rebuilt stream's frames against.
+fn maybe_reconnect_camera(
+    last_seen: Option<&FrameLiveness>,
+    last_reconnect_attempt: &mut Option<std::time::Instant>,
+    camera: &Mutex<Option<nokhwa::threaded::CallbackCamera>>,
+    camera_device: Option<&std::path::Path>,
+    ring_buffer: &Arc<Mutex<RingBuffer>>,
+) -> bool {
+    let now = std::time::Instant::now();
+
+    if !should_reconnect(last_seen, *last_reconnect_attempt, now) {
+        return false;
+    }
+
+    *last_reconnect_attempt = Some(now);
+
+    log::warn!(
+        "camera has been stalled for over {CAMERA_RECONNECT_STALL:?}; attempting to rebuild the capture stream"
+    );
+
+    // The old stream must be torn down (dropping it sets the wedged capture
+    // thread's die flag; see `start_camera_capture`'s doc comment) *before*
+    // attempting to open a new one, since both hold the same underlying
+    // device node open; otherwise every reopen attempt fails with EBUSY for
+    // as long as the old instance is still alive.
+    drop(camera.lock().expect("camera lock poisoned").take());
+
+    let rebuilt = capture::camera::start_camera_capture(camera_device, Arc::clone(ring_buffer));
+
+    match rebuilt {
+        Ok(new_camera) => {
+            *camera.lock().expect("camera lock poisoned") = Some(new_camera);
+            log::info!("camera stream rebuilt successfully");
+            true
+        }
+        Err(err) => {
+            log::error!("failed to rebuild camera stream: {err:?}");
+            false
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //! Shutdown-path tests for the two loops in this module that don't need
+    //! real hardware to reach their shutdown branch (see the module doc for
+    //! why the rest of each function can't be tested). `run_detection_loop`
+    //! and `maybe_reconnect_camera`'s rebuild path have no equivalent test
+    //! here since both require real hardware/model dependencies even to
+    //! reach their first line; see `docs/adr/0006-coverage-exclusions.md`.
+    #![allow(
+        clippy::unwrap_used,
+        reason = "test assertions favor unwrap for clarity"
+    )]
+
+    use crate::buffer::RingBuffer;
+
+    use super::*;
+
+    #[test]
+    fn run_recording_writer_loop_drains_and_signals_on_immediate_shutdown() {
+        let ring_buffer = Arc::new(Mutex::new(RingBuffer::new(Duration::from_secs(10))));
+        let active_event = Arc::new(Mutex::new(ActiveEvent::None));
+        let shutdown = Arc::new(AtomicBool::new(true));
+        let writer_drained = Arc::new(WriterDrained::default());
+
+        run_recording_writer_loop(
+            ring_buffer,
+            active_event,
+            shutdown,
+            Arc::clone(&writer_drained),
+        );
+
+        // Must not block: signal() was called before the function returned.
+        writer_drained.wait();
+    }
+
+    #[test]
+    fn run_preview_loop_returns_immediately_on_shutdown_without_preview() {
+        let ring_buffer = Arc::new(Mutex::new(RingBuffer::new(Duration::from_secs(10))));
+        let shutdown = Arc::new(AtomicBool::new(true));
+
+        // show_preview=false skips PreviewWindow::open() entirely, so this
+        // needs no display; only the shutdown-check branch is exercised.
+        let result = run_preview_loop(&ring_buffer, &shutdown, false);
+
+        assert!(result.is_ok());
     }
 }

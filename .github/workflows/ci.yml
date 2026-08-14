@@ -161,23 +161,23 @@ jobs:
 
       # 9 tests across detect.rs/main.rs are #[ignore]d: they construct a real
       # Detector (ONNX Runtime session) against models/yolov8n.onnx, which is
-      # gitignored and not fetched here -- everything else runs. Coverage (not
+      # gitignored and not fetched here, so everything else runs. Coverage (not
       # just pass/fail) is measured by the step below instead of a plain
       # `cargo test`, since llvm-cov's instrumented run already re-runs the
       # full suite; a bare `cargo test` here would just duplicate that work.
       #
-      # orchestration.rs/preview.rs/capture/camera.rs/capture/audio.rs are
+      # coverage_excluded.rs/preview.rs/capture/camera.rs/capture/audio.rs are
       # excluded by file: they need real camera/audio hardware or a display,
       # which CI (and this repo's stable-only toolchain, which can't use the
       # nightly-only #[coverage(off)] attribute for finer-grained exclusion)
-      # cannot provide -- see docs/adr/0006-coverage-exclusions.md.
+      # cannot provide, see docs/adr/0006-coverage-exclusions.md.
       #
-      # 77% (not the ~94.6% achievable locally with the model file present)
+      # 77% (not the ~95.7% achievable locally with the model file present)
       # is what CI can actually reach without the #[ignore]'d tests; set from
-      # the real measured number (77.42%) with a small margin so measurement
-      # noise doesn't fail unrelated PRs -- lower this only alongside a
+      # the real measured number (77.91%) with a small margin so measurement
+      # noise doesn't fail unrelated PRs. Lower this only alongside a
       # deliberate, reviewed decision to drop coverage, never to silence a
       # real regression.
       - name: Run tests with coverage
         if: github.event_name == 'pull_request'
-        run: cargo llvm-cov --workspace --fail-under-lines 77 --ignore-filename-regex 'orchestration\.rs|preview\.rs|capture/camera\.rs|capture/audio\.rs'
+        run: cargo llvm-cov --workspace --fail-under-lines 77 --ignore-filename-regex 'coverage_excluded\.rs|preview\.rs|capture/camera\.rs|capture/audio\.rs'

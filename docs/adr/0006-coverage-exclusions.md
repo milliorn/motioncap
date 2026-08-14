@@ -1,4 +1,4 @@
-# 6. Coverage exclusions: file-level via `cargo-llvm-cov`, plus a dedicated `orchestration.rs`
+# 6. Coverage exclusions: file-level via `cargo-llvm-cov`, plus a dedicated `coverage_excluded.rs`
 
 ## Status
 
@@ -20,16 +20,26 @@ stood between the codebase and 100%:
      via `cpal`.
    - `preview.rs` (every method): drives `OpenCV`'s highgui, which needs a real
      X11/Wayland display — there is no headless fake for a GUI window.
-   - `orchestration::init_logging`: calls `env_logger::Builder::init()`, which sets
+   - `coverage_excluded::init_logging`: calls `env_logger::Builder::init()`, which sets
      the process-global logger and panics if called a second time in the same
      process. `cargo test` runs the entire suite in one process, so this can only be
      invoked once, in the real startup path, without an order-dependent risk of
      poisoning every other test's use of the `log::` macros.
-   - `orchestration::run` (the former body of `main`) and `orchestration::run_detection_loop`
-     — top-level wiring that opens the real camera/audio devices and constructs a real
+   - `coverage_excluded::run` (the former body of `main`) and `coverage_excluded::run_detection_loop`,
+     top-level wiring that opens the real camera/audio devices and constructs a real
      `Detector::load` (model file + ONNX Runtime session) unconditionally before doing
      anything else, so even their shutdown-only paths can't be exercised without that
      hardware/model dependency.
+   - `coverage_excluded::run_recording_writer_loop` and `coverage_excluded::run_preview_loop`,
+     testable up to their shutdown-check branch (a plain `AtomicBool`, no hardware
+     needed; both have a unit test exercising exactly that), but their steady-state
+     loop body waits on real wall-clock time via `thread::sleep` and then either drains
+     real ring-buffer/ffmpeg state or drives `PreviewWindow`, which needs a real
+     `OpenCV` highgui display.
+   - `coverage_excluded::maybe_reconnect_camera`, which calls
+     `capture::camera::start_camera_capture` once past its threshold/cooldown guard,
+     opening a real `/dev/videoN` device. The guard itself (`should_reconnect`) is pure
+     and stays in `main.rs`, unit-tested directly there.
    - `Config::parse_args`: reads the real process's `std::env::args()`.
    - `check_ffmpeg`'s "not found" branch (`startup/depcheck.rs`), only reachable if
      `ffmpeg` is genuinely absent from `PATH` — this crate denies `unsafe_code`, and
@@ -65,22 +75,41 @@ coverage gate.
 
 ## Decision
 
-**Isolate every untestable function into its own module, `src/orchestration.rs`,** so
-that file-level exclusion becomes precise instead of a blunt trade-off. Only
-`orchestration::run` (top-level wiring, formerly `main`'s body),
-`orchestration::init_logging`, and `orchestration::run_detection_loop` live there;
-`main.rs`'s own `fn main()` shrinks to a one-line call into `orchestration::run()`.
-Every pure decision function the detection loop calls (`try_start_recording`,
-`evaluate_active_event`, `close_event_if_done`, `finish_event_on_shutdown`,
-`frame_liveness_advanced`, `maybe_reconnect_camera`, `should_reconnect`,
+**Isolate every untestable function into its own module, `src/coverage_excluded.rs`,** so
+that file-level exclusion becomes precise instead of a blunt trade-off. `coverage_excluded::run`
+(top-level wiring, formerly `main`'s body), `coverage_excluded::init_logging`,
+`coverage_excluded::run_detection_loop`, `coverage_excluded::run_recording_writer_loop`,
+`coverage_excluded::run_preview_loop`, and `coverage_excluded::maybe_reconnect_camera` live
+there; `main.rs`'s own `fn main()` shrinks to a one-line call into `coverage_excluded::run()`.
+The latter three moved out of `main.rs` after initially landing there: each is
+untestable past its own guard/shutdown-check branch for the same reasons as the rest of
+this module (real wall-clock polling, a real `OpenCV` window, or a real camera device),
+and leaving them in `main.rs` meant those specific lines dragged its reported number
+down for no different a reason than the functions already isolated here. Every pure
+decision function the detection loop (or these newly-moved functions) calls
+(`try_start_recording`, `evaluate_active_event`, `close_event_if_done`,
+`finish_event_on_shutdown`, `frame_liveness_advanced`, `should_reconnect`,
 `seed_and_drain_active_event`, `confirm_pending`, `expire_stale_pending`, ...) stays in
-`main.rs`, made `pub(crate)` where `orchestration.rs` needs to call it, and is
+`main.rs`, made `pub(crate)` where `coverage_excluded.rs` needs to call it, and is
 unit-tested directly there.
+
+Not every function with an untestable branch moved, though: `try_start_recording` and
+`evaluate_active_event` still call `RecordingEvent::start` (spawns ffmpeg) on their
+confirmed-detection path, which no test reaches, since doing so honestly (not just to
+satisfy the coverage tool) requires a real photo of a living-thing subject for YOLO to
+confirm, the same category of dependency as `detect.rs`'s `#[ignore]`'d tests. That gap
+was deliberately left in place rather than extracted: splitting the ffmpeg-spawning tail
+out of either function would fragment cohesive decision logic (which classes to record,
+whether to start at all) away from its own tests purely to move a handful of lines,
+exactly the "erasing real coverage signal" trade-off this ADR's Context section already
+rejected once. A `?`-propagated error branch or a genuinely hardware-bound function
+(opens a device, drives a GUI, blocks on real time) is worth isolating; a function that's
+merely *sometimes* reached only under real inputs a test can't fabricate is not.
 
 `cargo llvm-cov`'s CI/local invocation excludes exactly four files by regex:
 
 ```sh
---ignore-filename-regex 'orchestration\.rs|preview\.rs|capture/camera\.rs|capture/audio\.rs'
+--ignore-filename-regex 'coverage_excluded\.rs|preview\.rs|capture/camera\.rs|capture/audio\.rs'
 ```
 
 `capture/camera.rs` and `capture/audio.rs` are *not* excluded wholesale — only the
@@ -109,31 +138,34 @@ genuinely different achievable ceilings:
 
 - **Local** (`cargo llvm-cov --workspace --ignore-filename-regex '...' -- --include-ignored`,
   run on a machine with `models/yolov8n.onnx` and a working ONNX Runtime build already
-  present): **94.62%** measured at the time this ADR was written. The remaining gap is
-  entirely the `?`-propagated error branches described above.
+  present): **95.72%** measured after `run_recording_writer_loop`, `run_preview_loop`,
+  and `maybe_reconnect_camera` moved into `coverage_excluded.rs` (up from 94.62% before that
+  move). The remaining gap is the `?`-propagated error branches described above, plus
+  `try_start_recording`/`evaluate_active_event`'s confirmed-detection path, which needs
+  a real photo of a living-thing subject to reach honestly (see the Decision section).
 - **CI** (`cargo llvm-cov --workspace --fail-under-lines 77 --ignore-filename-regex '...'`,
-  no `--ignored` — the gitignored model file is never fetched in CI): **77.42%**
+  no `--ignored`, the gitignored model file is never fetched in CI): **77.91%**
   measured, gated at 77 with a small margin for measurement noise. This is
   meaningfully lower than the local number specifically because the 9 `#[ignore]`'d
   tests (which exercise a large fraction of `detect.rs`'s and `main.rs`'s logic) never
-  run there — that gap is expected and documented, not a sign CI is under-testing
+  run there; that gap is expected and documented, not a sign CI is under-testing
   relative to what it can actually run.
 
 ## Consequences
 
 - `main.rs` and every file except the four excluded ones are held to a *real*, gate-
   enforced 100%-or-explained-gap standard — a regression in any tested function moves
-  the reported number and fails CI, not just `orchestration.rs`'s untestable wiring.
-- Adding a new function to `orchestration.rs` is a deliberate signal: it should only
+  the reported number and fails CI, not just `coverage_excluded.rs`'s untestable wiring.
+- Adding a new function to `coverage_excluded.rs` is a deliberate signal: it should only
   ever contain thin sequencing/wiring calling into functions defined (and tested)
   elsewhere. If a function there starts accumulating real decision logic, that logic
-  belongs in `main.rs`, not `orchestration.rs` — see that module's own doc comment.
-- The CI threshold (77) and local threshold (94.62%, informal, not currently gated by
+  belongs in `main.rs`, not `coverage_excluded.rs` — see that module's own doc comment.
+- The CI threshold (77) and local threshold (95.72%, informal, not currently gated by
   a CI job, since there is no CI runner with the model file present) must be
   re-verified and adjusted together whenever the untestable-function list changes;
   they are not meant to converge, since the gap between them is structural (CI never
   has the model file), not a discrepancy to eliminate.
-- If `#[coverage(off)]` stabilizes on a future stable Rust release, `orchestration.rs`
+- If `#[coverage(off)]` stabilizes on a future stable Rust release, `coverage_excluded.rs`
   could in principle be dissolved back into `main.rs` with the exclusion moved to
   precise `#[coverage(off)]` attributes per-function, but this is not planned — the
   module split has its own value as a visible boundary between "wiring" and "logic"
