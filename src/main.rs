@@ -1869,9 +1869,12 @@ mod tests {
 
         // A synthetic frame has no real subject, so poll_confirmed_detections
         // returns None; the event stays open (60s post_buffer, not timed
-        // out) but no detection was confirmed.
+        // out) but no detection was confirmed. Whether `pending` ends up
+        // `Some`/`None` depends on the model's actual output on this
+        // synthetic frame, which isn't deterministic across builds, so it
+        // isn't asserted on here. Only that evaluate_active_event ran
+        // without panicking and left the event open is checked.
         assert!(active_event.lock().unwrap().is_some());
-        assert!(pending.is_none() || pending.is_some()); // exercised, no fixed outcome
         active_event
             .lock()
             .unwrap()
