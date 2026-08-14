@@ -94,5 +94,4 @@ a short window (`PENDING_CONFIRMATION_WINDOW`, currently 5s) before it counts, b
 start a new recording and to extend an already-active one's post-buffer window. A
 one-off hallucinated frame doesn't repeat; a real subject, which keeps tripping the
 motion gate and getting re-detected for as long as it's in frame, does. See
-`confirm_pending`/`PendingConfirmation` in `main.rs` (and the "Repeat-sighting
-confirmation gate" section of `CLAUDE.md`) for the implementation.
+`confirm_pending`/`PendingConfirmation` in `main.rs` for the implementation.

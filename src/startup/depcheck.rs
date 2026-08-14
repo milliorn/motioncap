@@ -49,3 +49,54 @@ fn check_model_file(path: &Path) -> Result<()> {
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    //! Unit tests for startup dependency checks. `check_ffmpeg` is tested
+    //! against the real `PATH` (ffmpeg is a hard runtime dependency of this
+    //! crate per ADR 5, so it's expected to be present wherever these tests
+    //! run) rather than mocked, since mocking a subprocess probe would test
+    //! nothing real about whether ffmpeg is actually reachable.
+    #![allow(
+        clippy::unwrap_used,
+        clippy::indexing_slicing,
+        clippy::missing_panics_doc,
+        reason = "test assertions favor unwrap/indexing for clarity; panics here fail the test, which is the intended behavior"
+    )]
+
+    use tempfile::NamedTempFile;
+
+    use super::*;
+
+    #[test]
+    fn check_ffmpeg_succeeds_when_present_on_path() {
+        assert!(check_ffmpeg().is_ok());
+    }
+
+    #[test]
+    fn check_model_file_ok_when_file_exists() {
+        let file = NamedTempFile::new().unwrap();
+        assert!(check_model_file(file.path()).is_ok());
+    }
+
+    #[test]
+    fn check_dependencies_ok_when_ffmpeg_and_model_present() {
+        use clap::Parser as _;
+
+        let file = NamedTempFile::new().unwrap();
+        let config =
+            Config::try_parse_from(["motioncap", "--model-path", &file.path().to_string_lossy()])
+                .unwrap();
+
+        assert!(check_dependencies(&config).is_ok());
+    }
+
+    #[test]
+    fn check_model_file_errors_with_helpful_message_when_missing() {
+        let missing = Path::new("/nonexistent/path/model.onnx");
+        let err = check_model_file(missing).unwrap_err();
+        let message = err.to_string();
+        assert!(message.contains("ONNX model file not found"));
+        assert!(message.contains("/nonexistent/path/model.onnx"));
+    }
+}

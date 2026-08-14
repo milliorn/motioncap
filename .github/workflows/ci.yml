@@ -39,7 +39,7 @@ concurrency:
   cancel-in-progress: true
 
 env:
-  # Pinned to match the opencv5.pc the crate is developed against (see CLAUDE.md).
+  # Pinned to match the opencv5.pc the crate is developed against.
   # ubuntu-latest's apt repos only ship OpenCV 4.x, so core OpenCV is built from
   # source here (contrib modules are not needed -- Cargo.toml only enables
   # video/videoio/imgproc/imgcodecs/highgui). Cached by this version + runner OS;
@@ -60,10 +60,13 @@ jobs:
 
       # cpal (audio capture) links against ALSA at build time regardless of
       # whether OpenCV is cached, so this runs unconditionally on every run.
+      # ffmpeg is also unconditional here: it's a hard runtime dependency (see
+      # ADR 5) and the recorder integration tests spawn it for real, so it
+      # must be present even on a cache-hit run where OpenCV needs nothing.
       - name: Install runtime linkage dependencies
         run: |
           sudo apt-get update
-          sudo apt-get install -y --no-install-recommends libasound2-dev
+          sudo apt-get install -y --no-install-recommends libasound2-dev ffmpeg
 
       # actions/cache's restore step extracts the tarball as the unprivileged runner
       # user (no sudo), but /usr/local is root-owned -- without this, every restore
@@ -121,7 +124,13 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
         with:
-          components: clippy, rustfmt
+          components: clippy, rustfmt, llvm-tools-preview
+
+      # cargo-llvm-cov is only needed on PR runs (see the coverage step below),
+      # but installing it unconditionally keeps this step's cache key stable and
+      # avoids conditional-install cache-key churn.
+      - name: Install cargo-llvm-cov
+        uses: taiki-e/install-action@cargo-llvm-cov
 
       - name: Cache cargo registry and build artifacts
         uses: actions/cache@v6
@@ -149,3 +158,26 @@ jobs:
 
       - name: Build
         run: cargo build --all-targets
+
+      # 9 tests across detect.rs/main.rs are #[ignore]d: they construct a real
+      # Detector (ONNX Runtime session) against models/yolov8n.onnx, which is
+      # gitignored and not fetched here -- everything else runs. Coverage (not
+      # just pass/fail) is measured by the step below instead of a plain
+      # `cargo test`, since llvm-cov's instrumented run already re-runs the
+      # full suite; a bare `cargo test` here would just duplicate that work.
+      #
+      # orchestration.rs/preview.rs/capture/camera.rs/capture/audio.rs are
+      # excluded by file: they need real camera/audio hardware or a display,
+      # which CI (and this repo's stable-only toolchain, which can't use the
+      # nightly-only #[coverage(off)] attribute for finer-grained exclusion)
+      # cannot provide -- see docs/adr/0006-coverage-exclusions.md.
+      #
+      # 77% (not the ~94.6% achievable locally with the model file present)
+      # is what CI can actually reach without the #[ignore]'d tests; set from
+      # the real measured number (77.42%) with a small margin so measurement
+      # noise doesn't fail unrelated PRs -- lower this only alongside a
+      # deliberate, reviewed decision to drop coverage, never to silence a
+      # real regression.
+      - name: Run tests with coverage
+        if: github.event_name == 'pull_request'
+        run: cargo llvm-cov --workspace --fail-under-lines 77 --ignore-filename-regex 'orchestration\.rs|preview\.rs|capture/camera\.rs|capture/audio\.rs'

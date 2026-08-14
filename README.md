@@ -129,9 +129,16 @@ Retention/pruning is out of scope — disk space is managed manually. See
 ```fish
 cargo clippy     # lint
 cargo fmt        # format
+cargo test       # run the test suite (skips model-dependent tests, matching CI)
+cargo test -- --ignored          # only the model-dependent tests (needs models/yolov8n.onnx)
+cargo test -- --include-ignored  # everything
 ```
 
-There is no test suite yet.
+Tests live inline as `#[cfg(test)] mod tests` next to the code they exercise, not in a
+top-level `tests/` directory. See
+[`docs/adr/0007-testing-conventions.md`](docs/adr/0007-testing-conventions.md) for why,
+and [`docs/adr/0006-coverage-exclusions.md`](docs/adr/0006-coverage-exclusions.md) for
+what's excluded from coverage and why.
 
 Design rationale for anything non-obvious in the codebase is recorded in
 [`docs/adr/`](docs/adr/) — read the relevant ADR before changing behavior in that area.

@@ -34,7 +34,7 @@ pub struct DetectionRecord {
 
 /// One recorded motion-gate trip, written into a clip's `.json` sidecar.
 /// Logged for every trip during an active recording, whether or not YOLO
-/// went on to confirm a living-thing class that same tick -- this is what
+/// went on to confirm a living-thing class that same tick; this is what
 /// lets a clip that kept extending (via the post-buffer quiet window) be
 /// audited after the fact for what actually kept triggering it.
 #[derive(Serialize)]
@@ -85,6 +85,175 @@ pub struct RecordingEventParams {
     pub clip_timeline_start: Instant,
 }
 
+/// Pure timing/bookkeeping state for a single recorded clip, split out from
+/// `RecordingEvent` so it can be unit-tested by constructing a bare
+/// `ClipState` directly, with no ffmpeg process or temp files involved. Holds
+/// everything about a clip's lifecycle *except* the actual I/O handles
+/// (`RecordingEvent`'s `ffmpeg_video`/`audio_file`/temp-file paths), which
+/// `RecordingEvent` still owns and drives through this struct's methods.
+struct ClipState {
+    /// Configured video frame rate for this clip.
+    frame_rate: u32,
+    /// Capture timestamp of the clip's first frame (the start of the
+    /// pre-buffer window, not the trigger instant), used as the zero point
+    /// for `DetectionRecord::offset_secs`.
+    clip_timeline_start: Instant,
+    /// When the most recent triggering detection occurred (drives the post-buffer quiet window).
+    last_trigger_at: Instant,
+    /// Timestamp up to which audio has already been drained.
+    last_audio_drain_at: Instant,
+    /// Timestamp up to which frames have already been drained.
+    last_frame_drain_at: Instant,
+    /// The next frame-rate tick due to be written, if any.
+    next_frame_due: Option<Instant>,
+    /// Wall-clock time a real, camera-delivered frame was last written. Used
+    /// by `camera_stalled` to detect when the camera has stopped delivering
+    /// frames. A security recording must never paper over a gap by
+    /// fabricating footage, so unlike a naive resampler this never duplicates
+    /// a frame to fill a missed tick; it reports the stall instead.
+    last_real_frame_at: Instant,
+    /// Every distinct class detected so far during this clip (ADR 4: the
+    /// final filename must reflect every class seen over the clip's
+    /// lifetime, not just the classes that triggered it).
+    all_classes: BTreeSet<&'static str>,
+    /// Every detection recorded so far during this clip.
+    detections: Vec<DetectionRecord>,
+    /// Every motion-gate trip recorded so far during this clip.
+    motion_events: Vec<MotionEvent>,
+}
+
+impl ClipState {
+    /// Starts fresh bookkeeping for a clip beginning now, with playback at `frame_rate`.
+    fn new(frame_rate: u32, clip_timeline_start: Instant) -> Self {
+        let now = Instant::now();
+        Self {
+            frame_rate,
+            clip_timeline_start,
+            last_trigger_at: now,
+            last_audio_drain_at: now,
+            last_frame_drain_at: now,
+            next_frame_due: None,
+            last_real_frame_at: now,
+            all_classes: BTreeSet::new(),
+            detections: Vec::new(),
+            motion_events: Vec::new(),
+        }
+    }
+
+    /// True once the camera has gone `MAX_FRAME_STALL` without delivering a
+    /// real frame. Callers should treat this as a signal to end the
+    /// recording: `drain_frames` never fabricates a frame to cover for the
+    /// camera, and the motion gate has nothing new to evaluate once frames
+    /// stop arriving, so nothing else will naturally close the clip.
+    fn camera_stalled(&self) -> bool {
+        self.last_real_frame_at.elapsed() >= MAX_FRAME_STALL
+    }
+
+    /// Duration of one frame-rate tick at this event's configured `frame_rate`.
+    fn frame_tick(&self) -> Duration {
+        Duration::from_secs_f64(1.0 / f64::from(self.frame_rate))
+    }
+
+    /// Decides whether a newly-drained frame at `frame_timestamp` is due to
+    /// be written at this event's configured `frame_rate`, advancing
+    /// `next_frame_due` to the following tick if so. The first call with no
+    /// prior `next_frame_due` treats `frame_timestamp` itself as due, so
+    /// draining never stalls waiting for a tick boundary that predates the
+    /// first frame it ever saw.
+    fn should_write_frame(&mut self, frame_timestamp: Instant) -> bool {
+        let due = self.next_frame_due.unwrap_or(frame_timestamp);
+
+        if frame_timestamp < due {
+            return false;
+        }
+
+        #[allow(
+            clippy::arithmetic_side_effects,
+            reason = "Instant + a sub-second Duration only overflows after ~584 billion years of process uptime"
+        )]
+        let next_due = due + self.frame_tick();
+
+        self.next_frame_due = Some(next_due);
+
+        true
+    }
+
+    /// Anchors the frame-rate tick clock to `last_seeded_timestamp` (the
+    /// capture timestamp of the last frame written by `seed`), so the first
+    /// live `drain_frames` call after seeding schedules its next write one
+    /// tick after the pre-buffer's last frame rather than from whatever
+    /// wall-clock instant `drain_frames` first happens to run at.
+    fn anchor_next_tick_after_seed(&mut self, last_seeded_timestamp: Instant) {
+        self.last_frame_drain_at = last_seeded_timestamp;
+
+        #[allow(
+            clippy::arithmetic_side_effects,
+            reason = "Instant + a sub-second Duration only overflows after ~584 billion years of process uptime"
+        )]
+        let next_due = last_seeded_timestamp + self.frame_tick();
+
+        self.next_frame_due = Some(next_due);
+    }
+
+    /// Records a detection into the sidecar and resets the post-buffer quiet
+    /// window. `frame_timestamp` is the capture timestamp of the frame the
+    /// detection ran against (from the ring buffer), used to compute
+    /// `offset_secs` relative to the clip's actual timeline start rather than
+    /// wall-clock time at the moment this function happens to run.
+    fn record_detection(
+        &mut self,
+        class_name: &'static str,
+        confidence: f32,
+        frame_timestamp: Instant,
+    ) {
+        let offset_secs = self.offset_secs(frame_timestamp);
+
+        self.all_classes.insert(class_name);
+
+        self.detections.push(DetectionRecord {
+            offset_secs,
+            class_name: class_name.to_string(),
+            confidence,
+        });
+
+        self.last_trigger_at = Instant::now();
+    }
+
+    /// Resets the post-buffer quiet window without recording a new detection
+    /// (e.g. motion continues but wasn't re-confirmed by YOLO this tick).
+    fn touch(&mut self) {
+        self.last_trigger_at = Instant::now();
+    }
+
+    /// Records a motion-gate trip into the sidecar for later audit (e.g.
+    /// distinguishing a fan/curtain repeatedly tripping the gate from an
+    /// actual subject). Purely diagnostic bookkeeping. It does not itself
+    /// touch the post-buffer quiet window. Callers already call
+    /// `touch`/`record_detection` for that as needed.
+    fn record_motion(&mut self, changed_ratio: f32, frame_timestamp: Instant) {
+        let offset_secs = self.offset_secs(frame_timestamp);
+
+        self.motion_events.push(MotionEvent {
+            offset_secs,
+            changed_ratio,
+        });
+    }
+
+    /// Seconds from the clip's actual timeline start (not wall-clock time at
+    /// the moment the caller happens to run) to `frame_timestamp`, the
+    /// capture timestamp of the frame being recorded against.
+    fn offset_secs(&self, frame_timestamp: Instant) -> f64 {
+        frame_timestamp
+            .saturating_duration_since(self.clip_timeline_start)
+            .as_secs_f64()
+    }
+
+    /// How long it's been since the last trigger/touch.
+    fn quiet_for(&self) -> Duration {
+        self.last_trigger_at.elapsed()
+    }
+}
+
 /// Manages the lifecycle of a single recorded clip: seeds the file with the
 /// pre-event buffer, accepts live frames as they arrive, and tracks the
 /// post-event quiet window so the caller knows when to close it (ADR 2, ADR 4).
@@ -116,34 +285,8 @@ pub struct RecordingEvent {
     audio_sample_rate: u32,
     /// Channel count of the buffered audio, needed to mux correctly.
     audio_channels: u16,
-    /// Configured video frame rate for this clip.
-    frame_rate: u32,
-    /// Capture timestamp of the clip's first frame (the start of the
-    /// pre-buffer window, not the trigger instant), used as the zero point
-    /// for `DetectionRecord::offset_secs`.
-    clip_timeline_start: Instant,
-    /// When the most recent triggering detection occurred (drives the post-buffer quiet window).
-    last_trigger_at: Instant,
-    /// Timestamp up to which audio has already been drained.
-    last_audio_drain_at: Instant,
-    /// Timestamp up to which frames have already been drained.
-    last_frame_drain_at: Instant,
-    /// The next frame-rate tick due to be written, if any.
-    next_frame_due: Option<Instant>,
-    /// Wall-clock time a real, camera-delivered frame was last written. Used
-    /// by `camera_stalled` to detect when the camera has stopped delivering
-    /// frames -- a security recording must never paper over a gap by
-    /// fabricating footage, so unlike a naive resampler this never duplicates
-    /// a frame to fill a missed tick; it reports the stall instead.
-    last_real_frame_at: Instant,
-    /// Every distinct class detected so far during this clip (ADR 4: the
-    /// final filename must reflect every class seen over the clip's
-    /// lifetime, not just the classes that triggered it).
-    all_classes: BTreeSet<&'static str>,
-    /// Every detection recorded so far during this clip.
-    detections: Vec<DetectionRecord>,
-    /// Every motion-gate trip recorded so far during this clip.
-    motion_events: Vec<MotionEvent>,
+    /// Pure timing/bookkeeping state for this clip (see `ClipState`).
+    state: ClipState,
 }
 
 impl RecordingEvent {
@@ -158,7 +301,7 @@ impl RecordingEvent {
     /// `capture::audio::AudioStreamInfo`), since the mux step needs the real
     /// values to interpret the buffered PCM correctly.
     ///
-    /// Deliberately does *not* write the pre-buffer here -- see `seed`.
+    /// Deliberately does *not* write the pre-buffer here. See `seed`.
     /// Writing dozens of frames synchronously on the caller's thread would
     /// block it for long enough that real wall-clock time passes with
     /// nothing being recorded, which shows up as a skip/jump right at the
@@ -168,7 +311,7 @@ impl RecordingEvent {
     ///
     /// `clip_timeline_start` should be the capture timestamp of the earliest
     /// pre-buffer frame that will be seeded into this clip (i.e. the actual
-    /// start of the video file), not the trigger instant -- it's the zero
+    /// start of the video file), not the trigger instant. It's the zero
     /// point `DetectionRecord::offset_secs` is measured from, so detections
     /// recorded against footage that predates the trigger (the pre-buffer
     /// window) get correct nonzero offsets instead of all reading ~0.
@@ -201,8 +344,6 @@ impl RecordingEvent {
             )
         })?;
 
-        let now = Instant::now();
-
         Ok(Self {
             ffmpeg_video,
             audio_tmp_path,
@@ -213,23 +354,14 @@ impl RecordingEvent {
             video_tmp_path,
             audio_sample_rate,
             audio_channels,
-            frame_rate,
-            clip_timeline_start,
-            last_trigger_at: now,
-            last_audio_drain_at: now,
-            last_frame_drain_at: now,
-            next_frame_due: None,
-            last_real_frame_at: now,
-            all_classes: BTreeSet::new(),
-            detections: Vec::new(),
-            motion_events: Vec::new(),
+            state: ClipState::new(frame_rate, clip_timeline_start),
         })
     }
 
     /// Writes the pre-event buffer (frames captured before the trigger
     /// fired) into a freshly-started event. Must be called once, as the
     /// first write against a new event, before any live `write_frame`/
-    /// `drain_audio` calls -- see the note on `start` for why this is
+    /// `drain_audio` calls. See the note on `start` for why this is
     /// separate from event construction.
     ///
     /// The ring buffer accumulates frames at the camera's native capture
@@ -244,26 +376,18 @@ impl RecordingEvent {
         pre_frames: &[TimestampedFrame],
         pre_audio: &[TimestampedAudio],
     ) -> Result<()> {
-        let selected = resample_to_frame_rate(pre_frames, self.frame_rate);
+        let selected = resample_to_frame_rate(pre_frames, self.state.frame_rate);
 
         for frame in &selected {
             self.write_frame(&frame.image)?;
         }
 
         if !selected.is_empty() {
-            self.last_real_frame_at = Instant::now();
+            self.state.last_real_frame_at = Instant::now();
         }
 
         if let Some(last) = selected.last() {
-            self.last_frame_drain_at = last.timestamp;
-
-            #[allow(
-                clippy::arithmetic_side_effects,
-                reason = "Instant + a sub-second Duration only overflows after ~584 billion years of process uptime"
-            )]
-            let next_due = last.timestamp + self.frame_tick();
-
-            self.next_frame_due = Some(next_due);
+            self.state.anchor_next_tick_after_seed(last.timestamp);
         }
 
         for chunk in pre_audio {
@@ -271,7 +395,7 @@ impl RecordingEvent {
         }
 
         if let Some(last) = pre_audio.last() {
-            self.last_audio_drain_at = last.timestamp;
+            self.state.last_audio_drain_at = last.timestamp;
         }
 
         Ok(())
@@ -291,7 +415,7 @@ impl RecordingEvent {
     /// This is a security recording: it must never paper over a gap in
     /// coverage by fabricating footage. If the camera doesn't deliver a real
     /// frame for a tick that's already due by wall-clock `Instant::now()`,
-    /// this does *not* duplicate the last frame to fill it -- it stops
+    /// this does *not* duplicate the last frame to fill it. It stops
     /// writing and leaves `camera_stalled` reporting true so the caller ends
     /// the recording instead of the clip silently containing footage that
     /// was never actually captured.
@@ -301,51 +425,33 @@ impl RecordingEvent {
     ) -> Result<()> {
         let new_frames = {
             let buf = ring_buffer.lock().expect("ring buffer lock poisoned");
-            buf.frames_since(self.last_frame_drain_at)
+            buf.frames_since(self.state.last_frame_drain_at)
         };
 
         if let Some(last) = new_frames.last() {
-            self.last_frame_drain_at = last.timestamp;
+            self.state.last_frame_drain_at = last.timestamp;
         }
 
         if !new_frames.is_empty() {
-            self.last_real_frame_at = Instant::now();
+            self.state.last_real_frame_at = Instant::now();
         }
-
-        let tick = self.frame_tick();
-        let mut next_due = self.next_frame_due;
 
         for frame in &new_frames {
-            let due = next_due.unwrap_or(frame.timestamp);
-
-            if frame.timestamp >= due {
+            if self.state.should_write_frame(frame.timestamp) {
                 self.write_frame(&frame.image)?;
-                #[allow(
-                    clippy::arithmetic_side_effects,
-                    reason = "Instant + a sub-second Duration only overflows after ~584 billion years of process uptime"
-                )]
-                let new_due = due + tick;
-                next_due = Some(new_due);
             }
         }
-
-        self.next_frame_due = next_due;
 
         Ok(())
     }
 
     /// True once the camera has gone `MAX_FRAME_STALL` without delivering a
     /// real frame. Callers should treat this as a signal to end the
-    /// recording -- `drain_frames` never fabricates a frame to cover for the
+    /// recording: `drain_frames` never fabricates a frame to cover for the
     /// camera, and the motion gate has nothing new to evaluate once frames
     /// stop arriving, so nothing else will naturally close the clip.
     pub fn camera_stalled(&self) -> bool {
-        self.last_real_frame_at.elapsed() >= MAX_FRAME_STALL
-    }
-
-    /// Duration of one frame-rate tick at this event's configured `frame_rate`.
-    fn frame_tick(&self) -> Duration {
-        Duration::from_secs_f64(1.0 / f64::from(self.frame_rate))
+        self.state.camera_stalled()
     }
 
     /// Writes any audio captured since the last drain (or since the event
@@ -359,11 +465,11 @@ impl RecordingEvent {
     ) -> Result<()> {
         let new_chunks = {
             let buf = ring_buffer.lock().expect("ring buffer lock poisoned");
-            buf.audio_since(self.last_audio_drain_at)
+            buf.audio_since(self.state.last_audio_drain_at)
         };
 
         if let Some(last) = new_chunks.last() {
-            self.last_audio_drain_at = last.timestamp;
+            self.state.last_audio_drain_at = last.timestamp;
         }
 
         for chunk in &new_chunks {
@@ -412,51 +518,28 @@ impl RecordingEvent {
         confidence: f32,
         frame_timestamp: Instant,
     ) {
-        let offset_secs = self.offset_secs(frame_timestamp);
-
-        self.all_classes.insert(class_name);
-
-        self.detections.push(DetectionRecord {
-            offset_secs,
-            class_name: class_name.to_string(),
-            confidence,
-        });
-
-        self.last_trigger_at = Instant::now();
+        self.state
+            .record_detection(class_name, confidence, frame_timestamp);
     }
 
     /// Resets the post-buffer quiet window without recording a new detection
     /// (e.g. motion continues but wasn't re-confirmed by YOLO this tick).
     pub fn touch(&mut self) {
-        self.last_trigger_at = Instant::now();
+        self.state.touch();
     }
 
     /// Records a motion-gate trip into the sidecar for later audit (e.g.
     /// distinguishing a fan/curtain repeatedly tripping the gate from an
-    /// actual subject). Purely diagnostic bookkeeping -- does not itself
-    /// touch the post-buffer quiet window; callers already call
+    /// actual subject). Purely diagnostic bookkeeping. It does not itself
+    /// touch the post-buffer quiet window. Callers already call
     /// `touch`/`record_detection` for that as needed.
     pub fn record_motion(&mut self, changed_ratio: f32, frame_timestamp: Instant) {
-        let offset_secs = self.offset_secs(frame_timestamp);
-
-        self.motion_events.push(MotionEvent {
-            offset_secs,
-            changed_ratio,
-        });
-    }
-
-    /// Seconds from the clip's actual timeline start (not wall-clock time at
-    /// the moment the caller happens to run) to `frame_timestamp`, the
-    /// capture timestamp of the frame being recorded against.
-    fn offset_secs(&self, frame_timestamp: Instant) -> f64 {
-        frame_timestamp
-            .saturating_duration_since(self.clip_timeline_start)
-            .as_secs_f64()
+        self.state.record_motion(changed_ratio, frame_timestamp);
     }
 
     /// How long it's been since the last trigger/touch.
     pub fn quiet_for(&self) -> Duration {
-        self.last_trigger_at.elapsed()
+        self.state.quiet_for()
     }
 
     /// Stops encoding, muxes the buffered audio into the video, and writes
@@ -495,7 +578,7 @@ impl RecordingEvent {
         let _ = std::fs::remove_file(&self.video_tmp_path);
         let _ = std::fs::remove_file(&self.audio_tmp_path);
 
-        let all_classes: Vec<&str> = self.all_classes.iter().copied().collect();
+        let all_classes: Vec<&str> = self.state.all_classes.iter().copied().collect();
         let renamed_path = clip_path(&self.output_dir, self.started_at, &all_classes)?;
 
         if renamed_path != self.final_clip_path {
@@ -510,8 +593,8 @@ impl RecordingEvent {
         }
 
         let sidecar = Sidecar {
-            detections: self.detections,
-            motion_events: self.motion_events,
+            detections: self.state.detections,
+            motion_events: self.state.motion_events,
         };
 
         let sidecar_json =
@@ -549,7 +632,7 @@ fn spawn_video_encoder(
         .stderr(Stdio::piped());
 
     // Put ffmpeg in its own process group so a terminal SIGINT (Ctrl+C)
-    // doesn't reach it directly -- it shares the foreground process group
+    // doesn't reach it directly. It shares the foreground process group
     // with motioncap by default, so without this, Ctrl+C kills ffmpeg at
     // the same instant as motioncap's own ctrlc handler tries to close it
     // gracefully (closing stdin, then waiting), racing ffmpeg's own SIGINT
@@ -644,4 +727,378 @@ fn resample_to_frame_rate(frames: &[TimestampedFrame], frame_rate: u32) -> Vec<&
     }
 
     selected
+}
+
+#[cfg(test)]
+mod tests {
+    //! Unit tests for `ClipState`'s bookkeeping (no ffmpeg process required),
+    //! `resample_to_frame_rate`, and sidecar JSON serialization, plus inline
+    //! ffmpeg-backed round-trip tests for `RecordingEvent::start`/`seed`/
+    //! `drain_frames`/`drain_audio`/`finish` further down in this same module
+    //! (no top-level `tests/` directory exists for this binary-only crate, see ADR 7).
+    #![allow(
+        clippy::unwrap_used,
+        clippy::indexing_slicing,
+        clippy::missing_panics_doc,
+        clippy::unchecked_time_subtraction,
+        reason = "test assertions favor unwrap/indexing/plain time arithmetic for clarity; test \
+                   durations are small hardcoded constants, so underflow is not reachable"
+    )]
+
+    use super::*;
+
+    fn frame_at(timestamp: Instant) -> TimestampedFrame {
+        TimestampedFrame {
+            timestamp,
+            image: image::RgbImage::new(1, 1),
+        }
+    }
+
+    // --- ClipState ---
+
+    #[test]
+    fn camera_stalled_false_when_recently_touched() {
+        let state = ClipState::new(15, Instant::now());
+        assert!(!state.camera_stalled());
+    }
+
+    #[test]
+    fn camera_stalled_true_once_max_frame_stall_elapses() {
+        let mut state = ClipState::new(15, Instant::now());
+        state.last_real_frame_at = Instant::now() - MAX_FRAME_STALL - Duration::from_millis(50);
+        assert!(state.camera_stalled());
+    }
+
+    #[test]
+    fn quiet_for_reflects_time_since_touch() {
+        let mut state = ClipState::new(15, Instant::now());
+        state.last_trigger_at = Instant::now() - Duration::from_secs(5);
+
+        assert!(state.quiet_for() >= Duration::from_secs(5));
+
+        state.touch();
+        assert!(state.quiet_for() < Duration::from_secs(1));
+    }
+
+    #[test]
+    fn quiet_for_reflects_time_since_record_detection() {
+        let mut state = ClipState::new(15, Instant::now());
+        state.last_trigger_at = Instant::now() - Duration::from_secs(5);
+
+        state.record_detection("person", 0.9, Instant::now());
+
+        assert!(state.quiet_for() < Duration::from_secs(1));
+    }
+
+    #[test]
+    fn offset_secs_relative_to_clip_timeline_start() {
+        let start = Instant::now();
+        let state = ClipState::new(15, start);
+
+        let five_secs_in = start + Duration::from_secs(5);
+        assert!((state.offset_secs(five_secs_in) - 5.0).abs() < 0.01);
+    }
+
+    #[test]
+    fn offset_secs_clamps_to_zero_for_timestamp_before_clip_start() {
+        let start = Instant::now();
+        let state = ClipState::new(15, start);
+
+        let before_start = start - Duration::from_secs(2);
+        assert!((state.offset_secs(before_start) - 0.0).abs() < f64::EPSILON);
+    }
+
+    #[test]
+    fn record_detection_deduplicates_and_sorts_classes() {
+        let mut state = ClipState::new(15, Instant::now());
+        let now = Instant::now();
+
+        state.record_detection("dog", 0.5, now);
+        state.record_detection("person", 0.9, now);
+        state.record_detection("dog", 0.6, now);
+
+        let classes: Vec<&str> = state.all_classes.iter().copied().collect();
+        assert_eq!(classes, vec!["dog", "person"]);
+        assert_eq!(state.detections.len(), 3);
+    }
+
+    #[test]
+    fn record_motion_appends_without_touching_quiet_window() {
+        let mut state = ClipState::new(15, Instant::now());
+        state.last_trigger_at = Instant::now() - Duration::from_secs(10);
+
+        state.record_motion(0.05, Instant::now());
+
+        assert_eq!(state.motion_events.len(), 1);
+        assert!(state.quiet_for() >= Duration::from_secs(9));
+    }
+
+    #[test]
+    fn should_write_frame_true_on_first_call_with_no_prior_due_tick() {
+        let mut state = ClipState::new(15, Instant::now());
+        assert!(state.next_frame_due.is_none());
+
+        assert!(state.should_write_frame(Instant::now()));
+        assert!(state.next_frame_due.is_some());
+    }
+
+    #[test]
+    fn should_write_frame_false_before_the_next_due_tick() {
+        let mut state = ClipState::new(15, Instant::now());
+        let first = Instant::now();
+        assert!(state.should_write_frame(first));
+
+        let just_after = first + Duration::from_millis(1);
+        assert!(!state.should_write_frame(just_after));
+    }
+
+    #[test]
+    fn should_write_frame_true_once_the_next_tick_is_reached() {
+        let mut state = ClipState::new(15, Instant::now());
+        let first = Instant::now();
+        assert!(state.should_write_frame(first));
+
+        let next_tick = first + state.frame_tick();
+        assert!(state.should_write_frame(next_tick));
+    }
+
+    #[test]
+    fn anchor_next_tick_after_seed_schedules_one_tick_past_the_seeded_frame() {
+        let mut state = ClipState::new(15, Instant::now());
+        let last_seeded = Instant::now();
+        let tick = state.frame_tick();
+
+        state.anchor_next_tick_after_seed(last_seeded);
+
+        assert_eq!(state.last_frame_drain_at, last_seeded);
+        assert_eq!(state.next_frame_due, Some(last_seeded + tick));
+    }
+
+    // --- resample_to_frame_rate ---
+
+    #[test]
+    fn resample_empty_input_yields_empty_output() {
+        let frames: Vec<TimestampedFrame> = Vec::new();
+        assert!(resample_to_frame_rate(&frames, 15).is_empty());
+    }
+
+    #[test]
+    fn resample_zero_frame_rate_passes_through_every_frame() {
+        let start = Instant::now();
+        let frames = vec![
+            frame_at(start),
+            frame_at(start + Duration::from_millis(1)),
+            frame_at(start + Duration::from_millis(2)),
+        ];
+
+        assert_eq!(resample_to_frame_rate(&frames, 0).len(), 3);
+    }
+
+    #[test]
+    fn resample_dedups_frames_tighter_than_one_tick() {
+        let start = Instant::now();
+        // 15fps tick is ~66.7ms; these arrive far tighter than that.
+        let frames = vec![
+            frame_at(start),
+            frame_at(start + Duration::from_millis(5)),
+            frame_at(start + Duration::from_millis(10)),
+        ];
+
+        assert_eq!(resample_to_frame_rate(&frames, 15).len(), 1);
+    }
+
+    #[test]
+    fn resample_keeps_all_frames_spaced_wider_than_one_tick() {
+        let start = Instant::now();
+        let frames = vec![
+            frame_at(start),
+            frame_at(start + Duration::from_millis(100)),
+            frame_at(start + Duration::from_millis(200)),
+        ];
+
+        assert_eq!(resample_to_frame_rate(&frames, 15).len(), 3);
+    }
+
+    // --- Sidecar serde round-trip ---
+
+    #[test]
+    fn sidecar_serializes_with_expected_shape() {
+        let sidecar = Sidecar {
+            detections: vec![DetectionRecord {
+                offset_secs: 1.5,
+                class_name: "person".to_string(),
+                confidence: 0.87,
+            }],
+            motion_events: vec![MotionEvent {
+                offset_secs: 0.2,
+                changed_ratio: 0.05,
+            }],
+        };
+
+        let json = serde_json::to_value(&sidecar).unwrap();
+
+        assert_eq!(json["detections"][0]["class_name"], "person");
+        assert!((json["detections"][0]["offset_secs"].as_f64().unwrap() - 1.5).abs() < 0.001);
+        assert!((json["motion_events"][0]["changed_ratio"].as_f64().unwrap() - 0.05).abs() < 0.001);
+    }
+
+    // --- RecordingEvent end-to-end (real ffmpeg subprocess) ---
+
+    /// Runs `ffprobe` against `path` and returns its parsed JSON stream info,
+    /// to confirm the muxed output is a real, playable file rather than just
+    /// a file that happens to exist on disk.
+    fn ffprobe_streams(path: &std::path::Path) -> serde_json::Value {
+        let output = Command::new("ffprobe")
+            .args([
+                "-v",
+                "error",
+                "-print_format",
+                "json",
+                "-show_format",
+                "-show_streams",
+            ])
+            .arg(path)
+            .output()
+            .expect("failed to spawn ffprobe");
+        assert!(
+            output.status.success(),
+            "ffprobe failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        serde_json::from_slice(&output.stdout).expect("ffprobe produced invalid JSON")
+    }
+
+    /// A 2x2 timestamped frame; libx264 requires even width/height, so this
+    /// (rather than the shared `frame_at`'s 1x1) is used for the ffmpeg
+    /// round-trip test below.
+    fn even_sized_frame_at(timestamp: Instant) -> TimestampedFrame {
+        TimestampedFrame {
+            timestamp,
+            image: image::RgbImage::new(2, 2),
+        }
+    }
+
+    #[test]
+    fn recording_event_round_trip_produces_valid_mp4_and_sidecar() {
+        let dir = tempfile::tempdir().unwrap();
+        let clip_timeline_start = Instant::now();
+        let started_at = chrono::Local::now();
+
+        // finish() recomputes the final filename from the full accumulated
+        // class list (ADR 4) via the same clip_path() helper; the initial
+        // final_clip_path only matters as the pre-rename name, so predict the
+        // real final path with clip_path() up front rather than guessing it.
+        let initial_path = clip_path(dir.path(), started_at, &[]).unwrap();
+        let expected_final_path = clip_path(dir.path(), started_at, &["person"]).unwrap();
+
+        let mut event = RecordingEvent::start(RecordingEventParams {
+            final_clip_path: initial_path,
+            output_dir: dir.path().to_path_buf(),
+            started_at,
+            width: 2,
+            height: 2,
+            frame_rate: 5,
+            audio_sample_rate: 8000,
+            audio_channels: 1,
+            clip_timeline_start,
+        })
+        .unwrap();
+
+        let pre_frames = vec![
+            even_sized_frame_at(clip_timeline_start),
+            even_sized_frame_at(clip_timeline_start + Duration::from_millis(250)),
+        ];
+        let pre_audio = vec![TimestampedAudio {
+            timestamp: clip_timeline_start,
+            samples: vec![0.0; 800],
+        }];
+
+        event.seed(&pre_frames, &pre_audio).unwrap();
+
+        event.record_motion(0.02, clip_timeline_start);
+        event.record_detection("person", 0.95, clip_timeline_start);
+        assert!(event.quiet_for() < Duration::from_secs(1));
+        event.touch();
+
+        event.finish().unwrap();
+
+        assert!(
+            expected_final_path.exists(),
+            "expected clip at {}",
+            expected_final_path.display()
+        );
+
+        let sidecar_json = std::fs::read_to_string(sidecar_path(&expected_final_path)).unwrap();
+        let sidecar: serde_json::Value = serde_json::from_str(&sidecar_json).unwrap();
+        assert_eq!(sidecar["detections"].as_array().unwrap().len(), 1);
+        assert_eq!(sidecar["motion_events"].as_array().unwrap().len(), 1);
+        assert_eq!(sidecar["detections"][0]["class_name"], "person");
+
+        let probe = ffprobe_streams(&expected_final_path);
+        let streams = probe["streams"].as_array().unwrap();
+        assert!(
+            streams.iter().any(|s| s["codec_type"] == "video"),
+            "expected a video stream in {probe}"
+        );
+        assert!(
+            streams.iter().any(|s| s["codec_type"] == "audio"),
+            "expected an audio stream in {probe}"
+        );
+    }
+
+    #[test]
+    fn drain_frames_and_drain_audio_write_newly_buffered_content() {
+        let dir = tempfile::tempdir().unwrap();
+        let clip_timeline_start = Instant::now();
+        let started_at = chrono::Local::now();
+
+        let initial_path = clip_path(dir.path(), started_at, &[]).unwrap();
+
+        let mut event = RecordingEvent::start(RecordingEventParams {
+            final_clip_path: initial_path,
+            output_dir: dir.path().to_path_buf(),
+            started_at,
+            width: 2,
+            height: 2,
+            frame_rate: 5,
+            audio_sample_rate: 8000,
+            audio_channels: 1,
+            clip_timeline_start,
+        })
+        .unwrap();
+
+        event
+            .seed(
+                &[even_sized_frame_at(clip_timeline_start)],
+                &[TimestampedAudio {
+                    timestamp: clip_timeline_start,
+                    samples: vec![0.0; 100],
+                }],
+            )
+            .unwrap();
+
+        // At 5fps, seed() sets next_frame_due to clip_timeline_start + 200ms;
+        // sleeping past that before pushing ensures the newly-buffered frame
+        // is actually due and gets written (not silently skipped for arriving
+        // before its tick), exercising drain_frames' write branch for real.
+        std::thread::sleep(Duration::from_millis(250));
+
+        let ring_buffer =
+            std::sync::Mutex::new(crate::buffer::RingBuffer::new(Duration::from_secs(30)));
+        {
+            let mut buf = ring_buffer.lock().unwrap();
+            buf.push_frame(image::RgbImage::new(2, 2));
+            buf.push_audio(vec![0.5; 100]);
+        }
+
+        // Both must succeed without error against real newly-buffered content
+        // pushed after seed(); this is the steady-poll path the recording
+        // writer thread drives in production.
+        event.drain_frames(&ring_buffer).unwrap();
+        event.drain_audio(&ring_buffer).unwrap();
+
+        assert!(!event.camera_stalled());
+
+        event.finish().unwrap();
+    }
 }

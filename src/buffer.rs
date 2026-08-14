@@ -100,7 +100,7 @@ impl RingBuffer {
 
     /// Frames pushed strictly after `since`, oldest first. Used by the
     /// recording writer to drain every frame the camera produced between
-    /// polls instead of only ever reading `latest_frame` -- reading just the
+    /// polls instead of only ever reading `latest_frame`: reading just the
     /// latest silently skips any frame that arrived and was superseded
     /// before the writer's next poll, which shows up as a visible jump in
     /// the subject's position despite otherwise-correct frame timestamps.
@@ -122,5 +122,115 @@ impl RingBuffer {
             .filter(|chunk| chunk.timestamp > since)
             .cloned()
             .collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    //! Unit tests for `RingBuffer`'s retention, eviction, and query behavior.
+    #![allow(
+        clippy::unwrap_used,
+        clippy::indexing_slicing,
+        clippy::missing_panics_doc,
+        reason = "test assertions favor unwrap/indexing for clarity; panics here fail the test, which is the intended behavior"
+    )]
+
+    use std::thread::sleep;
+
+    use image::RgbImage;
+
+    use super::*;
+
+    fn blank_frame() -> RgbImage {
+        RgbImage::new(1, 1)
+    }
+
+    #[test]
+    fn new_buffer_has_no_latest_frame() {
+        let buffer = RingBuffer::new(Duration::from_secs(10));
+        assert!(buffer.latest_frame().is_none());
+    }
+
+    #[test]
+    fn latest_frame_returns_most_recently_pushed() {
+        let mut buffer = RingBuffer::new(Duration::from_secs(10));
+        buffer.push_frame(blank_frame());
+        buffer.push_frame(blank_frame());
+        let latest = buffer.latest_frame();
+        assert!(latest.is_some());
+    }
+
+    #[test]
+    fn snapshot_returns_oldest_first() {
+        let mut buffer = RingBuffer::new(Duration::from_secs(10));
+        buffer.push_frame(blank_frame());
+        sleep(Duration::from_millis(5));
+        buffer.push_frame(blank_frame());
+
+        let (frames, _) = buffer.snapshot();
+        assert_eq!(frames.len(), 2);
+        assert!(frames[0].timestamp <= frames[1].timestamp);
+    }
+
+    #[test]
+    fn frames_since_excludes_frame_exactly_at_since() {
+        let mut buffer = RingBuffer::new(Duration::from_secs(10));
+        buffer.push_frame(blank_frame());
+        let since = buffer.latest_frame().unwrap().timestamp;
+
+        assert!(buffer.frames_since(since).is_empty());
+    }
+
+    #[test]
+    fn frames_since_includes_frames_strictly_after() {
+        let mut buffer = RingBuffer::new(Duration::from_secs(10));
+        buffer.push_frame(blank_frame());
+        let since = buffer.latest_frame().unwrap().timestamp;
+        sleep(Duration::from_millis(5));
+        buffer.push_frame(blank_frame());
+
+        assert_eq!(buffer.frames_since(since).len(), 1);
+    }
+
+    #[test]
+    fn audio_since_excludes_chunk_exactly_at_since() {
+        let mut buffer = RingBuffer::new(Duration::from_secs(10));
+        buffer.push_audio(vec![0.0]);
+        let since = buffer.snapshot().1.last().unwrap().timestamp;
+
+        assert!(buffer.audio_since(since).is_empty());
+    }
+
+    #[test]
+    fn audio_since_includes_chunks_strictly_after() {
+        let mut buffer = RingBuffer::new(Duration::from_secs(10));
+        buffer.push_audio(vec![0.0]);
+        let since = buffer.snapshot().1.last().unwrap().timestamp;
+        sleep(Duration::from_millis(5));
+        buffer.push_audio(vec![1.0]);
+
+        assert_eq!(buffer.audio_since(since).len(), 1);
+    }
+
+    #[test]
+    fn frames_older_than_retention_are_evicted_on_next_push() {
+        let mut buffer = RingBuffer::new(Duration::from_millis(10));
+        buffer.push_frame(blank_frame());
+        sleep(Duration::from_millis(30));
+        buffer.push_frame(blank_frame());
+
+        let (frames, _) = buffer.snapshot();
+        assert_eq!(frames.len(), 1);
+    }
+
+    #[test]
+    fn audio_older_than_retention_is_evicted_on_next_push() {
+        let mut buffer = RingBuffer::new(Duration::from_millis(10));
+        buffer.push_audio(vec![0.0]);
+        sleep(Duration::from_millis(30));
+        buffer.push_audio(vec![1.0]);
+
+        let (_, audio) = buffer.snapshot();
+        assert_eq!(audio.len(), 1);
     }
 }

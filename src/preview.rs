@@ -1,3 +1,8 @@
+// coverage: excluded (whole file); every function here drives OpenCV's
+// highgui, which requires a real X11/Wayland display; there is no headless
+// fake for a GUI window, so this is untestable in CI or a headless dev
+// session. See docs/adr/0006-coverage-exclusions.md.
+
 use std::cell::Cell;
 
 use anyhow::{Context, Result};
@@ -11,13 +16,13 @@ use crate::opencv_utils::rgb_image_to_bgr_mat;
 const WINDOW_NAME: &str = "motioncap preview";
 
 /// Factor the window is scaled up from the camera's native capture
-/// resolution -- webcams commonly capture at low resolutions (e.g.
+/// resolution. Webcams commonly capture at low resolutions (e.g.
 /// 320x240), which renders unreadably small with a 1:1 `WINDOW_AUTOSIZE`
 /// window on a modern display.
 const PREVIEW_SCALE: i32 = 2;
 
 /// Opt-in live preview window (ADR: off by default). Entirely decoupled from
-/// the recording pipeline -- it only ever displays frames, never affects
+/// the recording pipeline: it only ever displays frames, never affects
 /// whether or how a clip is recorded.
 pub struct PreviewWindow {
     /// Tracks whether the window has been sized to the first displayed

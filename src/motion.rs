@@ -37,12 +37,13 @@ impl MotionGate {
 
     /// Feeds one frame through the background model and reports the
     /// changed-pixel ratio alongside whether it exceeded the configured
-    /// threshold -- callers that need to log/record motion activity (not
+    /// threshold. Callers that need to log/record motion activity (not
     /// just gate on it) need the underlying ratio, not just the bool.
     pub fn evaluate(&mut self, frame: &RgbImage) -> Result<MotionReading> {
         let mat = rgb_image_to_bgr_mat(frame)?;
 
         let mut fgmask = Mat::default();
+
         self.subtractor
             .apply(&mat, &mut fgmask, -1.0)
             .context("background subtraction apply failed")?;
@@ -75,4 +76,83 @@ fn changed_ratio(mask: &(impl MatTraitConst + ToInputArray), total_pixels: f32) 
     )]
     let ratio = nonzero as f32 / total_pixels;
     Ok(ratio)
+}
+
+#[cfg(test)]
+mod tests {
+    //! Unit tests for `MotionGate` and `changed_ratio` against a real `OpenCV`
+    //! MOG2 background subtractor (no camera required). Tests that construct a
+    //! real `MotionGate` acquire `detect::MODEL_TEST_LOCK` for their full
+    //! duration, same as every other real-OpenCV/ONNX-Runtime-backed test in
+    //! this crate, since running such tests concurrently reproduces a
+    //! heap-corruption abort (see ADR 6).
+    #![allow(
+        clippy::unwrap_used,
+        clippy::indexing_slicing,
+        clippy::missing_panics_doc,
+        reason = "test assertions favor unwrap/indexing for clarity; panics here fail the test, which is the intended behavior"
+    )]
+
+    use image::Rgb;
+
+    use super::*;
+    use crate::detect;
+
+    fn solid_frame(width: u32, height: u32, color: [u8; 3]) -> RgbImage {
+        RgbImage::from_pixel(width, height, Rgb(color))
+    }
+
+    #[test]
+    fn repeated_identical_frames_do_not_trip() {
+        let _guard = detect::MODEL_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+        let mut gate = MotionGate::new(0.01).unwrap();
+        let frame = solid_frame(64, 64, [50, 50, 50]);
+
+        // MOG2 needs a few frames to establish its background model before
+        // its foreground mask stabilizes near zero for an unchanging scene.
+        for _ in 0..5 {
+            gate.evaluate(&frame).unwrap();
+        }
+
+        let reading = gate.evaluate(&frame).unwrap();
+
+        assert!(!reading.tripped, "changed_ratio={}", reading.changed_ratio);
+    }
+
+    #[test]
+    fn a_large_changed_region_trips_the_gate() {
+        let _guard = detect::MODEL_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+
+        let mut gate = MotionGate::new(0.01).unwrap();
+        let background = solid_frame(64, 64, [50, 50, 50]);
+
+        for _ in 0..10 {
+            gate.evaluate(&background).unwrap();
+        }
+
+        let mut changed = background.clone();
+
+        for y in 0..32 {
+            for x in 0..32 {
+                changed.put_pixel(x, y, Rgb([250, 250, 250]));
+            }
+        }
+
+        let reading = gate.evaluate(&changed).unwrap();
+
+        assert!(reading.tripped, "changed_ratio={}", reading.changed_ratio);
+        assert!(reading.changed_ratio > 0.01);
+    }
+
+    #[test]
+    fn changed_ratio_returns_zero_for_non_positive_total_pixels() {
+        let mask = Mat::default();
+        let ratio = changed_ratio(&mask, 0.0).unwrap();
+        assert!((ratio - 0.0).abs() < f32::EPSILON);
+    }
 }

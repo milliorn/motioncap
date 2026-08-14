@@ -20,6 +20,10 @@ pub struct AudioStreamInfo {
     pub channels: u16,
 }
 
+// coverage: excluded, requires a real audio input device (cpal's
+// default_input_device/default_input_config), which CI and many headless dev
+// sessions don't have. See docs/adr/0006-coverage-exclusions.md.
+
 /// Opens the default audio input device and starts streaming samples into the
 /// shared ring buffer. The returned `Stream` must be kept alive for capture to
 /// continue (dropping it stops the stream), so ownership is handed to the caller.

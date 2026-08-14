@@ -57,3 +57,6 @@ doc_link_with_quotes = "deny"
 doc_comment_double_space_linebreaks = "deny"
 doc_link_code = "deny"
 doc_include_without_cfg = "deny"
+
+[dev-dependencies]
+tempfile = "3.27.0"
