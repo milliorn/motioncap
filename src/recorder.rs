@@ -174,7 +174,7 @@ impl ClipState {
         let next_due = due + self.frame_tick();
 
         self.next_frame_due = Some(next_due);
-        
+
         true
     }
 
