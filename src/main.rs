@@ -335,9 +335,10 @@ fn seed_and_drain_active_event(ring_buffer: &Mutex<RingBuffer>, active_event: &M
 // thread::sleep against real wall-clock time and, in run_preview_loop's
 // case, driving OpenCV's highgui window (see coverage_excluded.rs's module
 // doc), so neither is exercisable by a test without either running forever
-// or a real display. The logic they call each tick
-// (seed_and_drain_active_event, PreviewWindow::show) is independently
-// unit-tested here.
+// or a real display. run_recording_writer_loop's per-tick logic
+// (seed_and_drain_active_event) is independently unit-tested here;
+// run_preview_loop's per-tick logic (PreviewWindow::show) is excluded
+// entirely, along with the rest of preview.rs, per ADR 6.
 
 /// Closes the active recording if either close condition is met: the camera
 /// has stalled (see `RecordingEvent::camera_stalled`), which the motion gate
