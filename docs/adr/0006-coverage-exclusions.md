@@ -17,7 +17,11 @@ stood between the codebase and 100%:
    - `capture::camera::start_camera_capture` and the auto-detect branch of
      `resolve_camera_index`: open a real `/dev/videoN` device via `nokhwa`.
    - `capture::audio::start_audio_capture`: opens the real default audio input device
-     via `cpal`.
+     via `cpal` (`default_host`/`default_input_device`/`default_input_config`/
+     `build_input_stream`/`stream.play`). The per-sample format conversion
+     (`samples_to_f32`) and the format-support check (`sample_format_supported`) that
+     this function's `match` relies on are pulled out into their own pure functions and
+     unit-tested independently, the same split as `resolve_camera_index` below.
    - `preview.rs` (every method): drives `OpenCV`'s highgui, which needs a real
      X11/Wayland display — there is no headless fake for a GUI window.
    - `coverage_excluded::init_logging`: calls `env_logger::Builder::init()`, which sets
@@ -106,19 +110,27 @@ rejected once. A `?`-propagated error branch or a genuinely hardware-bound funct
 (opens a device, drives a GUI, blocks on real time) is worth isolating; a function that's
 merely *sometimes* reached only under real inputs a test can't fabricate is not.
 
-`cargo llvm-cov`'s CI/local invocation excludes exactly four files by regex:
+`cargo llvm-cov`'s CI/local invocation excludes exactly three files by regex:
 
 ```sh
---ignore-filename-regex 'coverage_excluded\.rs|preview\.rs|capture/camera\.rs|capture/audio\.rs'
+--ignore-filename-regex 'coverage_excluded\.rs|preview\.rs|capture/camera\.rs'
 ```
 
-`capture/camera.rs` and `capture/audio.rs` are *not* excluded wholesale — only the
+`capture/camera.rs` and `capture/audio.rs` are *not* excluded wholesale; only the
 specific hardware-bound functions within them are marked with a `// coverage:
-excluded: <reason>` source comment — `resolve_camera_index`'s `Some(path)` branch (pure
-string parsing, no hardware) is unit-tested normally and pulls those files' reported
-percentage up from what a full-file exclusion would otherwise hide. The comment
+excluded: <reason>` source comment. `resolve_camera_index`'s `Some(path)` branch (pure
+string parsing, no hardware) is unit-tested normally and pulls `capture/camera.rs`'s
+reported percentage up from what a full-file exclusion would otherwise hide;
+`capture/camera.rs` still appears in the regex above because the *rest* of that file
+(the auto-detect branch and `start_camera_capture` itself) is hardware-bound, so
+excluding the whole file remains the least-bad option there. `capture/audio.rs`, by
+contrast, has no function whose reported percentage is worth keeping under file-level
+exclusion once `samples_to_f32`/`sample_format_supported` were pulled out and tested;
+`start_audio_capture` itself stays uncovered (marked with the same source comment) but
+the file as a whole is left in the coverage report rather than excluded, currently
+landing around 40% since that function is most of the file's line count. The comment
 convention exists because the tool itself can't express "exclude this function, not
-this file" on stable — the comment is what makes the omission visible in source and
+this file" on stable; the comment is what makes the omission visible in source and
 in code review, even though the coverage tool can't enforce it at that granularity.
 
 Every `#[ignore]`'d test (there are 9, split across `detect.rs` and `main.rs`) that
@@ -138,29 +150,35 @@ genuinely different achievable ceilings:
 
 - **Local** (`cargo llvm-cov --workspace --ignore-filename-regex '...' -- --include-ignored`,
   run on a machine with `models/yolov8n.onnx` and a working ONNX Runtime build already
-  present): **95.72%** measured after `run_recording_writer_loop`, `run_preview_loop`,
-  and `maybe_reconnect_camera` moved into `coverage_excluded.rs` (up from 94.62% before that
-  move). The remaining gap is the `?`-propagated error branches described above, plus
+  present): **93.46%** measured after `capture/audio.rs` moved from full exclusion to
+  the partial-exclusion convention (down from 95.72%, not because anything regressed,
+  but because `start_audio_capture`'s uncovered lines are now counted against the total
+  instead of hidden by file-level exclusion; the file's own reported percentage rose,
+  from 0% to ~40%, which is the real signal this move was for). The remaining gap is
+  the `?`-propagated error branches described above, `start_audio_capture` itself, plus
   `try_start_recording`/`evaluate_active_event`'s confirmed-detection path, which needs
   a real photo of a living-thing subject to reach honestly (see the Decision section).
-- **CI** (`cargo llvm-cov --workspace --fail-under-lines 77 --ignore-filename-regex '...'`,
-  no `--ignored`, the gitignored model file is never fetched in CI): **77.91%**
-  measured, gated at 77 with a small margin for measurement noise. This is
-  meaningfully lower than the local number specifically because the 9 `#[ignore]`'d
-  tests (which exercise a large fraction of `detect.rs`'s and `main.rs`'s logic) never
-  run there; that gap is expected and documented, not a sign CI is under-testing
-  relative to what it can actually run.
+- **CI** (`cargo llvm-cov --workspace --fail-under-lines 76 --ignore-filename-regex '...'`,
+  no `--ignored`, the gitignored model file is never fetched in CI): **76.38%**
+  measured, gated at 76 (lowered from 77 for the same reason as the local number above)
+  with a small margin for measurement noise. This is meaningfully lower than the local
+  number specifically because the 9 `#[ignore]`'d tests (which exercise a large fraction
+  of `detect.rs`'s and `main.rs`'s logic) never run there; that gap is expected and
+  documented, not a sign CI is under-testing relative to what it can actually run.
 
 ## Consequences
 
-- `main.rs` and every file except the four excluded ones are held to a *real*, gate-
-  enforced 100%-or-explained-gap standard — a regression in any tested function moves
-  the reported number and fails CI, not just `coverage_excluded.rs`'s untestable wiring.
+- `main.rs` and every file except the three fully-excluded ones are held to a *real*,
+  gate-enforced 100%-or-explained-gap standard; a regression in any tested function
+  moves the reported number and fails CI, not just `coverage_excluded.rs`'s untestable
+  wiring. `capture/audio.rs` is included in that same real standard for the part of it
+  that's actually testable (`samples_to_f32`, `sample_format_supported`), even though
+  its overall file percentage stays well under 100% because of `start_audio_capture`.
 - Adding a new function to `coverage_excluded.rs` is a deliberate signal: it should only
   ever contain thin sequencing/wiring calling into functions defined (and tested)
   elsewhere. If a function there starts accumulating real decision logic, that logic
   belongs in `main.rs`, not `coverage_excluded.rs` — see that module's own doc comment.
-- The CI threshold (77) and local threshold (95.72%, informal, not currently gated by
+- The CI threshold (76) and local threshold (93.46%, informal, not currently gated by
   a CI job, since there is no CI runner with the model file present) must be
   re-verified and adjusted together whenever the untestable-function list changes;
   they are not meant to converge, since the gap between them is structural (CI never
