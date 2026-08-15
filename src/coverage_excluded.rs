@@ -126,7 +126,8 @@ pub fn run() -> Result<()> {
     // replacement; see `maybe_reconnect_camera`.
     let camera = Arc::new(Mutex::new(Some(camera)));
 
-    let audio_info = capture::audio::start_audio_capture(Arc::clone(&ring_buffer))?;
+    let audio_info =
+        capture::audio_coverage_excluded::start_audio_capture(Arc::clone(&ring_buffer))?;
     let audio_sample_rate = audio_info.sample_rate;
     let audio_channels = audio_info.channels;
     let _audio_stream = audio_info.stream;

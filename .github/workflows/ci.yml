@@ -166,23 +166,23 @@ jobs:
       # `cargo test`, since llvm-cov's instrumented run already re-runs the
       # full suite; a bare `cargo test` here would just duplicate that work.
       #
-      # coverage_excluded.rs/preview.rs/capture/camera.rs are excluded by
-      # file: they need real camera hardware or a display, which CI (and this
-      # repo's stable-only toolchain, which can't use the nightly-only
+      # coverage_excluded.rs/preview.rs/capture/camera.rs/
+      # capture/audio_coverage_excluded.rs are excluded by file: they need
+      # real camera/audio hardware or a display, which CI (and this repo's
+      # stable-only toolchain, which can't use the nightly-only
       # #[coverage(off)] attribute for finer-grained exclusion) cannot
-      # provide, see docs/adr/0006-coverage-exclusions.md. capture/audio.rs is
-      # not excluded wholesale: only the functions that open a real audio
-      # device are marked with a `// coverage: excluded` source comment, same
-      # convention as capture/camera.rs, which is why its own coverage
-      # (currently ~40%) still drags the total below what the other four
-      # excluded files alone would allow.
+      # provide, see docs/adr/0006-coverage-exclusions.md. capture/audio.rs
+      # itself is not in this list: start_audio_capture (the one hardware-bound
+      # function it used to contain) was moved entirely into
+      # capture/audio_coverage_excluded.rs, so capture/audio.rs is held to
+      # real 100% instead of the file being partially excluded.
       #
-      # 76% (not the ~93.5% achievable locally with the model file present)
+      # 78% (not the ~95.8% achievable locally with the model file present)
       # is what CI can actually reach without the #[ignore]'d tests; set from
-      # the real measured number (76.38%) with a small margin so measurement
+      # the real measured number (78.28%) with a small margin so measurement
       # noise doesn't fail unrelated PRs. Lower this only alongside a
       # deliberate, reviewed decision to drop coverage, never to silence a
       # real regression.
       - name: Run tests with coverage
         if: github.event_name == 'pull_request'
-        run: cargo llvm-cov --workspace --fail-under-lines 76 --ignore-filename-regex 'coverage_excluded\.rs|preview\.rs|capture/camera\.rs'
+        run: cargo llvm-cov --workspace --fail-under-lines 78 --ignore-filename-regex 'coverage_excluded\.rs|preview\.rs|capture/camera\.rs|capture/audio_coverage_excluded\.rs'
