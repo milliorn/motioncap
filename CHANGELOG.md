@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.6.0](https://github.com/milliorn/motioncap/compare/motioncap-v0.5.1...motioncap-v0.6.0) (2026-08-15)
+
+
+### Features
+
+* add PR title linting and document audio sample format support ([#23](https://github.com/milliorn/motioncap/issues/23)) ([9b7dbeb](https://github.com/milliorn/motioncap/commit/9b7dbeb42d4b552e2eb4cc391d2b85b1443025da))
+
 ## [0.5.1](https://github.com/milliorn/motioncap/compare/motioncap-v0.5.0...motioncap-v0.5.1) (2026-08-13)
 
 
