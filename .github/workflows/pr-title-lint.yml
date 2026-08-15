@@ -8,8 +8,13 @@ name: PR Title Lint
 # one feat: buried inside) must be titled with the most significant type
 # present (feat > fix > everything else), or that release-worthy change is
 # silently invisible to release-please after squash.
+#
+# Uses pull_request rather than pull_request_target: all contributors here
+# have write access to the repo (no public fork PRs to support), so the
+# elevated base-repo privileges pull_request_target grants aren't needed and
+# would only add blast radius if this third-party action were compromised.
 on:
-  pull_request_target:
+  pull_request:
     types:
       - opened
       - edited
