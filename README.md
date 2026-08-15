@@ -11,7 +11,9 @@ accelerators/dependencies is a first-class concern rather than an edge case.
 
 ## How it works
 
-1. Camera and audio are captured continuously into a rolling ring buffer.
+1. Camera and audio are captured continuously into a rolling ring buffer. Audio input
+   in F32, I16, or U16 sample formats is converted to interleaved f32 at capture time;
+   other formats are rejected with an error rather than silently misread.
 2. A background-subtraction motion gate (OpenCV MOG2) watches for changed pixels.
 3. When the gate trips, a YOLO model confirms a living thing (person or any COCO
    animal class) is actually present before anything is recorded.
