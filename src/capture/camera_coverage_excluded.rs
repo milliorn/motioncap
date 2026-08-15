@@ -1,6 +1,6 @@
 //! Holds the two pieces of `capture::camera` that cannot be exercised by an
-//! automated test under any circumstances: the auto-detect branch of
-//! `resolve_camera_index` (enumerates and probe-opens real cameras via
+//! automated test under any circumstances: `auto_detect_camera_index`
+//! (enumerates and probe-opens real cameras via
 //! `nokhwa::query`/`nokhwa::Camera::new`) and all of `start_camera_capture`
 //! (opens a real camera device via `CallbackCamera::new`/`open_stream`),
 //! neither of which CI or many headless dev sessions have. Split out of
