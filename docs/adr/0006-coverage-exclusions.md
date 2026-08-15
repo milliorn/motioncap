@@ -14,8 +14,8 @@ stood between the codebase and 100%:
 1. **Irreducible untestable code.** Some functions can only run against real hardware,
    an unrepeatable process-global side effect, or an external model file, and no
    automated test can fake that safely:
-   - `capture::camera::start_camera_capture` and the auto-detect branch of
-     `resolve_camera_index`: open a real `/dev/videoN` device via `nokhwa`.
+   - `capture::camera_coverage_excluded::start_camera_capture` and
+     `auto_detect_camera_index`: open a real `/dev/videoN` device via `nokhwa`.
    - `capture::audio_coverage_excluded::start_audio_capture`: opens the real default
      audio input device via `cpal` (`default_host`/`default_input_device`/
      `default_input_config`/`build_input_stream`/`stream.play`). The per-sample format
@@ -41,7 +41,7 @@ stood between the codebase and 100%:
      real ring-buffer/ffmpeg state or drives `PreviewWindow`, which needs a real
      `OpenCV` highgui display.
    - `coverage_excluded::maybe_reconnect_camera`, which calls
-     `capture::camera::start_camera_capture` once past its threshold/cooldown guard,
+     `capture::camera_coverage_excluded::start_camera_capture` once past its threshold/cooldown guard,
      opening a real `/dev/videoN` device. The guard itself (`should_reconnect`) is pure
      and stays in `main.rs`, unit-tested directly there.
    - `Config::parse_args`: reads the real process's `std::env::args()`.
@@ -110,34 +110,30 @@ rejected once. A `?`-propagated error branch or a genuinely hardware-bound funct
 (opens a device, drives a GUI, blocks on real time) is worth isolating; a function that's
 merely *sometimes* reached only under real inputs a test can't fabricate is not.
 
-`cargo llvm-cov`'s CI/local invocation excludes exactly four files by regex:
+`cargo llvm-cov`'s CI/local invocation excludes files by regex:
 
 ```sh
---ignore-filename-regex 'coverage_excluded\.rs|preview\.rs|capture/camera\.rs|capture/audio_coverage_excluded\.rs'
+--ignore-filename-regex 'coverage_excluded\.rs|preview\.rs'
 ```
 
-`capture/camera.rs` is *not* excluded wholesale for a different reason than the other
-three: only the specific hardware-bound functions within it (the auto-detect branch of
-`resolve_camera_index`, and `start_camera_capture` itself) are marked with a
-`// coverage: excluded: <reason>` source comment, and it still appears in the regex
-above only because that hardware-bound portion is most of the file. The pure
-`Some(path)` branch of `resolve_camera_index` is unit-tested normally and pulls
-`capture/camera.rs`'s reported percentage up from what a full-file exclusion would
-otherwise hide.
+`coverage_excluded\.rs` (unanchored) matches both the crate-root `coverage_excluded.rs`
+and any `*_coverage_excluded.rs` sibling file, so `capture/camera_coverage_excluded.rs`
+and `capture/audio_coverage_excluded.rs` are covered by this single pattern without
+needing their own entries.
 
-`capture/audio.rs` took a different route: rather than leaving its one hardware-bound
-function (`start_audio_capture`) in place under a source comment (as `camera.rs` does),
-it was moved entirely into a sibling file, `capture/audio_coverage_excluded.rs`, mirroring
-the crate-root `coverage_excluded.rs` split. `samples_to_f32` and `sample_format_supported`
-stayed behind in `capture/audio.rs`, which is why that file is *not* in the regex above and
-instead reports genuine 100% coverage on its own. This is the stricter of the two
-available conventions (moving the function out entirely, vs. leaving it in place under a
-comment) and was chosen deliberately for `audio.rs` specifically so its number reads as
-"fully covered," not "well, covered except for the function that's actually most of the
-file." `capture/camera.rs` was not moved to match, since its hardware-bound portion (the
-auto-detect branch, plus `start_camera_capture`) is a larger fraction of that file and
-already has a working, precedented convention; changing it would be churn without a
-concrete problem to fix. The source-comment convention still exists because the tool
+Both `capture/camera.rs` and `capture/audio.rs` use the same convention: rather than
+leaving their one or two hardware-bound functions in place under a source comment, each
+moved them entirely into a sibling file (`capture/camera_coverage_excluded.rs`,
+`capture/audio_coverage_excluded.rs`), mirroring the crate-root `coverage_excluded.rs`
+split. `capture/camera.rs` originally left `start_camera_capture` and the auto-detect
+branch of `resolve_camera_index` in place under a `// coverage: excluded` comment, since
+the hardware-bound portion was a large fraction of the file; it was later moved to match
+`audio.rs`'s stricter convention once the pattern proved out, so both files now report
+genuine 100% coverage on their own instead of "100%-minus-a-documented-gap." The
+remaining pure logic (`resolve_pinned_camera_index` in `camera.rs`, `samples_to_f32`/
+`sample_format_supported` in `audio.rs`) is unit-tested normally. The source-comment
+convention (`// coverage: excluded: <reason>`) still exists for cases where the
+untestable portion is a small fraction of a larger, mostly-testable file, since the tool
 itself can't express "exclude this function, not this file" on stable; the comment is
 what makes the omission visible in source and in code review wherever that convention is
 used, even though the coverage tool can't enforce it at that granularity.
@@ -159,11 +155,14 @@ genuinely different achievable ceilings:
 
 - **Local** (`cargo llvm-cov --workspace --ignore-filename-regex '...' -- --include-ignored`,
   run on a machine with `models/yolov8n.onnx` and a working ONNX Runtime build already
-  present): **95.79%** measured after `start_audio_capture` moved into
-  `capture/audio_coverage_excluded.rs`, leaving `capture/audio.rs` itself at genuine
-  100%. The remaining gap is the `?`-propagated error branches described above, plus
-  `try_start_recording`/`evaluate_active_event`'s confirmed-detection path, which needs
-  a real photo of a living-thing subject to reach honestly (see the Decision section).
+  present): last measured in the mid-90s% after both `start_audio_capture` and
+  `start_camera_capture`/camera auto-detect moved into their own
+  `*_coverage_excluded.rs` siblings, leaving `capture/audio.rs` and `capture/camera.rs`
+  themselves at genuine 100%. The remaining gap is the `?`-propagated error branches
+  described above, plus `try_start_recording`/`evaluate_active_event`'s
+  confirmed-detection path, which needs a real photo of a living-thing subject to reach
+  honestly (see the Decision section). Re-run the command above to get the exact current
+  number rather than trusting a stale figure here.
 - **CI** (`cargo llvm-cov --workspace --fail-under-lines 78 --ignore-filename-regex '...'`,
   no `--ignored`, the gitignored model file is never fetched in CI): **78.28%**
   measured, gated at 78 with a small margin for measurement noise. This is meaningfully
@@ -174,11 +173,13 @@ genuinely different achievable ceilings:
 
 ## Consequences
 
-- `main.rs` and every file except the four fully-excluded ones are held to a *real*,
-  gate-enforced 100%-or-explained-gap standard; a regression in any tested function
-  moves the reported number and fails CI, not just `coverage_excluded.rs`'s untestable
-  wiring. `capture/audio.rs` is now literally 100%, not "100%-minus-a-documented-gap,"
-  since its one untestable function was moved out rather than left in place.
+- `main.rs` and every file except the fully-excluded `coverage_excluded.rs`/
+  `preview.rs`/`capture/camera_coverage_excluded.rs`/`capture/audio_coverage_excluded.rs`
+  are held to a *real*, gate-enforced 100%-or-explained-gap standard; a regression in
+  any tested function moves the reported number and fails CI, not just those excluded
+  files' untestable wiring. `capture/audio.rs` and `capture/camera.rs` are now literally
+  100%, not "100%-minus-a-documented-gap," since their untestable functions were moved
+  out rather than left in place.
 - Adding a new function to `coverage_excluded.rs` is a deliberate signal: it should only
   ever contain thin sequencing/wiring calling into functions defined (and tested)
   elsewhere. If a function there starts accumulating real decision logic, that logic
