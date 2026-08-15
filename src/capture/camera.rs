@@ -75,6 +75,7 @@ mod tests {
         assert_eq!(index, None);
     }
 
+    #[cfg(unix)]
     #[test]
     fn rejects_non_utf8_path() {
         use std::ffi::OsStr;
