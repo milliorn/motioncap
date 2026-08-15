@@ -209,7 +209,7 @@ pub(crate) const LOG_FILE_NAME: &str = "motioncap.log";
 /// tearing down and reopening the OS camera handle. Doing that on every
 /// brief stall would thrash the device and could itself induce more stalls.
 /// This threshold instead assumes the camera is genuinely gone (see
-/// `capture::camera::start_camera_capture`'s doc comment for why nokhwa
+/// `capture::camera_coverage_excluded::start_camera_capture`'s doc comment for why nokhwa
 /// never recovers from this on its own) and a full stream rebuild is
 /// warranted.
 const CAMERA_RECONNECT_STALL: Duration = Duration::from_secs(15);
@@ -589,7 +589,7 @@ fn should_reconnect(
 
 // maybe_reconnect_camera lives in coverage_excluded.rs, not here: past the
 // should_reconnect guard below (which is what's actually unit-tested),
-// every remaining line calls capture::camera::start_camera_capture, which
+// every remaining line calls capture::camera_coverage_excluded::start_camera_capture, which
 // opens a real /dev/videoN device (see coverage_excluded.rs's module doc). The
 // pure threshold/cooldown decision is should_reconnect, kept here and
 // tested directly.

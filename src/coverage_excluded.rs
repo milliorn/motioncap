@@ -37,7 +37,7 @@
 //!   ring-buffer/ffmpeg state or drives `PreviewWindow`, which needs a real
 //!   `OpenCV` highgui display. A test can exercise the shutdown branch, not
 //!   the loop actually running.
-//! - [`maybe_reconnect_camera`] calls `capture::camera::start_camera_capture`
+//! - [`maybe_reconnect_camera`] calls `capture::camera_coverage_excluded::start_camera_capture`
 //!   once past its threshold/cooldown guard, opening a real `/dev/videoN`
 //!   device. The guard itself (`should_reconnect`) is pure and stays in
 //!   `main.rs`, tested directly there.
@@ -114,7 +114,7 @@ pub fn run() -> Result<()> {
     let pre_buffer = Duration::from_secs(u64::from(config.pre_buffer_secs));
     let ring_buffer = Arc::new(Mutex::new(RingBuffer::new(pre_buffer)));
 
-    let camera = capture::camera::start_camera_capture(
+    let camera = capture::camera_coverage_excluded::start_camera_capture(
         config.camera_device.as_deref(),
         Arc::clone(&ring_buffer),
     )?;
@@ -420,7 +420,7 @@ fn run_preview_loop(
 
 /// If the current stall (tracked by `last_seen`) has persisted past
 /// `CAMERA_RECONNECT_STALL`, tears down and rebuilds the capture stream (see
-/// `capture::camera::start_camera_capture`'s doc comment), respecting
+/// `capture::camera_coverage_excluded::start_camera_capture`'s doc comment), respecting
 /// `CAMERA_RECONNECT_COOLDOWN` between attempts so a camera that stays absent
 /// doesn't get reopened on every single poll tick while it's gone.
 /// `last_reconnect_attempt` is updated on every attempt (success or failure),
@@ -457,7 +457,10 @@ fn maybe_reconnect_camera(
     // as long as the old instance is still alive.
     drop(camera.lock().expect("camera lock poisoned").take());
 
-    let rebuilt = capture::camera::start_camera_capture(camera_device, Arc::clone(ring_buffer));
+    let rebuilt = capture::camera_coverage_excluded::start_camera_capture(
+        camera_device,
+        Arc::clone(ring_buffer),
+    );
 
     match rebuilt {
         Ok(new_camera) => {
