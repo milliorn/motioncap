@@ -171,11 +171,9 @@ jobs:
       # real camera/audio hardware or a display, which CI (and this repo's
       # stable-only toolchain, which can't use the nightly-only
       # #[coverage(off)] attribute for finer-grained exclusion) cannot
-      # provide, see docs/adr/0006-coverage-exclusions.md. capture/audio.rs
-      # itself is not in this list: start_audio_capture (the one hardware-bound
-      # function it used to contain) was moved entirely into
-      # capture/audio_coverage_excluded.rs, so capture/audio.rs is held to
-      # real 100% instead of the file being partially excluded.
+      # provide. capture/audio.rs itself is deliberately not in this list
+      # (held to real 100%); see docs/adr/0006-coverage-exclusions.md for
+      # why and for the per-file reasoning behind this whole list.
       #
       # 78% (not the ~95.8% achievable locally with the model file present)
       # is what CI can actually reach without the #[ignore]'d tests; set from
