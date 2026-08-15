@@ -1,0 +1,27 @@
+---
+name: PR Title Lint
+
+# Enforces that PR titles follow Conventional Commits. This repo squash-merges
+# PRs, and GitHub defaults the squash commit message to the PR title, so the
+# PR title is what release-please actually reads on main, not the individual
+# commits inside the PR. A PR mixing commit types (e.g. mostly refactor: with
+# one feat: buried inside) must be titled with the most significant type
+# present (feat > fix > everything else), or that release-worthy change is
+# silently invisible to release-please after squash.
+on:
+  pull_request_target:
+    types:
+      - opened
+      - edited
+      - synchronize
+
+permissions:
+  pull-requests: read
+
+jobs:
+  lint-pr-title:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: amannn/action-semantic-pull-request@v5
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
