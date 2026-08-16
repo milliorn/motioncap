@@ -843,21 +843,6 @@ pub(crate) fn try_start_recording(
         return Ok(());
     };
 
-    if !pre_buffer_ready(
-        reconnected_at,
-        config.pre_buffer_secs,
-        std::time::Instant::now(),
-    ) {
-        // The capture stream was rebuilt too recently for the ring buffer to
-        // have refilled a full pre-buffer window; wait for it rather than
-        // starting a clip with a starved lead-in (see `pre_buffer_ready`).
-        // `pending_confirmation` is left untouched so a still-present
-        // subject simply re-confirms and retries on the next poll instead of
-        // needing a fresh two-poll confirmation cycle once the buffer is
-        // ready.
-        return Ok(());
-    }
-
     let mut classes: Vec<&str> = confirmed.iter().map(|d| d.class_name).collect();
 
     classes.sort_unstable();
