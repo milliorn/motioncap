@@ -502,19 +502,31 @@ fn confirm_pending(
 /// gate to a confirmed detection. `expire_stale_pending` runs unconditionally
 /// before returning regardless of which branch inside `confirm_pending` was
 /// taken (including when `triggers::evaluate` finds nothing and
-/// `confirm_pending` is never reached), so callers no longer need to
-/// remember that invariant themselves. See `expire_stale_pending`'s doc
-/// comment for why skipping it on the no-detection path is the exact bug
-/// this gate exists to prevent.
+/// `confirm_pending` is never reached, or when `skip_inference` is set), so
+/// callers no longer need to remember that invariant themselves. See
+/// `expire_stale_pending`'s doc comment for why skipping it on the
+/// no-detection path is the exact bug this gate exists to prevent.
+///
+/// When `skip_inference` is `true`, `detector.detect` is not called and this
+/// always returns `Ok(None)`, but `expire_stale_pending` still runs; used by
+/// `try_start_recording` to avoid paying for YOLO inference on polls whose
+/// result would be discarded anyway by the `pre_buffer_ready` gate, without
+/// letting a `pending` confirmation sit unexpired for the whole time
+/// inference is being skipped.
 fn poll_confirmed_detections(
     detector: &mut Detector,
     config: &Config,
     frame: &image::RgbImage,
     pending: &mut Option<PendingConfirmation>,
+    skip_inference: bool,
 ) -> Result<Option<Vec<detect::Detection>>> {
     let now = std::time::Instant::now();
-    let detections = detector.detect(frame, config.detection_confidence)?;
-    let confirmed = triggers::evaluate(detections).and_then(|d| confirm_pending(pending, d, now));
+    let confirmed = if skip_inference {
+        None
+    } else {
+        let detections = detector.detect(frame, config.detection_confidence)?;
+        triggers::evaluate(detections).and_then(|d| confirm_pending(pending, d, now))
+    };
     expire_stale_pending(pending, now);
     Ok(confirmed)
 }
@@ -697,7 +709,7 @@ pub(crate) fn evaluate_active_event(
     // to keep writing frames/audio at a steady pace while this runs, not
     // blocked waiting on this lock.
     let confirmed = if motion.tripped {
-        poll_confirmed_detections(detector, config, frame, pending_confirmation)?
+        poll_confirmed_detections(detector, config, frame, pending_confirmation, false)?
     } else {
         None
     };
@@ -797,25 +809,39 @@ pub(crate) fn try_start_recording(
         return Ok(());
     }
 
-    let Some(confirmed) = poll_confirmed_detections(detector, config, frame, pending_confirmation)?
-    else {
-        return Ok(());
-    };
-
-    if !pre_buffer_ready(
+    let buffer_ready = pre_buffer_ready(
         reconnected_at,
         config.pre_buffer_secs,
         std::time::Instant::now(),
-    ) {
+    );
+
+    if !buffer_ready {
         // The capture stream was rebuilt too recently for the ring buffer to
-        // have refilled a full pre-buffer window; wait for it rather than
-        // starting a clip with a starved lead-in (see `pre_buffer_ready`).
-        // `pending_confirmation` is left untouched so a still-present
-        // subject simply re-confirms and retries on the next poll instead of
-        // needing a fresh two-poll confirmation cycle once the buffer is
-        // ready.
+        // have refilled a full pre-buffer window; skip the expensive YOLO
+        // call entirely rather than running inference on every tripped-motion
+        // poll for the whole grace window, only to discard the result (see
+        // `pre_buffer_ready`). `expire_stale_pending` still runs
+        // unconditionally inside `poll_confirmed_detections` even though
+        // inference is skipped, so a `pending_confirmation` older than
+        // `PENDING_CONFIRMATION_WINDOW` can't sit unexpired for the whole
+        // grace window and then spuriously confirm against an unrelated
+        // sighting once inference resumes. `pending_confirmation` is
+        // otherwise left untouched so a still-present subject simply
+        // re-confirms and retries on the next poll instead of needing a
+        // fresh two-poll confirmation cycle once the buffer is ready.
+        poll_confirmed_detections(detector, config, frame, pending_confirmation, true)?;
+        log::debug!(
+            "motion tripped but recording start held back; ring buffer still refilling after \
+             camera reconnect"
+        );
         return Ok(());
     }
+
+    let Some(confirmed) =
+        poll_confirmed_detections(detector, config, frame, pending_confirmation, false)?
+    else {
+        return Ok(());
+    };
 
     let mut classes: Vec<&str> = confirmed.iter().map(|d| d.class_name).collect();
 
@@ -1572,6 +1598,12 @@ mod tests {
         assert!(pre_buffer_ready(Some(reconnected_at), 10, now));
     }
 
+    #[test]
+    fn pre_buffer_ready_true_immediately_when_pre_buffer_secs_is_zero() {
+        let now = Instant::now();
+        assert!(pre_buffer_ready(Some(now), 0, now));
+    }
+
     // run_recording_writer_loop and run_preview_loop, and their
     // shutdown-path tests, now live in coverage_excluded.rs alongside
     // run_detection_loop, since past their shutdown check both spend their
@@ -1940,14 +1972,17 @@ mod tests {
     #[ignore = "requires models/yolov8n.onnx + a working ONNX Runtime build; run explicitly with \
                 `cargo test -- --ignored` on a machine that has both"]
     fn try_start_recording_skips_when_reconnected_too_recently() {
-        // A camera reconnect just happened (reconnected_at = now). If
-        // poll_confirmed_detections returns None here (the common case for a
-        // synthetic frame, same caveat as the sibling ring-buffer-empty
-        // test), this only validates the ordinary no-confirmation no-op
-        // path; if it happens to return Some, the pre_buffer_ready guard
-        // added ahead of the ring-buffer snapshot is exercised for real,
-        // proving a confirmed detection still doesn't start a recording
-        // before config.pre_buffer_secs has elapsed since the reconnect.
+        // A camera reconnect just happened (reconnected_at = now), so
+        // `pre_buffer_ready` is false and `try_start_recording` must skip
+        // YOLO inference entirely (passing `skip_inference: true` into
+        // `poll_confirmed_detections`) rather than run it and discard the
+        // result. `Detector` still needs a real loaded model to construct at
+        // all (there is no stub constructor), hence this test still needs
+        // `MODEL_TEST_LOCK` and is `#[ignore]`'d, but unlike before, the
+        // guard being held no longer matters for whether the gate itself is
+        // exercised: `detector.detect` is never invoked on this path, so the
+        // assertions below hold deterministically rather than depending on
+        // what a synthetic frame happens to classify as.
         let _guard = detect::MODEL_TEST_LOCK
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
@@ -1962,7 +1997,10 @@ mod tests {
             sample_rate: 8000,
             channels: 1,
         };
-        let mut pending = None;
+        let mut pending = Some(PendingConfirmation {
+            class_name: "person",
+            first_seen: Instant::now(),
+        });
 
         for _ in 0..5 {
             motion_gate.evaluate(&background_frame()).unwrap();
@@ -1983,5 +2021,11 @@ mod tests {
         .unwrap();
 
         assert!(!active_event.lock().unwrap().is_some());
+        // `pending_confirmation` must survive untouched across the hold-back,
+        // per the guarantee documented at the `pre_buffer_ready` call site:
+        // a still-present subject should simply re-confirm and retry on the
+        // next poll instead of needing a fresh two-poll confirmation cycle
+        // once the buffer is ready.
+        assert_eq!(pending.map(|p| p.class_name), Some("person"));
     }
 }
