@@ -209,7 +209,7 @@ pub(crate) const LOG_FILE_NAME: &str = "motioncap.log";
 /// tearing down and reopening the OS camera handle. Doing that on every
 /// brief stall would thrash the device and could itself induce more stalls.
 /// This threshold instead assumes the camera is genuinely gone (see
-/// `capture::camera::start_camera_capture`'s doc comment for why nokhwa
+/// `capture::camera_coverage_excluded::start_camera_capture`'s doc comment for why nokhwa
 /// never recovers from this on its own) and a full stream rebuild is
 /// warranted.
 const CAMERA_RECONNECT_STALL: Duration = Duration::from_secs(15);
@@ -502,19 +502,31 @@ fn confirm_pending(
 /// gate to a confirmed detection. `expire_stale_pending` runs unconditionally
 /// before returning regardless of which branch inside `confirm_pending` was
 /// taken (including when `triggers::evaluate` finds nothing and
-/// `confirm_pending` is never reached), so callers no longer need to
-/// remember that invariant themselves. See `expire_stale_pending`'s doc
-/// comment for why skipping it on the no-detection path is the exact bug
-/// this gate exists to prevent.
+/// `confirm_pending` is never reached, or when `skip_inference` is set), so
+/// callers no longer need to remember that invariant themselves. See
+/// `expire_stale_pending`'s doc comment for why skipping it on the
+/// no-detection path is the exact bug this gate exists to prevent.
+///
+/// When `skip_inference` is `true`, `detector.detect` is not called and this
+/// always returns `Ok(None)`, but `expire_stale_pending` still runs; used by
+/// `try_start_recording` to avoid paying for YOLO inference on polls whose
+/// result would be discarded anyway by the `pre_buffer_ready` gate, without
+/// letting a `pending` confirmation sit unexpired for the whole time
+/// inference is being skipped.
 fn poll_confirmed_detections(
     detector: &mut Detector,
     config: &Config,
     frame: &image::RgbImage,
     pending: &mut Option<PendingConfirmation>,
+    skip_inference: bool,
 ) -> Result<Option<Vec<detect::Detection>>> {
     let now = std::time::Instant::now();
-    let detections = detector.detect(frame, config.detection_confidence)?;
-    let confirmed = triggers::evaluate(detections).and_then(|d| confirm_pending(pending, d, now));
+    let confirmed = if skip_inference {
+        None
+    } else {
+        let detections = detector.detect(frame, config.detection_confidence)?;
+        triggers::evaluate(detections).and_then(|d| confirm_pending(pending, d, now))
+    };
     expire_stale_pending(pending, now);
     Ok(confirmed)
 }
@@ -589,10 +601,41 @@ fn should_reconnect(
 
 // maybe_reconnect_camera lives in coverage_excluded.rs, not here: past the
 // should_reconnect guard below (which is what's actually unit-tested),
-// every remaining line calls capture::camera::start_camera_capture, which
+// every remaining line calls capture::camera_coverage_excluded::start_camera_capture, which
 // opens a real /dev/videoN device (see coverage_excluded.rs's module doc). The
 // pure threshold/cooldown decision is should_reconnect, kept here and
 // tested directly.
+
+/// `false` while the ring buffer hasn't yet had `pre_buffer_secs` worth of
+/// wall-clock time to refill since the capture stream was last rebuilt by
+/// `maybe_reconnect_camera`.
+///
+/// A reconnect drops the old `CallbackCamera` and opens a fresh one (see
+/// `maybe_reconnect_camera`'s doc comment), so the ring buffer starts
+/// effectively empty at that instant: it only evicts on `push_frame`, but
+/// nothing pushes *new* frames into it during the stall, and any frames
+/// still sitting in it are the stale pre-stall ones the trigger's pre-buffer
+/// snapshot has no use for as genuine lead-in. If a trigger fires before the
+/// buffer has had a full `pre_buffer_secs` to refill from the rebuilt
+/// stream, `try_start_recording` would seed the new clip with only the
+/// handful of seconds actually captured since reconnect, instead of the
+/// configured lead-in, producing a clip that opens abruptly mid-action
+/// rather than easing in (observed directly: a reconnect completing ~4s
+/// before the next confirmed trigger produced a clip with ~4s of pre-roll
+/// against a configured 10s). `reconnected_at` is `None` before any
+/// reconnect has happened this run, in which case the buffer has had the
+/// entire process lifetime to fill and this always returns `true`.
+fn pre_buffer_ready(
+    reconnected_at: Option<std::time::Instant>,
+    pre_buffer_secs: u32,
+    now: std::time::Instant,
+) -> bool {
+    let Some(reconnected_at) = reconnected_at else {
+        return true;
+    };
+
+    now.duration_since(reconnected_at) >= Duration::from_secs(u64::from(pre_buffer_secs))
+}
 
 /// Called after `maybe_reconnect_camera` rebuilds the stream, in place of
 /// clearing `last_seen` to `None`.
@@ -666,7 +709,7 @@ pub(crate) fn evaluate_active_event(
     // to keep writing frames/audio at a steady pace while this runs, not
     // blocked waiting on this lock.
     let confirmed = if motion.tripped {
-        poll_confirmed_detections(detector, config, frame, pending_confirmation)?
+        poll_confirmed_detections(detector, config, frame, pending_confirmation, false)?
     } else {
         None
     };
@@ -737,8 +780,10 @@ pub(crate) struct AudioParams {
 /// Runs the motion gate and (on trip, then second-poll confirmation) YOLO
 /// detection against `frame` when no recording is currently active, starting
 /// a new `ActiveEvent::Pending` once `confirm_pending` accepts a repeat
-/// sighting. Kept separate from `run_detection_loop` purely to stay under
-/// clippy's function-length limit; it has no logic in common with
+/// sighting and `pre_buffer_ready` confirms the ring buffer has had time to
+/// refill since the last camera reconnect (see that function's doc comment).
+/// Kept separate from `run_detection_loop` purely to stay under clippy's
+/// function-length limit; it has no logic in common with
 /// `evaluate_active_event` beyond polling the same frame.
 #[allow(
     clippy::too_many_arguments,
@@ -754,6 +799,7 @@ pub(crate) fn try_start_recording(
     frame: &image::RgbImage,
     frame_timestamp: std::time::Instant,
     pending_confirmation: &mut Option<PendingConfirmation>,
+    reconnected_at: Option<std::time::Instant>,
 ) -> Result<()> {
     let motion = motion_gate.evaluate(frame)?;
 
@@ -763,7 +809,36 @@ pub(crate) fn try_start_recording(
         return Ok(());
     }
 
-    let Some(confirmed) = poll_confirmed_detections(detector, config, frame, pending_confirmation)?
+    let buffer_ready = pre_buffer_ready(
+        reconnected_at,
+        config.pre_buffer_secs,
+        std::time::Instant::now(),
+    );
+
+    if !buffer_ready {
+        // The capture stream was rebuilt too recently for the ring buffer to
+        // have refilled a full pre-buffer window; skip the expensive YOLO
+        // call entirely rather than running inference on every tripped-motion
+        // poll for the whole grace window, only to discard the result (see
+        // `pre_buffer_ready`). `expire_stale_pending` still runs
+        // unconditionally inside `poll_confirmed_detections` even though
+        // inference is skipped, so a `pending_confirmation` older than
+        // `PENDING_CONFIRMATION_WINDOW` can't sit unexpired for the whole
+        // grace window and then spuriously confirm against an unrelated
+        // sighting once inference resumes. `pending_confirmation` is
+        // otherwise left untouched so a still-present subject simply
+        // re-confirms and retries on the next poll instead of needing a
+        // fresh two-poll confirmation cycle once the buffer is ready.
+        poll_confirmed_detections(detector, config, frame, pending_confirmation, true)?;
+        log::debug!(
+            "motion tripped but recording start held back; ring buffer still refilling after \
+             camera reconnect"
+        );
+        return Ok(());
+    }
+
+    let Some(confirmed) =
+        poll_confirmed_detections(detector, config, frame, pending_confirmation, false)?
     else {
         return Ok(());
     };
@@ -1501,6 +1576,34 @@ mod tests {
         assert!(should_reconnect(Some(&seen), Some(last_attempt), now));
     }
 
+    // --- pre_buffer_ready ---
+
+    #[test]
+    fn pre_buffer_ready_true_when_no_reconnect_tracked() {
+        let now = Instant::now();
+        assert!(pre_buffer_ready(None, 10, now));
+    }
+
+    #[test]
+    fn pre_buffer_ready_false_before_pre_buffer_secs_have_elapsed() {
+        let now = Instant::now();
+        let reconnected_at = now - Duration::from_secs(4);
+        assert!(!pre_buffer_ready(Some(reconnected_at), 10, now));
+    }
+
+    #[test]
+    fn pre_buffer_ready_true_once_pre_buffer_secs_have_elapsed() {
+        let now = Instant::now();
+        let reconnected_at = now - Duration::from_secs(10);
+        assert!(pre_buffer_ready(Some(reconnected_at), 10, now));
+    }
+
+    #[test]
+    fn pre_buffer_ready_true_immediately_when_pre_buffer_secs_is_zero() {
+        let now = Instant::now();
+        assert!(pre_buffer_ready(Some(now), 0, now));
+    }
+
     // run_recording_writer_loop and run_preview_loop, and their
     // shutdown-path tests, now live in coverage_excluded.rs alongside
     // run_detection_loop, since past their shutdown check both spend their
@@ -1752,6 +1855,7 @@ mod tests {
             &background_frame(),
             Instant::now(),
             &mut pending,
+            None,
         )
         .unwrap();
 
@@ -1794,6 +1898,7 @@ mod tests {
             &changed_frame(),
             Instant::now(),
             &mut pending,
+            None,
         )
         .unwrap();
         try_start_recording(
@@ -1806,6 +1911,7 @@ mod tests {
             &changed_frame(),
             Instant::now(),
             &mut pending,
+            None,
         )
         .unwrap();
 
@@ -1855,9 +1961,71 @@ mod tests {
             &changed_frame(),
             Instant::now(),
             &mut pending,
+            None,
         )
         .unwrap();
 
         assert!(!active_event.lock().unwrap().is_some());
+    }
+
+    #[test]
+    #[ignore = "requires models/yolov8n.onnx + a working ONNX Runtime build; run explicitly with \
+                `cargo test -- --ignored` on a machine that has both"]
+    fn try_start_recording_skips_when_reconnected_too_recently() {
+        // A camera reconnect just happened (reconnected_at = now), so
+        // `pre_buffer_ready` is false and `try_start_recording` must skip
+        // YOLO inference entirely (passing `skip_inference: true` into
+        // `poll_confirmed_detections`) rather than run it and discard the
+        // result. `Detector` still needs a real loaded model to construct at
+        // all (there is no stub constructor), hence this test still needs
+        // `MODEL_TEST_LOCK` and is `#[ignore]`'d, but unlike before, the
+        // guard being held no longer matters for whether the gate itself is
+        // exercised: `detector.detect` is never invoked on this path, so the
+        // assertions below hold deterministically rather than depending on
+        // what a synthetic frame happens to classify as.
+        let _guard = detect::MODEL_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_config(dir.path());
+        let mut motion_gate = MotionGate::new(config.motion_threshold).unwrap();
+        let mut detector = test_detector();
+        let ring_buffer = Arc::new(Mutex::new(RingBuffer::new(Duration::from_secs(10))));
+        ring_buffer.lock().unwrap().push_frame(background_frame());
+        let active_event = Arc::new(Mutex::new(ActiveEvent::None));
+        let audio = AudioParams {
+            sample_rate: 8000,
+            channels: 1,
+        };
+        let mut pending = Some(PendingConfirmation {
+            class_name: "person",
+            first_seen: Instant::now(),
+        });
+
+        for _ in 0..5 {
+            motion_gate.evaluate(&background_frame()).unwrap();
+        }
+
+        try_start_recording(
+            &config,
+            &mut motion_gate,
+            &mut detector,
+            &ring_buffer,
+            &active_event,
+            &audio,
+            &changed_frame(),
+            Instant::now(),
+            &mut pending,
+            Some(Instant::now()),
+        )
+        .unwrap();
+
+        assert!(!active_event.lock().unwrap().is_some());
+        // `pending_confirmation` must survive untouched across the hold-back,
+        // per the guarantee documented at the `pre_buffer_ready` call site:
+        // a still-present subject should simply re-confirm and retry on the
+        // next poll instead of needing a fresh two-poll confirmation cycle
+        // once the buffer is ready.
+        assert_eq!(pending.map(|p| p.class_name), Some("person"));
     }
 }

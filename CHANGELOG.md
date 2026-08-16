@@ -1,5 +1,13 @@
 # Changelog
 
+## [0.7.0](https://github.com/milliorn/motioncap/compare/motioncap-v0.6.0...motioncap-v0.7.0) (2026-08-16)
+
+
+### Features
+
+* implement pre-buffer readiness check for recording start after camera reconnect ([01e4c85](https://github.com/milliorn/motioncap/commit/01e4c85b87d6a5c992fbf05e761c41391035c721))
+* optimize detection polling by skipping inference during pre-buffer wait ([25471a3](https://github.com/milliorn/motioncap/commit/25471a30e687e342a64d1ee826f53e91c38db279))
+
 ## [0.6.0](https://github.com/milliorn/motioncap/compare/motioncap-v0.5.1...motioncap-v0.6.0) (2026-08-15)
 
 
