@@ -255,6 +255,11 @@ fn run_detection_loop(
     // stalled doesn't get the stream rebuilt on every single poll tick (see
     // `maybe_reconnect_camera` / `CAMERA_RECONNECT_COOLDOWN`).
     let mut last_reconnect_attempt: Option<std::time::Instant> = None;
+    // When the capture stream was last successfully rebuilt, so
+    // `try_start_recording` can hold off starting a new recording until the
+    // ring buffer has had a full `pre_buffer_secs` to refill from the
+    // rebuilt stream (see `pre_buffer_ready`).
+    let mut reconnected_at: Option<std::time::Instant> = None;
     // A first, unconfirmed living-thing sighting awaiting a second one to
     // start a recording (see `confirm_pending` / `PENDING_CONFIRMATION_WINDOW`).
     let mut pending_confirmation: Option<PendingConfirmation> = None;
@@ -304,6 +309,7 @@ fn run_detection_loop(
                 &ring_buffer,
             ) {
                 reset_liveness_after_reconnect(&mut last_frame_seen);
+                reconnected_at = Some(std::time::Instant::now());
             }
 
             continue;
@@ -340,6 +346,7 @@ fn run_detection_loop(
             &frame,
             frame_timestamp,
             &mut pending_confirmation,
+            reconnected_at,
         )?;
     }
 }

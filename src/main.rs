@@ -594,6 +594,37 @@ fn should_reconnect(
 // pure threshold/cooldown decision is should_reconnect, kept here and
 // tested directly.
 
+/// `false` while the ring buffer hasn't yet had `pre_buffer_secs` worth of
+/// wall-clock time to refill since the capture stream was last rebuilt by
+/// `maybe_reconnect_camera`.
+///
+/// A reconnect drops the old `CallbackCamera` and opens a fresh one (see
+/// `maybe_reconnect_camera`'s doc comment), so the ring buffer starts
+/// effectively empty at that instant: it only evicts on `push_frame`, but
+/// nothing pushes *new* frames into it during the stall, and any frames
+/// still sitting in it are the stale pre-stall ones the trigger's pre-buffer
+/// snapshot has no use for as genuine lead-in. If a trigger fires before the
+/// buffer has had a full `pre_buffer_secs` to refill from the rebuilt
+/// stream, `try_start_recording` would seed the new clip with only the
+/// handful of seconds actually captured since reconnect, instead of the
+/// configured lead-in, producing a clip that opens abruptly mid-action
+/// rather than easing in (observed directly: a reconnect completing ~4s
+/// before the next confirmed trigger produced a clip with ~4s of pre-roll
+/// against a configured 10s). `reconnected_at` is `None` before any
+/// reconnect has happened this run, in which case the buffer has had the
+/// entire process lifetime to fill and this always returns `true`.
+fn pre_buffer_ready(
+    reconnected_at: Option<std::time::Instant>,
+    pre_buffer_secs: u32,
+    now: std::time::Instant,
+) -> bool {
+    let Some(reconnected_at) = reconnected_at else {
+        return true;
+    };
+
+    now.duration_since(reconnected_at) >= Duration::from_secs(u64::from(pre_buffer_secs))
+}
+
 /// Called after `maybe_reconnect_camera` rebuilds the stream, in place of
 /// clearing `last_seen` to `None`.
 ///
@@ -737,8 +768,10 @@ pub(crate) struct AudioParams {
 /// Runs the motion gate and (on trip, then second-poll confirmation) YOLO
 /// detection against `frame` when no recording is currently active, starting
 /// a new `ActiveEvent::Pending` once `confirm_pending` accepts a repeat
-/// sighting. Kept separate from `run_detection_loop` purely to stay under
-/// clippy's function-length limit; it has no logic in common with
+/// sighting and `pre_buffer_ready` confirms the ring buffer has had time to
+/// refill since the last camera reconnect (see that function's doc comment).
+/// Kept separate from `run_detection_loop` purely to stay under clippy's
+/// function-length limit; it has no logic in common with
 /// `evaluate_active_event` beyond polling the same frame.
 #[allow(
     clippy::too_many_arguments,
@@ -754,6 +787,7 @@ pub(crate) fn try_start_recording(
     frame: &image::RgbImage,
     frame_timestamp: std::time::Instant,
     pending_confirmation: &mut Option<PendingConfirmation>,
+    reconnected_at: Option<std::time::Instant>,
 ) -> Result<()> {
     let motion = motion_gate.evaluate(frame)?;
 
@@ -767,6 +801,21 @@ pub(crate) fn try_start_recording(
     else {
         return Ok(());
     };
+
+    if !pre_buffer_ready(
+        reconnected_at,
+        config.pre_buffer_secs,
+        std::time::Instant::now(),
+    ) {
+        // The capture stream was rebuilt too recently for the ring buffer to
+        // have refilled a full pre-buffer window; wait for it rather than
+        // starting a clip with a starved lead-in (see `pre_buffer_ready`).
+        // `pending_confirmation` is left untouched so a still-present
+        // subject simply re-confirms and retries on the next poll instead of
+        // needing a fresh two-poll confirmation cycle once the buffer is
+        // ready.
+        return Ok(());
+    }
 
     let mut classes: Vec<&str> = confirmed.iter().map(|d| d.class_name).collect();
 
@@ -1501,6 +1550,28 @@ mod tests {
         assert!(should_reconnect(Some(&seen), Some(last_attempt), now));
     }
 
+    // --- pre_buffer_ready ---
+
+    #[test]
+    fn pre_buffer_ready_true_when_no_reconnect_tracked() {
+        let now = Instant::now();
+        assert!(pre_buffer_ready(None, 10, now));
+    }
+
+    #[test]
+    fn pre_buffer_ready_false_before_pre_buffer_secs_have_elapsed() {
+        let now = Instant::now();
+        let reconnected_at = now - Duration::from_secs(4);
+        assert!(!pre_buffer_ready(Some(reconnected_at), 10, now));
+    }
+
+    #[test]
+    fn pre_buffer_ready_true_once_pre_buffer_secs_have_elapsed() {
+        let now = Instant::now();
+        let reconnected_at = now - Duration::from_secs(10);
+        assert!(pre_buffer_ready(Some(reconnected_at), 10, now));
+    }
+
     // run_recording_writer_loop and run_preview_loop, and their
     // shutdown-path tests, now live in coverage_excluded.rs alongside
     // run_detection_loop, since past their shutdown check both spend their
@@ -1752,6 +1823,7 @@ mod tests {
             &background_frame(),
             Instant::now(),
             &mut pending,
+            None,
         )
         .unwrap();
 
@@ -1794,6 +1866,7 @@ mod tests {
             &changed_frame(),
             Instant::now(),
             &mut pending,
+            None,
         )
         .unwrap();
         try_start_recording(
@@ -1806,6 +1879,7 @@ mod tests {
             &changed_frame(),
             Instant::now(),
             &mut pending,
+            None,
         )
         .unwrap();
 
@@ -1855,6 +1929,56 @@ mod tests {
             &changed_frame(),
             Instant::now(),
             &mut pending,
+            None,
+        )
+        .unwrap();
+
+        assert!(!active_event.lock().unwrap().is_some());
+    }
+
+    #[test]
+    #[ignore = "requires models/yolov8n.onnx + a working ONNX Runtime build; run explicitly with \
+                `cargo test -- --ignored` on a machine that has both"]
+    fn try_start_recording_skips_when_reconnected_too_recently() {
+        // A camera reconnect just happened (reconnected_at = now). If
+        // poll_confirmed_detections returns None here (the common case for a
+        // synthetic frame, same caveat as the sibling ring-buffer-empty
+        // test), this only validates the ordinary no-confirmation no-op
+        // path; if it happens to return Some, the pre_buffer_ready guard
+        // added ahead of the ring-buffer snapshot is exercised for real,
+        // proving a confirmed detection still doesn't start a recording
+        // before config.pre_buffer_secs has elapsed since the reconnect.
+        let _guard = detect::MODEL_TEST_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let dir = tempfile::tempdir().unwrap();
+        let config = test_config(dir.path());
+        let mut motion_gate = MotionGate::new(config.motion_threshold).unwrap();
+        let mut detector = test_detector();
+        let ring_buffer = Arc::new(Mutex::new(RingBuffer::new(Duration::from_secs(10))));
+        ring_buffer.lock().unwrap().push_frame(background_frame());
+        let active_event = Arc::new(Mutex::new(ActiveEvent::None));
+        let audio = AudioParams {
+            sample_rate: 8000,
+            channels: 1,
+        };
+        let mut pending = None;
+
+        for _ in 0..5 {
+            motion_gate.evaluate(&background_frame()).unwrap();
+        }
+
+        try_start_recording(
+            &config,
+            &mut motion_gate,
+            &mut detector,
+            &ring_buffer,
+            &active_event,
+            &audio,
+            &changed_frame(),
+            Instant::now(),
+            &mut pending,
+            Some(Instant::now()),
         )
         .unwrap();
 
