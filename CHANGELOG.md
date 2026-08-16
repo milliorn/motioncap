@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.8.0](https://github.com/milliorn/motioncap/compare/motioncap-v0.7.0...motioncap-v0.8.0) (2026-08-16)
+
+
+### Features
+
+* **recorder:** gate new recordings on pre-buffer readiness after camera reconnect ([#27](https://github.com/milliorn/motioncap/issues/27)) ([85ad86c](https://github.com/milliorn/motioncap/commit/85ad86c5360a4eb40361ef42948da3427e655938))
+
 ## [0.7.0](https://github.com/milliorn/motioncap/compare/motioncap-v0.6.0...motioncap-v0.7.0) (2026-08-16)
 
 
