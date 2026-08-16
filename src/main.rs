@@ -797,9 +797,7 @@ pub(crate) fn try_start_recording(
         return Ok(());
     }
 
-    let buffer_ready = pre_buffer_ready(reconnected_at, config.pre_buffer_secs, frame_timestamp);
-
-    if !buffer_ready {
+    if !pre_buffer_ready(reconnected_at, config.pre_buffer_secs, frame_timestamp) {
         // The capture stream was rebuilt too recently for the ring buffer to
         // have refilled a full pre-buffer window; skip the expensive YOLO
         // call entirely rather than running inference on every tripped-motion
