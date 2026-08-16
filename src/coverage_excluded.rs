@@ -60,6 +60,7 @@ use anyhow::{Context, Result};
 
 use crate::buffer::RingBuffer;
 use crate::config::Config;
+use crate::config_coverage_excluded;
 use crate::detect::Detector;
 use crate::motion::MotionGate;
 use crate::preview::PreviewWindow;
@@ -106,7 +107,7 @@ fn init_logging(output_dir: &std::path::Path) -> Result<()> {
 /// `--preview` is set) the preview loop, then blocks on the preview loop
 /// until shutdown. Called by `main`.
 pub fn run() -> Result<()> {
-    let config = Config::parse_args();
+    let config = config_coverage_excluded::parse_args();
     init_logging(&config.output_dir)?;
 
     startup::check_dependencies(&config)?;

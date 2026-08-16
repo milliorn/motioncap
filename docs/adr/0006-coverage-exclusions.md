@@ -44,7 +44,7 @@ stood between the codebase and 100%:
      `capture::camera_coverage_excluded::start_camera_capture` once past its threshold/cooldown guard,
      opening a real `/dev/videoN` device. The guard itself (`should_reconnect`) is pure
      and stays in `main.rs`, unit-tested directly there.
-   - `Config::parse_args`: reads the real process's `std::env::args()`.
+   - `config_coverage_excluded::parse_args`: reads the real process's `std::env::args()`.
    - `check_ffmpeg`'s "not found" branch (`startup/depcheck.rs`), only reachable if
      `ffmpeg` is genuinely absent from `PATH` — this crate denies `unsafe_code`, and
      `std::env::set_var` (the only way to fake `PATH` from within a test) requires
@@ -121,22 +121,24 @@ and any `*_coverage_excluded.rs` sibling file, so `capture/camera_coverage_exclu
 and `capture/audio_coverage_excluded.rs` are covered by this single pattern without
 needing their own entries.
 
-Both `capture/camera.rs` and `capture/audio.rs` use the same convention: rather than
-leaving their one or two hardware-bound functions in place under a source comment, each
-moved them entirely into a sibling file (`capture/camera_coverage_excluded.rs`,
-`capture/audio_coverage_excluded.rs`), mirroring the crate-root `coverage_excluded.rs`
-split. `capture/camera.rs` originally left `start_camera_capture` and the auto-detect
-branch of `resolve_camera_index` in place under a `// coverage: excluded` comment, since
-the hardware-bound portion was a large fraction of the file; it was later moved to match
-`audio.rs`'s stricter convention once the pattern proved out, so both files now report
+`capture/camera.rs`, `capture/audio.rs`, and `config.rs` all use the same convention:
+rather than leaving their one or two hardware-/process-bound functions in place under a
+source comment, each moved them entirely into a sibling file
+(`capture/camera_coverage_excluded.rs`, `capture/audio_coverage_excluded.rs`,
+`config_coverage_excluded.rs`), mirroring the crate-root `coverage_excluded.rs` split.
+`capture/camera.rs` originally left `start_camera_capture` and the auto-detect branch of
+`resolve_camera_index` in place under a `// coverage: excluded` comment, since the
+hardware-bound portion was a large fraction of the file; it was later moved to match
+`audio.rs`'s stricter convention once the pattern proved out, so these files now report
 genuine 100% coverage on their own instead of "100%-minus-a-documented-gap." The
 remaining pure logic (`resolve_pinned_camera_index` in `camera.rs`, `samples_to_f32`/
-`sample_format_supported` in `audio.rs`) is unit-tested normally. The source-comment
-convention (`// coverage: excluded: <reason>`) still exists for cases where the
-untestable portion is a small fraction of a larger, mostly-testable file, since the tool
-itself can't express "exclude this function, not this file" on stable; the comment is
-what makes the omission visible in source and in code review wherever that convention is
-used, even though the coverage tool can't enforce it at that granularity.
+`sample_format_supported` in `audio.rs`, `Config`'s own construction via
+`try_parse_from` in `config.rs`) is unit-tested normally. The source-comment convention
+(`// coverage: excluded: <reason>`) still exists for cases where the untestable portion
+is a small fraction of a larger, mostly-testable file, since the tool itself can't
+express "exclude this function, not this file" on stable; the comment is what makes the
+omission visible in source and in code review wherever that convention is used, even
+though the coverage tool can't enforce it at that granularity.
 
 Every `#[ignore]`'d test (there are 9, split across `detect.rs` and `main.rs`) that
 constructs a real `Detector`/ONNX Runtime session and/or a real `MotionGate` shares one
@@ -174,12 +176,13 @@ genuinely different achievable ceilings:
 ## Consequences
 
 - `main.rs` and every file except the fully-excluded `coverage_excluded.rs`/
-  `preview.rs`/`capture/camera_coverage_excluded.rs`/`capture/audio_coverage_excluded.rs`
-  are held to a *real*, gate-enforced 100%-or-explained-gap standard; a regression in
-  any tested function moves the reported number and fails CI, not just those excluded
-  files' untestable wiring. `capture/audio.rs` and `capture/camera.rs` are now literally
-  100%, not "100%-minus-a-documented-gap," since their untestable functions were moved
-  out rather than left in place.
+  `preview.rs`/`capture/camera_coverage_excluded.rs`/`capture/audio_coverage_excluded.rs`/
+  `config_coverage_excluded.rs` are held to a *real*, gate-enforced 100%-or-explained-gap
+  standard; a regression in any tested function moves the reported number and fails CI,
+  not just those excluded files' untestable wiring. `capture/audio.rs`,
+  `capture/camera.rs`, and `config.rs` are now literally 100%, not
+  "100%-minus-a-documented-gap," since their untestable functions were moved out rather
+  than left in place.
 - Adding a new function to `coverage_excluded.rs` is a deliberate signal: it should only
   ever contain thin sequencing/wiring calling into functions defined (and tested)
   elsewhere. If a function there starts accumulating real decision logic, that logic

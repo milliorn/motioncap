@@ -7,6 +7,9 @@ mod buffer;
 mod capture;
 /// CLI argument parsing.
 mod config;
+/// The one function in `config` that cannot be unit-tested (see that
+/// module's doc comment).
+mod config_coverage_excluded;
 /// Top-level wiring and the functions that cannot be unit-tested (see that
 /// module's doc comment).
 mod coverage_excluded;

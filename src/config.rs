@@ -44,11 +44,6 @@ pub struct Config {
 }
 
 impl Config {
-    /// Parses `Config` from the process's command-line arguments.
-    pub fn parse_args() -> Self {
-        Self::parse()
-    }
-
     /// The configured YOLO ONNX model path.
     pub fn model_path(&self) -> &Path {
         &self.model_path
