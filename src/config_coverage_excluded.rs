@@ -10,7 +10,7 @@
 
 use clap::Parser;
 
-use crate::config::Config;
+use super::config::Config;
 
 /// Parses `Config` from the process's command-line arguments.
 pub fn parse_args() -> Config {
