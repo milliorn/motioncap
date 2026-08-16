@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.9.0](https://github.com/milliorn/motioncap/compare/motioncap-v0.8.0...motioncap-v0.9.0) (2026-08-16)
+
+
+### Features
+
+* **config:** refactor argument parsing and improve coverage documentation ([#29](https://github.com/milliorn/motioncap/issues/29)) ([c2664ca](https://github.com/milliorn/motioncap/commit/c2664ca88975c40609de951415544f47be99cd61))
+
 ## [0.8.0](https://github.com/milliorn/motioncap/compare/motioncap-v0.7.0...motioncap-v0.8.0) (2026-08-16)
 
 
