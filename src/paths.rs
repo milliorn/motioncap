@@ -97,6 +97,17 @@ mod tests {
     }
 
     #[test]
+    fn clip_path_errors_when_output_dir_cannot_be_created() {
+        let dir = tempdir().unwrap();
+        let blocked = dir.path().join("blocked");
+        std::fs::write(&blocked, b"not a directory").unwrap();
+
+        let err = clip_path(&blocked, fixed_time(), &["person"]).unwrap_err();
+
+        assert!(err.to_string().contains("failed to create output directory"));
+    }
+
+    #[test]
     fn sidecar_path_swaps_extension_only() {
         let clip = Path::new("/recordings/2026-03-05/2026-03-05_13-45-30_person.mp4");
         let sidecar = sidecar_path(clip);
