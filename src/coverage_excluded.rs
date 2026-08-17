@@ -81,6 +81,14 @@ const PREVIEW_FRAME_RATE: u32 = 30;
 /// Poll interval derived from `PREVIEW_FRAME_RATE`.
 const PREVIEW_POLL_INTERVAL: Duration = Duration::from_millis(1000 / PREVIEW_FRAME_RATE as u64);
 
+/// Minimum gap between consecutive `try_start_recording` failure logs. A
+/// persistent failure (e.g. an unwritable output directory) can otherwise be
+/// re-hit on every confirmed detection while no recording is active, filling
+/// the log with duplicate errors; this rate-limits logging without
+/// suppressing the loop itself, since the underlying condition may clear
+/// (e.g. disk space freed up) and should be reported again once it does.
+const START_RECORDING_ERROR_LOG_INTERVAL: Duration = Duration::from_secs(30);
+
 /// Initializes logging to write every line to both `<output_dir>/motioncap.log`
 /// and stderr (see `TeeWriter`), honoring `RUST_LOG` exactly as a bare
 /// `env_logger::init()` would otherwise. `output_dir` is created if it
@@ -272,6 +280,11 @@ fn run_detection_loop(
     // state across that boundary would let a stale pre-recording sighting
     // spuriously confirm a hit against an event it had nothing to do with.
     let mut active_pending_confirmation: Option<PendingConfirmation> = None;
+    // When a `try_start_recording` failure was last logged, so a persistent
+    // failure (e.g. an unwritable output directory) doesn't spam the log on
+    // every confirmed detection while no recording is active (see
+    // `START_RECORDING_ERROR_LOG_INTERVAL`).
+    let mut last_start_recording_error_logged: Option<std::time::Instant> = None;
 
     loop {
         if shutdown.load(Ordering::SeqCst) {
@@ -300,7 +313,7 @@ fn run_detection_loop(
         // and must keep expiring regardless of whether fresh frames are arriving.
         if !frame_is_live {
             let guard = active_event.lock().expect("active event lock poisoned");
-            
+
             if let Err(err) = close_event_if_done(guard, post_buffer) {
                 log::error!("failed to close recording event: {err:?}");
             }
@@ -354,7 +367,13 @@ fn run_detection_loop(
             &mut pending_confirmation,
             reconnected_at,
         ) {
-            log::error!("failed to start recording: {err:?}");
+            let should_log = last_start_recording_error_logged
+                .is_none_or(|at| at.elapsed() >= START_RECORDING_ERROR_LOG_INTERVAL);
+
+            if should_log {
+                log::error!("failed to start recording: {err:?}");
+                last_start_recording_error_logged = Some(std::time::Instant::now());
+            }
         }
     }
 }
