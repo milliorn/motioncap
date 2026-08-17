@@ -300,6 +300,7 @@ fn run_detection_loop(
         // and must keep expiring regardless of whether fresh frames are arriving.
         if !frame_is_live {
             let guard = active_event.lock().expect("active event lock poisoned");
+            
             if let Err(err) = close_event_if_done(guard, post_buffer) {
                 log::error!("failed to close recording event: {err:?}");
             }
