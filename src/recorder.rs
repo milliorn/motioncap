@@ -978,6 +978,46 @@ mod tests {
         }
     }
 
+    /// Starts a `RecordingEvent` with the field values shared by most tests
+    /// in this module (2x2 frames, 5fps, 8kHz mono audio), overriding only
+    /// the fields a given test needs to vary.
+    fn start_event(
+        dir: &std::path::Path,
+        final_clip_path: std::path::PathBuf,
+        started_at: DateTime<Local>,
+        clip_timeline_start: Instant,
+        width: u32,
+        height: u32,
+        audio_sample_rate: u32,
+    ) -> Result<RecordingEvent> {
+        RecordingEvent::start(RecordingEventParams {
+            final_clip_path,
+            output_dir: dir.to_path_buf(),
+            started_at,
+            width,
+            height,
+            frame_rate: 5,
+            audio_sample_rate,
+            audio_channels: 1,
+            clip_timeline_start,
+        })
+    }
+
+    /// Seeds `event` with a single even-sized frame and a small audio chunk,
+    /// both timestamped at `clip_timeline_start`. Used by tests that only
+    /// need *some* pre-buffer content written, not its exact size or timing.
+    fn seed_one_frame(event: &mut RecordingEvent, clip_timeline_start: Instant) {
+        event
+            .seed(
+                &[even_sized_frame_at(clip_timeline_start)],
+                &[TimestampedAudio {
+                    timestamp: clip_timeline_start,
+                    samples: vec![0.0; 100],
+                }],
+            )
+            .unwrap();
+    }
+
     #[test]
     fn recording_event_round_trip_produces_valid_mp4_and_sidecar() {
         let dir = tempfile::tempdir().unwrap();
@@ -1054,28 +1094,18 @@ mod tests {
 
         let initial_path = clip_path(dir.path(), started_at, &[]).unwrap();
 
-        let mut event = RecordingEvent::start(RecordingEventParams {
-            final_clip_path: initial_path,
-            output_dir: dir.path().to_path_buf(),
+        let mut event = start_event(
+            dir.path(),
+            initial_path,
             started_at,
-            width: 2,
-            height: 2,
-            frame_rate: 5,
-            audio_sample_rate: 8000,
-            audio_channels: 1,
             clip_timeline_start,
-        })
+            2,
+            2,
+            8000,
+        )
         .unwrap();
 
-        event
-            .seed(
-                &[even_sized_frame_at(clip_timeline_start)],
-                &[TimestampedAudio {
-                    timestamp: clip_timeline_start,
-                    samples: vec![0.0; 100],
-                }],
-            )
-            .unwrap();
+        seed_one_frame(&mut event, clip_timeline_start);
 
         // At 5fps, seed() sets next_frame_due to clip_timeline_start + 200ms;
         // sleeping past that before pushing ensures the newly-buffered frame
@@ -1100,5 +1130,129 @@ mod tests {
         assert!(!event.camera_stalled());
 
         event.finish().unwrap();
+    }
+
+    #[test]
+    fn start_errors_when_audio_temp_file_cannot_be_created() {
+        let dir = tempfile::tempdir().unwrap();
+        let started_at = chrono::Local::now();
+
+        // A final_clip_path under a nonexistent subdirectory makes the audio
+        // temp file's std::fs::File::create fail (no such directory), while
+        // spawn_video_encoder itself doesn't touch the filesystem until
+        // ffmpeg actually writes, so this exercises the audio-file error arm
+        // specifically rather than the video spawn.
+        let missing_subdir = dir.path().join("does-not-exist");
+        let final_clip_path = missing_subdir.join("clip.mp4");
+
+        let err = start_event(
+            dir.path(),
+            final_clip_path,
+            started_at,
+            Instant::now(),
+            2,
+            2,
+            8000,
+        )
+        .err()
+        .unwrap();
+
+        assert!(err.to_string().contains("failed to create temp audio file"));
+    }
+
+    #[test]
+    fn finish_errors_when_video_encoder_exits_nonzero() {
+        let dir = tempfile::tempdir().unwrap();
+        let clip_timeline_start = Instant::now();
+        let started_at = chrono::Local::now();
+        let initial_path = clip_path(dir.path(), started_at, &[]).unwrap();
+
+        // width/height of 0 makes ffmpeg reject "-video_size 0x0" and exit
+        // nonzero immediately, without needing any frames written to stdin.
+        let event = start_event(
+            dir.path(),
+            initial_path,
+            started_at,
+            clip_timeline_start,
+            0,
+            0,
+            8000,
+        )
+        .unwrap();
+
+        let err = event.finish().unwrap_err();
+
+        assert!(err.to_string().contains("ffmpeg video encoder exited with"));
+    }
+
+    #[test]
+    fn finish_errors_when_audio_mux_fails() {
+        let dir = tempfile::tempdir().unwrap();
+        let clip_timeline_start = Instant::now();
+        let started_at = chrono::Local::now();
+        let initial_path = clip_path(dir.path(), started_at, &[]).unwrap();
+
+        // A sample rate of 0 makes ffmpeg's mux step (-ar 0) reject the raw
+        // PCM input and exit nonzero. finish() closes stdin and waits on the
+        // video encoder regardless of whether any frame was ever written, so
+        // no seed() call is needed to reach the mux step this targets.
+        let event = start_event(
+            dir.path(),
+            initial_path,
+            started_at,
+            clip_timeline_start,
+            2,
+            2,
+            0,
+        )
+        .unwrap();
+
+        let err = event.finish().unwrap_err();
+
+        assert!(err.to_string().contains("ffmpeg audio mux exited with"));
+    }
+
+    #[test]
+    fn finish_errors_when_rename_target_already_exists_as_a_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let clip_timeline_start = Instant::now();
+        let started_at = chrono::Local::now();
+        let initial_path = clip_path(dir.path(), started_at, &[]).unwrap();
+
+        // finish() recomputes the final path from the accumulated class list
+        // via clip_path() and renames into it. Pre-creating a directory at
+        // that exact target path makes the rename fail (can't rename a file
+        // onto an existing directory) without touching filesystem permissions.
+        let renamed_path = clip_path(dir.path(), started_at, &["person"]).unwrap();
+        std::fs::create_dir_all(&renamed_path).unwrap();
+
+        let mut event = start_event(
+            dir.path(),
+            initial_path,
+            started_at,
+            clip_timeline_start,
+            2,
+            2,
+            8000,
+        )
+        .unwrap();
+
+        // Unlike finish_errors_when_audio_mux_fails' -ar 0 (which fails
+        // fast), this test uses a valid sample rate so finish() actually
+        // runs the full mux before reaching the rename step under test.
+        // Muxing an empty audio stream against a video stream whose
+        // duration ffmpeg can't determine makes the apad filter pad
+        // indefinitely instead of erroring, hanging rather than completing,
+        // so a real frame/audio chunk must be seeded first.
+        seed_one_frame(&mut event, clip_timeline_start);
+
+        event.record_detection("person", 0.9, clip_timeline_start);
+
+        let err = event.finish().unwrap_err();
+
+        assert!(
+            err.to_string().contains("failed to rename clip"),
+            "unexpected error: {err}"
+        );
     }
 }
