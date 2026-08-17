@@ -25,6 +25,9 @@ mod paths;
 mod preview;
 /// Recording lifecycle and ffmpeg-backed encoding.
 mod recorder;
+/// The handful of `recorder` expressions that cannot be unit-tested (see
+/// that module's doc comment).
+mod recorder_coverage_excluded;
 /// Startup dependency checks.
 mod startup;
 /// YOLO-detection-to-trigger evaluation.

@@ -1,14 +1,13 @@
 use std::collections::BTreeSet;
 use std::io::Write;
-use std::process::{Child, Command, Stdio};
+use std::process::Child;
 use std::time::{Duration, Instant};
 
-use anyhow::{Context, Result, bail};
+use anyhow::{Context, Result};
 use chrono::{DateTime, Local};
 use serde::Serialize;
 
 use crate::buffer::{TimestampedAudio, TimestampedFrame};
-use crate::paths::{clip_path, sidecar_path};
 
 /// How long the camera may go without delivering a real frame before
 /// `camera_stalled` reports true. Must be well above ordinary jitter between
@@ -91,7 +90,7 @@ pub struct RecordingEventParams {
 /// everything about a clip's lifecycle *except* the actual I/O handles
 /// (`RecordingEvent`'s `ffmpeg_video`/`audio_file`/temp-file paths), which
 /// `RecordingEvent` still owns and drives through this struct's methods.
-struct ClipState {
+pub struct ClipState {
     /// Configured video frame rate for this clip.
     frame_rate: u32,
     /// Capture timestamp of the clip's first frame (the start of the
@@ -124,7 +123,7 @@ struct ClipState {
 
 impl ClipState {
     /// Starts fresh bookkeeping for a clip beginning now, with playback at `frame_rate`.
-    fn new(frame_rate: u32, clip_timeline_start: Instant) -> Self {
+    pub fn new(frame_rate: u32, clip_timeline_start: Instant) -> Self {
         let now = Instant::now();
         Self {
             frame_rate,
@@ -252,6 +251,20 @@ impl ClipState {
     fn quiet_for(&self) -> Duration {
         self.last_trigger_at.elapsed()
     }
+
+    /// Consumes this state, handing ownership of the accumulated class list
+    /// and sidecar records to the caller. Used by
+    /// `recorder_coverage_excluded`'s `RecordingEvent::finish` to build the
+    /// final filename's class list and the `Sidecar` written alongside it.
+    pub fn into_parts(
+        self,
+    ) -> (
+        BTreeSet<&'static str>,
+        Vec<DetectionRecord>,
+        Vec<MotionEvent>,
+    ) {
+        (self.all_classes, self.detections, self.motion_events)
+    }
 }
 
 /// Manages the lifecycle of a single recorded clip: seeds the file with the
@@ -264,100 +277,32 @@ impl ClipState {
 /// are streamed live via ffmpeg's stdin as they arrive.
 pub struct RecordingEvent {
     /// The running ffmpeg process encoding video, fed live via its stdin.
-    ffmpeg_video: Child,
+    pub ffmpeg_video: Child,
     /// Path to the temporary raw PCM file audio is buffered into.
-    audio_tmp_path: std::path::PathBuf,
+    pub audio_tmp_path: std::path::PathBuf,
     /// Open handle to `audio_tmp_path`, written to as audio arrives.
-    audio_file: std::fs::File,
+    pub audio_file: std::fs::File,
     /// Where the finished, muxed clip is written on `finish`, before any
     /// class-list rename (see `all_classes`).
-    final_clip_path: std::path::PathBuf,
+    pub final_clip_path: std::path::PathBuf,
     /// Directory recordings are written under, needed to recompute
     /// `final_clip_path` at `finish` if `all_classes` grew since `start`.
-    output_dir: std::path::PathBuf,
+    pub output_dir: std::path::PathBuf,
     /// Wall-clock time the clip started, needed (alongside `output_dir`) to
     /// recompute `final_clip_path` at `finish` via the same `clip_path`
     /// naming convention it was originally built with.
-    started_at: DateTime<Local>,
+    pub started_at: DateTime<Local>,
     /// Path to the temporary video-only file ffmpeg encodes into.
-    video_tmp_path: std::path::PathBuf,
+    pub video_tmp_path: std::path::PathBuf,
     /// Sample rate of the buffered audio, needed to mux correctly.
-    audio_sample_rate: u32,
+    pub audio_sample_rate: u32,
     /// Channel count of the buffered audio, needed to mux correctly.
-    audio_channels: u16,
+    pub audio_channels: u16,
     /// Pure timing/bookkeeping state for this clip (see `ClipState`).
-    state: ClipState,
+    pub state: ClipState,
 }
 
 impl RecordingEvent {
-    /// Starts a new event: launches the video-encoding ffmpeg process and
-    /// creates the temp audio file. `final_clip_path` should already reflect
-    /// the trigger's classes/timestamp per the output layout convention
-    /// (ADR 4); this module only performs the actual encoding/muxing, not
-    /// path naming.
-    ///
-    /// `audio_sample_rate`/`audio_channels` must match whatever format the
-    /// caller's audio samples were captured/converted to (see
-    /// `capture::audio::AudioStreamInfo`), since the mux step needs the real
-    /// values to interpret the buffered PCM correctly.
-    ///
-    /// Deliberately does *not* write the pre-buffer here. See `seed`.
-    /// Writing dozens of frames synchronously on the caller's thread would
-    /// block it for long enough that real wall-clock time passes with
-    /// nothing being recorded, which shows up as a skip/jump right at the
-    /// start of the clip once live writing resumes. Callers should invoke
-    /// `seed` from whatever thread is responsible for steady-paced frame
-    /// writing instead.
-    ///
-    /// `clip_timeline_start` should be the capture timestamp of the earliest
-    /// pre-buffer frame that will be seeded into this clip (i.e. the actual
-    /// start of the video file), not the trigger instant. It's the zero
-    /// point `DetectionRecord::offset_secs` is measured from, so detections
-    /// recorded against footage that predates the trigger (the pre-buffer
-    /// window) get correct nonzero offsets instead of all reading ~0.
-    ///
-    /// `output_dir`/`started_at` must be the same values `final_clip_path`
-    /// was originally built from via `clip_path`, so `finish` can recompute
-    /// the filename with the full class list accumulated over the clip's
-    /// lifetime (ADR 4) and rename to it if it grew since `start`.
-    pub fn start(params: RecordingEventParams) -> Result<Self> {
-        let RecordingEventParams {
-            final_clip_path,
-            output_dir,
-            started_at,
-            width,
-            height,
-            frame_rate,
-            audio_sample_rate,
-            audio_channels,
-            clip_timeline_start,
-        } = params;
-
-        let video_tmp_path = final_clip_path.with_extension("video.tmp.mp4");
-        let audio_tmp_path = final_clip_path.with_extension("audio.tmp.pcm");
-
-        let ffmpeg_video = spawn_video_encoder(&video_tmp_path, width, height, frame_rate)?;
-        let audio_file = std::fs::File::create(&audio_tmp_path).with_context(|| {
-            format!(
-                "failed to create temp audio file {}",
-                audio_tmp_path.display()
-            )
-        })?;
-
-        Ok(Self {
-            ffmpeg_video,
-            audio_tmp_path,
-            audio_file,
-            final_clip_path,
-            output_dir,
-            started_at,
-            video_tmp_path,
-            audio_sample_rate,
-            audio_channels,
-            state: ClipState::new(frame_rate, clip_timeline_start),
-        })
-    }
-
     /// Writes the pre-event buffer (frames captured before the trigger
     /// fired) into a freshly-started event. Must be called once, as the
     /// first write against a new event, before any live `write_frame`/
@@ -541,157 +486,6 @@ impl RecordingEvent {
     pub fn quiet_for(&self) -> Duration {
         self.state.quiet_for()
     }
-
-    /// Stops encoding, muxes the buffered audio into the video, and writes
-    /// the JSON sidecar alongside the final clip.
-    pub fn finish(mut self) -> Result<()> {
-        drop(self.ffmpeg_video.stdin.take());
-
-        let mut stderr = String::new();
-
-        if let Some(mut stderr_pipe) = self.ffmpeg_video.stderr.take() {
-            let _ = std::io::Read::read_to_string(&mut stderr_pipe, &mut stderr);
-        }
-
-        let status = self
-            .ffmpeg_video
-            .wait()
-            .context("ffmpeg video encoder failed")?;
-
-        if !status.success() {
-            bail!(
-                "ffmpeg video encoder exited with {status}: {}",
-                stderr.trim()
-            );
-        }
-
-        drop(self.audio_file);
-
-        mux_audio_into_video(
-            &self.video_tmp_path,
-            &self.audio_tmp_path,
-            &self.final_clip_path,
-            self.audio_sample_rate,
-            self.audio_channels,
-        )?;
-
-        let _ = std::fs::remove_file(&self.video_tmp_path);
-        let _ = std::fs::remove_file(&self.audio_tmp_path);
-
-        let all_classes: Vec<&str> = self.state.all_classes.iter().copied().collect();
-        let renamed_path = clip_path(&self.output_dir, self.started_at, &all_classes)?;
-
-        if renamed_path != self.final_clip_path {
-            std::fs::rename(&self.final_clip_path, &renamed_path).with_context(|| {
-                format!(
-                    "failed to rename clip {} to {} (reflecting every class detected during the clip, per ADR 4)",
-                    self.final_clip_path.display(),
-                    renamed_path.display()
-                )
-            })?;
-            self.final_clip_path = renamed_path;
-        }
-
-        let sidecar = Sidecar {
-            detections: self.state.detections,
-            motion_events: self.state.motion_events,
-        };
-
-        let sidecar_json =
-            serde_json::to_string_pretty(&sidecar).context("failed to serialize sidecar")?;
-
-        std::fs::write(sidecar_path(&self.final_clip_path), sidecar_json)
-            .context("failed to write sidecar file")?;
-
-        Ok(())
-    }
-}
-
-/// Spawns ffmpeg to encode raw RGB frames fed via stdin into an H.264 file.
-fn spawn_video_encoder(
-    path: &std::path::Path,
-    width: u32,
-    height: u32,
-    frame_rate: u32,
-) -> Result<Child> {
-    #[cfg(unix)]
-    use std::os::unix::process::CommandExt;
-
-    let mut command = Command::new("ffmpeg");
-
-    command
-        .args(["-y", "-loglevel", "error"])
-        .args(["-f", "rawvideo", "-pixel_format", "rgb24"])
-        .args(["-video_size", &format!("{width}x{height}")])
-        .args(["-framerate", &frame_rate.to_string()])
-        .args(["-i", "-"])
-        .args(["-c:v", "libx264", "-pix_fmt", "yuv420p"])
-        .arg(path)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::null())
-        .stderr(Stdio::piped());
-
-    // Put ffmpeg in its own process group so a terminal SIGINT (Ctrl+C)
-    // doesn't reach it directly. It shares the foreground process group
-    // with motioncap by default, so without this, Ctrl+C kills ffmpeg at
-    // the same instant as motioncap's own ctrlc handler tries to close it
-    // gracefully (closing stdin, then waiting), racing ffmpeg's own SIGINT
-    // handling and producing a nonzero exit even when the output file is
-    // actually complete and valid. Graceful shutdown should be the only
-    // thing that ever tells ffmpeg to stop.
-    #[cfg(unix)]
-    command.process_group(0);
-
-    command
-        .spawn()
-        .context("failed to spawn ffmpeg video encoder")
-}
-
-/// Muxes the buffered raw audio into the encoded video. `-shortest` is
-/// deliberately not used: with independently-accumulated video/audio streams,
-/// whichever stream is shorter due to minor drift would otherwise have the
-/// *other* stream silently truncated to match, losing recorded content.
-/// Instead, the audio stream is padded with silence (`apad`) to at least the
-/// video's duration and `-shortest` is applied only to that padded output, so
-/// the result is exactly the video's length with no dropped video frames.
-fn mux_audio_into_video(
-    video_path: &std::path::Path,
-    audio_path: &std::path::Path,
-    output_path: &std::path::Path,
-    sample_rate: u32,
-    channels: u16,
-) -> Result<()> {
-    let output = Command::new("ffmpeg")
-        .args(["-y", "-i"])
-        .arg(video_path)
-        .args([
-            "-f",
-            "f32le",
-            "-ar",
-            &sample_rate.to_string(),
-            "-ac",
-            &channels.to_string(),
-        ])
-        .arg("-i")
-        .arg(audio_path)
-        .args(["-c:v", "copy", "-af", "apad", "-c:a", "aac", "-shortest"])
-        .arg(output_path)
-        .stdout(Stdio::null())
-        .stderr(Stdio::piped())
-        .output()
-        .context("failed to spawn ffmpeg for audio muxing")?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-
-        bail!(
-            "ffmpeg audio mux exited with {}: {}",
-            output.status,
-            stderr.trim()
-        );
-    }
-
-    Ok(())
 }
 
 /// Downsamples timestamped frames to approximately `frame_rate` frames per
@@ -745,7 +539,10 @@ mod tests {
                    durations are small hardcoded constants, so underflow is not reachable"
     )]
 
+    use std::process::Command;
+
     use super::*;
+    use crate::paths::{clip_path, sidecar_path};
 
     fn frame_at(timestamp: Instant) -> TimestampedFrame {
         TimestampedFrame {
@@ -960,11 +757,10 @@ mod tests {
             .arg(path)
             .output()
             .expect("failed to spawn ffprobe");
-        assert!(
-            output.status.success(),
-            "ffprobe failed: {}",
-            String::from_utf8_lossy(&output.stderr)
-        );
+        // Built unconditionally (not passed as a lazy assert! message arg) so
+        // this line is exercised on every run, not just an ffprobe failure.
+        let stderr = String::from_utf8_lossy(&output.stderr).into_owned();
+        assert!(output.status.success(), "ffprobe failed: {stderr}");
         serde_json::from_slice(&output.stdout).expect("ffprobe produced invalid JSON")
     }
 
@@ -1062,10 +858,12 @@ mod tests {
 
         event.finish().unwrap();
 
+        // Built unconditionally (not passed as a lazy assert! message arg) so
+        // this line is exercised on every run, not just a missing-file failure.
+        let expected_final_path_display = expected_final_path.display().to_string();
         assert!(
             expected_final_path.exists(),
-            "expected clip at {}",
-            expected_final_path.display()
+            "expected clip at {expected_final_path_display}"
         );
 
         let sidecar_json = std::fs::read_to_string(sidecar_path(&expected_final_path)).unwrap();
@@ -1253,6 +1051,373 @@ mod tests {
         assert!(
             err.to_string().contains("failed to rename clip"),
             "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn write_frame_errors_when_stdin_already_closed() {
+        let dir = tempfile::tempdir().unwrap();
+        let clip_timeline_start = Instant::now();
+        let started_at = chrono::Local::now();
+        let initial_path = clip_path(dir.path(), started_at, &[]).unwrap();
+
+        let mut event = start_event(
+            dir.path(),
+            initial_path,
+            started_at,
+            clip_timeline_start,
+            2,
+            2,
+            8000,
+        )
+        .unwrap();
+
+        // Taking stdin out from under the event (rather than anything ffmpeg
+        // does) is what write_frame's own "already closed" arm guards
+        // against; drop it here to force that arm directly.
+        drop(event.ffmpeg_video.stdin.take());
+
+        let err = event.write_frame(&image::RgbImage::new(2, 2)).unwrap_err();
+        assert!(err.to_string().contains("ffmpeg stdin was already closed"));
+
+        // ffmpeg_video is still a live child with no stdin ever supplied a
+        // frame; wait it out directly instead of calling finish() (which
+        // would try to write to the now-closed stdin again via its own
+        // drop(stdin.take())/wait() sequence, which is fine, but the process
+        // never received "-video_size" data and this test only cares about
+        // the write_frame error path above).
+        let _ = event.ffmpeg_video.wait();
+    }
+
+    #[test]
+    fn seed_errors_when_stdin_already_closed() {
+        let dir = tempfile::tempdir().unwrap();
+        let clip_timeline_start = Instant::now();
+        let started_at = chrono::Local::now();
+        let initial_path = clip_path(dir.path(), started_at, &[]).unwrap();
+
+        let mut event = start_event(
+            dir.path(),
+            initial_path,
+            started_at,
+            clip_timeline_start,
+            2,
+            2,
+            8000,
+        )
+        .unwrap();
+
+        drop(event.ffmpeg_video.stdin.take());
+
+        let err = event
+            .seed(&[even_sized_frame_at(clip_timeline_start)], &[])
+            .unwrap_err();
+        assert!(err.to_string().contains("ffmpeg stdin was already closed"));
+
+        let _ = event.ffmpeg_video.wait();
+    }
+
+    #[test]
+    fn drain_frames_errors_when_stdin_already_closed() {
+        let dir = tempfile::tempdir().unwrap();
+        let clip_timeline_start = Instant::now();
+        let started_at = chrono::Local::now();
+        let initial_path = clip_path(dir.path(), started_at, &[]).unwrap();
+
+        let mut event = start_event(
+            dir.path(),
+            initial_path,
+            started_at,
+            clip_timeline_start,
+            2,
+            2,
+            8000,
+        )
+        .unwrap();
+
+        seed_one_frame(&mut event, clip_timeline_start);
+        std::thread::sleep(Duration::from_millis(250));
+
+        let ring_buffer =
+            std::sync::Mutex::new(crate::buffer::RingBuffer::new(Duration::from_secs(30)));
+        {
+            let mut buf = ring_buffer.lock().unwrap();
+            buf.push_frame(image::RgbImage::new(2, 2));
+        }
+
+        drop(event.ffmpeg_video.stdin.take());
+
+        let err = event.drain_frames(&ring_buffer).unwrap_err();
+        assert!(err.to_string().contains("ffmpeg stdin was already closed"));
+
+        let _ = event.ffmpeg_video.wait();
+    }
+
+    #[test]
+    fn write_frame_errors_when_ffmpeg_process_has_exited() {
+        let dir = tempfile::tempdir().unwrap();
+        let clip_timeline_start = Instant::now();
+        let started_at = chrono::Local::now();
+        let initial_path = clip_path(dir.path(), started_at, &[]).unwrap();
+
+        let mut event = start_event(
+            dir.path(),
+            initial_path,
+            started_at,
+            clip_timeline_start,
+            2,
+            2,
+            8000,
+        )
+        .unwrap();
+
+        // Kill the encoder out from under the event so its stdin pipe becomes
+        // a broken pipe (the process is gone, but the Stdio::piped() handle
+        // itself is still Some), reaching write_all's failure arm rather than
+        // write_frame's own "stdin already closed" precondition check.
+        // Deliberately never call Child::wait()/try_wait() here: std's wait()
+        // takes self.stdin itself (to avoid a deadlock where the child blocks
+        // writing to a full stdout/stderr pipe while the parent blocks in
+        // wait() before draining it), which would trip the "already closed"
+        // arm instead of the one this test targets.
+        event.ffmpeg_video.kill().unwrap();
+
+        let mut result = event.write_frame(&image::RgbImage::new(2, 2));
+        // A single write can land in the pipe buffer before the kernel
+        // notices the reader is gone; retry briefly until the broken pipe is
+        // actually observed rather than asserting on a racy first attempt.
+        for _ in 0..200 {
+            if result.is_err() {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(10));
+            result = event.write_frame(&image::RgbImage::new(2, 2));
+        }
+
+        let err = result.unwrap_err();
+        assert!(
+            err.to_string().contains("failed to write frame to ffmpeg"),
+            "unexpected error: {err}"
+        );
+
+        // Reap the killed child directly (bypassing RecordingEvent::finish,
+        // which would try to write the sidecar/mux against a process this
+        // test intentionally never fed valid frames to).
+        let _ = event.ffmpeg_video.wait();
+    }
+
+    #[test]
+    fn write_audio_errors_when_audio_file_is_not_writable() {
+        let dir = tempfile::tempdir().unwrap();
+        let clip_timeline_start = Instant::now();
+        let started_at = chrono::Local::now();
+        let initial_path = clip_path(dir.path(), started_at, &[]).unwrap();
+
+        let mut event = start_event(
+            dir.path(),
+            initial_path,
+            started_at,
+            clip_timeline_start,
+            2,
+            2,
+            8000,
+        )
+        .unwrap();
+
+        // Swap in a read-only handle to the same temp file so write_all
+        // itself fails (EBADF) rather than anything about the path/directory
+        // being wrong; audio_tmp_path is private to this module, reachable
+        // here as a same-module test.
+        event.audio_file = std::fs::File::open(&event.audio_tmp_path).unwrap();
+
+        let err = event.write_audio(&[0.0; 10]).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("failed to write audio samples to temp file"),
+            "unexpected error: {err}"
+        );
+
+        drop(event.ffmpeg_video.stdin.take());
+        let _ = event.ffmpeg_video.wait();
+    }
+
+    #[test]
+    fn seed_errors_when_audio_file_is_not_writable() {
+        let dir = tempfile::tempdir().unwrap();
+        let clip_timeline_start = Instant::now();
+        let started_at = chrono::Local::now();
+        let initial_path = clip_path(dir.path(), started_at, &[]).unwrap();
+
+        let mut event = start_event(
+            dir.path(),
+            initial_path,
+            started_at,
+            clip_timeline_start,
+            2,
+            2,
+            8000,
+        )
+        .unwrap();
+
+        event.audio_file = std::fs::File::open(&event.audio_tmp_path).unwrap();
+
+        let err = event
+            .seed(
+                &[],
+                &[TimestampedAudio {
+                    timestamp: clip_timeline_start,
+                    samples: vec![0.0; 10],
+                }],
+            )
+            .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("failed to write audio samples to temp file"),
+            "unexpected error: {err}"
+        );
+
+        drop(event.ffmpeg_video.stdin.take());
+        let _ = event.ffmpeg_video.wait();
+    }
+
+    #[test]
+    fn drain_audio_errors_when_audio_file_is_not_writable() {
+        let dir = tempfile::tempdir().unwrap();
+        let clip_timeline_start = Instant::now();
+        let started_at = chrono::Local::now();
+        let initial_path = clip_path(dir.path(), started_at, &[]).unwrap();
+
+        let mut event = start_event(
+            dir.path(),
+            initial_path,
+            started_at,
+            clip_timeline_start,
+            2,
+            2,
+            8000,
+        )
+        .unwrap();
+
+        seed_one_frame(&mut event, clip_timeline_start);
+
+        let ring_buffer =
+            std::sync::Mutex::new(crate::buffer::RingBuffer::new(Duration::from_secs(30)));
+        {
+            let mut buf = ring_buffer.lock().unwrap();
+            buf.push_audio(vec![0.5; 100]);
+        }
+
+        event.audio_file = std::fs::File::open(&event.audio_tmp_path).unwrap();
+
+        let err = event.drain_audio(&ring_buffer).unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("failed to write audio samples to temp file"),
+            "unexpected error: {err}"
+        );
+
+        drop(event.ffmpeg_video.stdin.take());
+        let _ = event.ffmpeg_video.wait();
+    }
+
+    #[test]
+    fn finish_skips_stderr_capture_when_already_taken() {
+        let dir = tempfile::tempdir().unwrap();
+        let clip_timeline_start = Instant::now();
+        let started_at = chrono::Local::now();
+        let initial_path = clip_path(dir.path(), started_at, &[]).unwrap();
+
+        let mut event = start_event(
+            dir.path(),
+            initial_path,
+            started_at,
+            clip_timeline_start,
+            2,
+            2,
+            8000,
+        )
+        .unwrap();
+
+        seed_one_frame(&mut event, clip_timeline_start);
+        event.record_detection("person", 0.9, clip_timeline_start);
+
+        // finish()'s `if let Some(stderr_pipe) = self.ffmpeg_video.stderr.take()`
+        // only has stderr to capture the first time it runs; pre-taking it
+        // here exercises the None arm (nothing to read, stderr stays empty)
+        // instead of the Some arm every other finish()-calling test already
+        // covers.
+        drop(event.ffmpeg_video.stderr.take());
+
+        event.finish().unwrap();
+    }
+
+    #[test]
+    fn finish_errors_when_sidecar_path_already_exists_as_a_directory() {
+        let dir = tempfile::tempdir().unwrap();
+        let clip_timeline_start = Instant::now();
+        let started_at = chrono::Local::now();
+        let initial_path = clip_path(dir.path(), started_at, &[]).unwrap();
+
+        // No class is ever recorded, so finish() recomputes the same path
+        // clip_path(..., &[]) already resolves to (no rename needed) and
+        // proceeds straight to the sidecar write this test targets.
+        let sidecar_target = sidecar_path(&initial_path);
+        std::fs::create_dir_all(&sidecar_target).unwrap();
+
+        let mut event = start_event(
+            dir.path(),
+            initial_path,
+            started_at,
+            clip_timeline_start,
+            2,
+            2,
+            8000,
+        )
+        .unwrap();
+
+        seed_one_frame(&mut event, clip_timeline_start);
+
+        let err = event.finish().unwrap_err();
+        assert!(
+            err.to_string().contains("failed to write sidecar file"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn finish_errors_when_output_dir_cannot_be_created_for_rename() {
+        let dir = tempfile::tempdir().unwrap();
+        let clip_timeline_start = Instant::now();
+        let started_at = chrono::Local::now();
+        let initial_path = clip_path(dir.path(), started_at, &[]).unwrap();
+
+        let mut event = start_event(
+            dir.path(),
+            initial_path,
+            started_at,
+            clip_timeline_start,
+            2,
+            2,
+            8000,
+        )
+        .unwrap();
+
+        seed_one_frame(&mut event, clip_timeline_start);
+        event.record_detection("person", 0.9, clip_timeline_start);
+
+        // finish() recomputes the final path via clip_path(&self.output_dir,
+        // ...), which create_dir_all()s the day directory under output_dir.
+        // Replacing output_dir with a path that is itself a plain file (not
+        // a directory) makes that create_dir_all fail, reaching clip_path's
+        // own '?' inside finish() rather than the later rename/write steps.
+        let blocked_output_dir = dir.path().join("blocked");
+        std::fs::write(&blocked_output_dir, b"not a directory").unwrap();
+        event.output_dir = blocked_output_dir;
+
+        let err = event.finish().unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("failed to create output directory")
         );
     }
 }

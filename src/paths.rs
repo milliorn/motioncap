@@ -104,7 +104,10 @@ mod tests {
 
         let err = clip_path(&blocked, fixed_time(), &["person"]).unwrap_err();
 
-        assert!(err.to_string().contains("failed to create output directory"));
+        assert!(
+            err.to_string()
+                .contains("failed to create output directory")
+        );
     }
 
     #[test]
