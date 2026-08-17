@@ -300,7 +300,9 @@ fn run_detection_loop(
         // and must keep expiring regardless of whether fresh frames are arriving.
         if !frame_is_live {
             let guard = active_event.lock().expect("active event lock poisoned");
-            close_event_if_done(guard, post_buffer)?;
+            if let Err(err) = close_event_if_done(guard, post_buffer) {
+                log::error!("failed to close recording event: {err:?}");
+            }
 
             if maybe_reconnect_camera(
                 last_frame_seen.as_ref(),
@@ -322,7 +324,7 @@ fn run_detection_loop(
             .is_some();
 
         if has_active_event {
-            evaluate_active_event(
+            if let Err(err) = evaluate_active_event(
                 &config,
                 &mut motion_gate,
                 &mut detector,
@@ -331,13 +333,15 @@ fn run_detection_loop(
                 frame_timestamp,
                 post_buffer,
                 &mut active_pending_confirmation,
-            )?;
+            ) {
+                log::error!("failed to evaluate active recording event: {err:?}");
+            }
             continue;
         }
 
         active_pending_confirmation = None;
 
-        try_start_recording(
+        if let Err(err) = try_start_recording(
             &config,
             &mut motion_gate,
             &mut detector,
@@ -348,7 +352,9 @@ fn run_detection_loop(
             frame_timestamp,
             &mut pending_confirmation,
             reconnected_at,
-        )?;
+        ) {
+            log::error!("failed to start recording: {err:?}");
+        }
     }
 }
 
