@@ -61,7 +61,7 @@ use anyhow::{Context, Result};
 use crate::buffer::RingBuffer;
 use crate::config::Config;
 use crate::config_coverage_excluded;
-use crate::detect::Detector;
+use crate::detect_coverage_excluded::Detector;
 use crate::motion::MotionGate;
 use crate::preview::PreviewWindow;
 use crate::{
