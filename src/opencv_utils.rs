@@ -1,5 +1,7 @@
 use anyhow::{Context, Result};
 use image::RgbImage;
+// `Mat` ("matrix") is OpenCV's own core image/array type, not a Rust or std
+// convention: https://docs.opencv.org/4.x/d3/d63/classcv_1_1Mat.html
 use opencv::core::{Mat, MatTraitConst, Vec3b};
 
 /// Converts an RGB image into an owned `OpenCV` BGR `Mat`, for use with any
@@ -13,11 +15,21 @@ pub fn rgb_image_to_bgr_mat(image: &RgbImage) -> Result<Mat> {
         .map(|p| Vec3b::from([p[2], p[1], p[0]]))
         .collect();
 
+    bgr_vec_to_mat(width, height, &bgr)
+}
+
+/// Builds an owned `Mat` from a flat row-major BGR pixel buffer. Split out of
+/// `rgb_image_to_bgr_mat` so the `rows*cols` mismatch that
+/// `Mat::new_rows_cols_with_data` rejects, never reachable through the
+/// `RgbImage`-driven caller whose buffer length always matches its own
+/// dimensions by construction, can still be exercised directly with a
+/// deliberately mismatched buffer in a test.
+fn bgr_vec_to_mat(width: u32, height: u32, bgr: &[Vec3b]) -> Result<Mat> {
     #[allow(
         clippy::cast_possible_wrap,
         reason = "camera frame dimensions never approach i32::MAX"
     )]
-    let borrowed = Mat::new_rows_cols_with_data(height as i32, width as i32, &bgr)
+    let borrowed = Mat::new_rows_cols_with_data(height as i32, width as i32, bgr)
         .context("failed to build Mat from frame")?;
 
     borrowed.try_clone().context("failed to clone frame Mat")
@@ -67,5 +79,14 @@ mod tests {
 
         assert_eq!(mat.rows(), 3);
         assert_eq!(mat.cols(), 5);
+    }
+
+    #[test]
+    fn bgr_vec_to_mat_errors_when_buffer_length_does_not_match_dimensions() {
+        let bgr = vec![Vec3b::from([0, 0, 0]); 4];
+
+        let err = bgr_vec_to_mat(5, 3, &bgr).unwrap_err();
+
+        assert!(err.to_string().contains("failed to build Mat from frame"));
     }
 }

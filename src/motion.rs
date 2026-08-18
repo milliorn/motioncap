@@ -1,5 +1,7 @@
 use anyhow::{Context, Result};
 use image::RgbImage;
+// `Mat` ("matrix") is OpenCV's own core image/array type, not a Rust or std
+// convention: https://docs.opencv.org/4.x/d3/d63/classcv_1_1Mat.html
 use opencv::core::{Mat, MatTraitConst, ToInputArray};
 use opencv::video::{BackgroundSubtractorTrait, create_background_subtractor_mog2};
 
