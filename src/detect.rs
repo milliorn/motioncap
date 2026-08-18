@@ -315,5 +315,4 @@ mod tests {
         assert!(text.contains("context message"));
         assert!(text.contains("boom"));
     }
-
 }
