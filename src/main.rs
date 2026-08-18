@@ -15,6 +15,9 @@ mod config_coverage_excluded;
 mod coverage_excluded;
 /// YOLO object-detection inference.
 mod detect;
+/// The parts of `detect` that require a real ONNX Runtime session and model
+/// file, and cannot be unit-tested (see that module's doc comment).
+mod detect_coverage_excluded;
 /// Background-subtraction motion gate.
 mod motion;
 /// Shared `OpenCV` conversion helpers.
@@ -44,7 +47,7 @@ use anyhow::Result;
 
 use buffer::{RingBuffer, TimestampedAudio, TimestampedFrame};
 use config::Config;
-use detect::Detector;
+use detect_coverage_excluded::Detector;
 use motion::MotionGate;
 use paths::clip_path;
 use recorder::{RecordingEvent, RecordingEventParams};

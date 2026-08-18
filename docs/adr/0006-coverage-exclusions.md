@@ -172,7 +172,8 @@ express "exclude this function, not this file" on stable; the comment is what ma
 omission visible in source and in code review wherever that convention is used, even
 though the coverage tool can't enforce it at that granularity.
 
-Every `#[ignore]`'d test (there are 9, split across `detect.rs` and `main.rs`) that
+Every `#[ignore]`'d test (there are 10, split across `detect_coverage_excluded.rs` and
+`main.rs`) that
 constructs a real `Detector`/ONNX Runtime session and/or a real `MotionGate` shares one
 `detect::MODEL_TEST_LOCK` mutex, acquired for the test's full duration before doing
 anything else. This was added after directly reproducing a heap-corruption abort
