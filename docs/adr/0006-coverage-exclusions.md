@@ -45,10 +45,6 @@ stood between the codebase and 100%:
      opening a real `/dev/videoN` device. The guard itself (`should_reconnect`) is pure
      and stays in `main.rs`, unit-tested directly there.
    - `config_coverage_excluded::parse_args`: reads the real process's `std::env::args()`.
-   - `check_ffmpeg`'s "not found" branch (`startup/depcheck.rs`), only reachable if
-     `ffmpeg` is genuinely absent from `PATH` — this crate denies `unsafe_code`, and
-     `std::env::set_var` (the only way to fake `PATH` from within a test) requires
-     `unsafe` on current Rust, so this branch is not safely fakeable from a test.
    - A handful of `?`-propagated error branches (`Detector::load`/`detect`'s `ort_err`
      calls) that would require deliberately corrupting a model file: fault injection
      disproportionate to the value of covering an already-simple `bail!`/`.context()`
