@@ -50,6 +50,11 @@ jobs:
   ci:
     name: Lint and Build
     runs-on: ubuntu-latest
+    # Longest observed successful run (cold OpenCV-build cache miss) is
+    # ~9m10s; without this, GitHub's 360min default job timeout lets a
+    # wedged step (e.g. a stalled apt mirror) burn hours of runner time
+    # before anyone notices and cancels it manually.
+    timeout-minutes: 10
     # Least-privilege: only read access to the repository contents is needed.
     permissions:
       contents: read
@@ -65,7 +70,7 @@ jobs:
       # must be present even on a cache-hit run where OpenCV needs nothing.
       - name: Install runtime linkage dependencies
         run: |
-          sudo apt-get update
+          sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=15 update
           sudo apt-get install -y --no-install-recommends libasound2-dev ffmpeg
 
       # actions/cache's restore step extracts the tarball as the unprivileged runner
@@ -93,7 +98,7 @@ jobs:
       - name: Install OpenCV build dependencies
         if: steps.cache-opencv.outputs.cache-hit != 'true'
         run: |
-          sudo apt-get update
+          sudo apt-get -o Acquire::Retries=3 -o Acquire::http::Timeout=15 update
           sudo apt-get install -y --no-install-recommends \
             build-essential cmake git pkg-config \
             libgtk-3-dev libavcodec-dev libavformat-dev libswscale-dev \
