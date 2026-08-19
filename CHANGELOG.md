@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.10.0](https://github.com/milliorn/motioncap/compare/motioncap-v0.9.0...motioncap-v0.10.0) (2026-08-18)
+
+
+### Features
+
+* **opencv_utils:** add bgr_vec_to_mat function and related error handling test ([#34](https://github.com/milliorn/motioncap/issues/34)) ([7732d0b](https://github.com/milliorn/motioncap/commit/7732d0b111d2162d122077de7a0ff035ef9b76c8))
+
 ## [0.9.0](https://github.com/milliorn/motioncap/compare/motioncap-v0.8.0...motioncap-v0.9.0) (2026-08-16)
 
 
