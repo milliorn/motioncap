@@ -252,6 +252,18 @@ mod tests {
     }
 
     #[test]
+    fn postprocess_keeps_first_best_score_when_later_anchor_scores_lower() {
+        let num_anchors = 2;
+        let data = synthetic_output(num_anchors, &[(0, 0, 0.95), (1, 0, 0.4)]);
+        let shape = Shape::from(vec![1_i64, 84, num_anchors as i64]);
+
+        let detections = postprocess(&shape, &data, 0.3);
+
+        assert_eq!(detections.len(), 1);
+        assert!((detections[0].confidence - 0.95).abs() < f32::EPSILON);
+    }
+
+    #[test]
     fn postprocess_returns_empty_on_wrong_class_dim() {
         let shape = Shape::from(vec![1_i64, 85, 10_i64]);
         let data = vec![0.0_f32; 85 * 10];
