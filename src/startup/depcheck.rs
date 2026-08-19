@@ -14,9 +14,19 @@ pub fn check_dependencies(config: &Config) -> Result<()> {
     Ok(())
 }
 
-/// Checks that `ffmpeg` is on `PATH`, exiting with install instructions if not.
+/// Checks that `ffmpeg` is on `PATH`, exiting with install instructions if
+/// not. Delegates to `check_ffmpeg_probe`, which tests call directly with a
+/// name that isn't on `PATH` to exercise the not-found path, without needing
+/// to fake `PATH` itself (this crate denies `unsafe_code`, which
+/// `std::env::set_var` requires on current Rust).
 fn check_ffmpeg() -> Result<()> {
-    let found = Command::new("ffmpeg")
+    check_ffmpeg_probe("ffmpeg")
+}
+
+/// Probes for a `-version`-capable binary by name, exiting with install
+/// instructions if not found.
+fn check_ffmpeg_probe(binary: &str) -> Result<()> {
+    let found = Command::new(binary)
         .arg("-version")
         .stdout(std::process::Stdio::null())
         .stderr(std::process::Stdio::null())
@@ -56,7 +66,9 @@ mod tests {
     //! against the real `PATH` (ffmpeg is a hard runtime dependency of this
     //! crate per ADR 5, so it's expected to be present wherever these tests
     //! run) rather than mocked, since mocking a subprocess probe would test
-    //! nothing real about whether ffmpeg is actually reachable.
+    //! nothing real about whether ffmpeg is actually reachable. The
+    //! not-found path is instead exercised by calling `check_ffmpeg_probe`
+    //! directly with a binary name that doesn't exist on `PATH`.
     #![allow(
         clippy::unwrap_used,
         clippy::indexing_slicing,
@@ -74,9 +86,29 @@ mod tests {
     }
 
     #[test]
+    fn check_ffmpeg_probe_errors_with_helpful_message_when_not_found() {
+        let err = check_ffmpeg_probe("definitely-not-a-real-binary-motioncap-test").unwrap_err();
+        let message = err.to_string();
+        assert!(message.contains("ffmpeg was not found on this system"));
+        assert!(message.contains("sudo apt install ffmpeg"));
+    }
+
+    #[test]
     fn check_model_file_ok_when_file_exists() {
         let file = NamedTempFile::new().unwrap();
         assert!(check_model_file(file.path()).is_ok());
+    }
+
+    #[test]
+    fn check_dependencies_errors_when_model_file_is_missing() {
+        use clap::Parser as _;
+
+        let config =
+            Config::try_parse_from(["motioncap", "--model-path", "/nonexistent/path/model.onnx"])
+                .unwrap();
+
+        let err = check_dependencies(&config).unwrap_err();
+        assert!(err.to_string().contains("ONNX model file not found"));
     }
 
     #[test]
