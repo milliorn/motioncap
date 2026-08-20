@@ -1091,8 +1091,12 @@ mod tests {
         let event = Mutex::new(ActiveEvent::Active(test_recording_event(dir.path())));
 
         // A generous post_buffer means only the camera-stall branch (not the
-        // quiet-window timeout) can be what closes this event.
-        std::thread::sleep(recorder::MAX_FRAME_STALL + Duration::from_millis(50));
+        // quiet-window timeout) can be what closes this event. Backdated
+        // rather than a real sleep, per ADR 7 (see
+        // `backdate_last_real_frame_at_past_stall`'s doc comment).
+        if let ActiveEvent::Active(recording) = &mut *event.lock().unwrap() {
+            recording.state.backdate_last_real_frame_at_past_stall();
+        }
         close_event_if_done(event.lock().unwrap(), Duration::from_mins(1)).unwrap();
 
         assert!(!event.lock().unwrap().is_some());
