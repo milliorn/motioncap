@@ -1,5 +1,5 @@
 //! Holds `check_dependencies`, whose `check_ffmpeg()?` call site has an
-//! error-propagation branch that only reachable if `ffmpeg` is genuinely
+//! error-propagation branch that is only reachable if `ffmpeg` is genuinely
 //! absent from `PATH`. That's the same untestable condition documented on
 //! `check_ffmpeg` itself in `depcheck.rs` (this crate denies `unsafe_code`,
 //! and faking `PATH` from within a test requires `std::env::set_var`, which
