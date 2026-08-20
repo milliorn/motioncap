@@ -1101,7 +1101,7 @@ mod tests {
             .unwrap()
             .state
             .backdate_last_real_frame_at_past_stall();
-        
+
         close_event_if_done(event.lock().unwrap(), Duration::from_mins(1)).unwrap();
 
         assert!(!event.lock().unwrap().is_some());
