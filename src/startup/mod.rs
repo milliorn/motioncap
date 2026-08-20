@@ -1,8 +1,9 @@
 /// Hard runtime dependency detection (ffmpeg, ONNX model file).
 mod depcheck;
-/// `check_dependencies`, isolated because its `check_ffmpeg()?` call site has
-/// an error-propagation branch untestable without faking `PATH`. See
-/// `docs/adr/0006-coverage-exclusions.md`.
+/// `check_dependencies`, the one function in `depcheck` that cannot be
+/// unit-tested (see that module's doc comment).
 mod depcheck_coverage_excluded;
 
+/// Lives in `depcheck_coverage_excluded`, not `depcheck`; see that module's
+/// doc comment.
 pub use depcheck_coverage_excluded::check_dependencies;

@@ -1,17 +1,11 @@
-//! Holds `check_dependencies`, whose `check_ffmpeg()?` call site has an
-//! error-propagation branch that is only reachable if `ffmpeg` is genuinely
-//! absent from `PATH`. That's the same untestable condition documented on
-//! `check_ffmpeg` itself in `depcheck.rs` (this crate denies `unsafe_code`,
-//! and faking `PATH` from within a test requires `std::env::set_var`, which
-//! needs `unsafe` on current Rust) - just visible one call frame up. Since
-//! `cargo-llvm-cov` attributes an uncovered `?` region to its own source
-//! line regardless of which function the fallible call lives in, leaving
-//! `check_dependencies` in `depcheck.rs` would hold that whole file below
-//! 100% for a branch that isn't actually exercisable there either. Moving
-//! only this thin orchestration function out (not `check_ffmpeg`,
-//! `check_ffmpeg_probe`, or `check_model_file`, which are all fully tested
-//! and stay in `depcheck.rs`) mirrors the `RecordingEvent::start`/`finish`
-//! split in `recorder_coverage_excluded.rs`. See
+//! Holds `check_dependencies`, the one function in `depcheck` that cannot be
+//! unit-tested: its `check_ffmpeg()?` call has an error-propagation branch
+//! untestable for the same reason documented on `check_ffmpeg` itself in
+//! `depcheck.rs` (faking `PATH` needs `unsafe`, denied by this crate).
+//! `cargo-llvm-cov` attributes that branch to this call site regardless of
+//! which function it lives in, so only moving the whole function out (not
+//! `check_ffmpeg`, `check_ffmpeg_probe`, or `check_model_file`, which stay in
+//! `depcheck.rs` fully tested) clears it. See
 //! `docs/adr/0006-coverage-exclusions.md`.
 
 use anyhow::Result;
