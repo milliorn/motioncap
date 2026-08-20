@@ -226,21 +226,29 @@ genuinely different achievable ceilings:
 
 - **Local** (`cargo llvm-cov --workspace --ignore-filename-regex '...' -- --include-ignored`,
   run on a machine with `models/yolov8n.onnx` and a working ONNX Runtime build already
-  present): last measured in the mid-90s% after both `start_audio_capture` and
-  `start_camera_capture`/camera auto-detect moved into their own
-  `*_coverage_excluded.rs` siblings, leaving `capture/audio.rs` and `capture/camera.rs`
-  themselves at genuine 100%. The remaining gap is the `?`-propagated error branches
-  described above, plus `try_start_recording`/`evaluate_active_event`'s
-  confirmed-detection path, which needs a real photo of a living-thing subject to reach
-  honestly (see the Decision section). Re-run the command above to get the exact current
-  number rather than trusting a stale figure here.
-- **CI** (`cargo llvm-cov --workspace --fail-under-lines 78 --ignore-filename-regex '...'`,
-  no `--ignored`, the gitignored model file is never fetched in CI): **78.28%**
-  measured, gated at 78 with a small margin for measurement noise. This is meaningfully
-  lower than the local number specifically because the 9 `#[ignore]`'d tests (which
-  exercise a large fraction of `detect.rs`'s and `main.rs`'s logic) never run there;
-  that gap is expected and documented, not a sign CI is under-testing relative to what
-  it can actually run.
+  present): last measured at 97.45% *line* coverage (cargo-llvm-cov's summary table
+  reports Regions/Functions/Lines as three separate columns; this ADR and the CI
+  workflow track the Lines column specifically, since that is what `--fail-under-lines`
+  gates on, and the Regions column reads a few points higher for the same run) after
+  both `start_audio_capture` and `start_camera_capture`/camera auto-detect moved into
+  their own `*_coverage_excluded.rs` siblings, leaving `capture/audio.rs` and
+  `capture/camera.rs` themselves at genuine 100%. The remaining gap is the
+  `?`-propagated error branches described above, plus
+  `try_start_recording`/`evaluate_active_event`'s confirmed-detection path, which needs
+  a real photo of a living-thing subject to reach honestly (see the Decision section).
+  Re-run the command above to get the exact current number rather than trusting a stale
+  figure here.
+- **CI** (`cargo llvm-cov --workspace --fail-under-lines 81 --ignore-filename-regex '...'`,
+  no `--include-ignored`, the gitignored model file is never fetched in CI): **81.86%**
+  line coverage measured, gated at 81 with a small margin for measurement noise. This is
+  meaningfully lower than the local number specifically because the 10 `#[ignore]`'d
+  tests (which exercise a large fraction of `detect.rs`'s and `main.rs`'s logic) never
+  run there; that gap is expected and documented, not a sign CI is under-testing
+  relative to what it can actually run. (Previously gated at 77/77.28%, then briefly at
+  83 after a recalibration that read the Regions column, 84.38%, instead of the Lines
+  column the gate actually checks; that mistake made the 83 gate fail CI outright since
+  real Lines coverage was only 81.86%, and was caught and fixed the same day the 83
+  value was set.)
 
 ## Consequences
 
@@ -261,8 +269,8 @@ genuinely different achievable ceilings:
   ever contain thin sequencing/wiring calling into functions defined (and tested)
   elsewhere. If a function there starts accumulating real decision logic, that logic
   belongs in `main.rs`, not `coverage_excluded.rs` — see that module's own doc comment.
-- The CI threshold (78) and local threshold (95.79%, informal, not currently gated by
-  a CI job, since there is no CI runner with the model file present) must be
+- The CI threshold (81) and last recorded local line coverage (97.45%, informal, not
+  currently gated by a CI job, since there is no CI runner with the model file present) must be
   re-verified and adjusted together whenever the untestable-function list changes;
   they are not meant to converge, since the gap between them is structural (CI never
   has the model file), not a discrepancy to eliminate.
