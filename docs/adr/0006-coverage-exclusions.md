@@ -45,17 +45,24 @@ stood between the codebase and 100%:
      opening a real `/dev/videoN` device. The guard itself (`should_reconnect`) is pure
      and stays in `main.rs`, unit-tested directly there.
    - `config_coverage_excluded::parse_args`: reads the real process's `std::env::args()`.
-   - `check_ffmpeg`'s "not found" branch (`startup/depcheck.rs`), only reachable if
-     `ffmpeg` is genuinely absent from `PATH`, since this crate denies `unsafe_code`, and
-     `std::env::set_var` (the only way to fake `PATH` from within a test) requires
-     `unsafe` on current Rust, so this branch is not safely fakeable from a test. The
-     underlying probe (`check_ffmpeg_probe`, parameterized on the binary name) is
-     itself fully tested directly, including its not-found branch reached by probing a
-     name that genuinely isn't on `PATH`; only `check_ffmpeg`'s own hardcoded call into
-     it with the literal `"ffmpeg"` is the untestable line, and moving one line into its
-     own file for this would fragment cohesive, four-line wiring purely to satisfy the
-     coverage tool, the same trade-off the Decision section's
-     `try_start_recording`/`evaluate_active_event` reasoning already rejects.
+   - `check_ffmpeg`'s "not found" branch, only reachable if `ffmpeg` is genuinely absent
+     from `PATH`, since this crate denies `unsafe_code`, and `std::env::set_var` (the
+     only way to fake `PATH` from within a test) requires `unsafe` on current Rust, so
+     this branch is not safely fakeable from a test. The underlying probe
+     (`check_ffmpeg_probe`, parameterized on the binary name) is itself fully tested
+     directly, including its not-found branch reached by probing a name that genuinely
+     isn't on `PATH`. `check_ffmpeg`'s own hardcoded call into it with the literal
+     `"ffmpeg"` stays in `startup/depcheck.rs` alongside `check_ffmpeg_probe` and
+     `check_model_file`, since that call itself always succeeds in a test (real `PATH`
+     has `ffmpeg`) and so isn't the untestable line - only the caller that would
+     observe a failure is. `check_dependencies` (`startup/depcheck.rs` originally) is
+     that caller: its `check_ffmpeg()?` has an error-propagation branch reachable only
+     if `check_ffmpeg` itself returns `Err`, which no test can produce, so it moved
+     wholesale into `startup/depcheck_coverage_excluded.rs`, taking its two existing
+     tests with it, mirroring the `RecordingEvent::start`/`finish` split described
+     below: `cargo-llvm-cov` attributes an uncovered `?` region to its own source line
+     regardless of which function the fallible call lives in, so only moving the entire
+     function containing the branch removes it from `depcheck.rs`'s count.
    - A handful of `?`-propagated error branches (`Detector::load`/`detect`'s `ort_err`
      calls) that would require deliberately corrupting a model file: fault injection
      disproportionate to the value of covering an already-simple `bail!`/`.context()`
@@ -153,18 +160,23 @@ and any `*_coverage_excluded.rs` sibling file, so `capture/camera_coverage_exclu
 `capture/audio_coverage_excluded.rs`, and `recorder_coverage_excluded.rs` are covered by
 this single pattern without needing their own entries.
 
-`capture/camera.rs`, `capture/audio.rs`, `config.rs`, and `recorder.rs` all use the same
-convention: rather than leaving their hardware-/process-bound functions in place under a
-source comment, each moved them entirely into a sibling file
-(`capture/camera_coverage_excluded.rs`, `capture/audio_coverage_excluded.rs`,
-`config_coverage_excluded.rs`, `recorder_coverage_excluded.rs`), mirroring the
-crate-root `coverage_excluded.rs` split. `recorder_coverage_excluded.rs` differs from
-the other three siblings in one respect: it holds two `impl RecordingEvent` methods
+`capture/camera.rs`, `capture/audio.rs`, `config.rs`, `recorder.rs`, and
+`startup/depcheck.rs` all use the same convention: rather than leaving their
+hardware-/process-bound functions in place under a source comment, each moved them
+entirely into a sibling file (`capture/camera_coverage_excluded.rs`,
+`capture/audio_coverage_excluded.rs`, `config_coverage_excluded.rs`,
+`recorder_coverage_excluded.rs`, `startup/depcheck_coverage_excluded.rs`), mirroring
+the crate-root `coverage_excluded.rs` split. `recorder_coverage_excluded.rs` differs
+from the other siblings in one respect: it holds two `impl RecordingEvent` methods
 (`start`, `finish`) rather than free functions, since Rust allows a type's `impl` block
 to be split across files in the same crate, and `RecordingEvent`'s fields needed to
 become `pub` (module-private field access doesn't cross file boundaries the way it
 crosses `mod` boundaries within one file) for the sibling file's `impl` block to
-construct/consume them.
+construct/consume them. `startup/depcheck_coverage_excluded.rs` differs in the opposite
+direction from the others: the function that moved (`check_dependencies`) is not itself
+hardware-bound, only its call site into an untestable sibling function
+(`check_ffmpeg`, which stays behind in `depcheck.rs` since its own body is fully
+testable) makes it unreachable in the `Err` case.
 `capture/camera.rs` originally left `start_camera_capture` and the auto-detect branch of
 `resolve_camera_index` in place under a `// coverage: excluded` comment, since the
 hardware-bound portion was a large fraction of the file; it was later moved to match
@@ -217,12 +229,13 @@ genuinely different achievable ceilings:
 
 - `main.rs` and every file except the fully-excluded `coverage_excluded.rs`/
   `preview.rs`/`capture/camera_coverage_excluded.rs`/`capture/audio_coverage_excluded.rs`/
-  `config_coverage_excluded.rs`/`recorder_coverage_excluded.rs` are held to a *real*,
-  gate-enforced 100%-or-explained-gap standard; a regression in any tested function moves
-  the reported number and fails CI, not just those excluded files' untestable wiring.
-  `capture/audio.rs`, `capture/camera.rs`, `config.rs`, and `recorder.rs` are now
-  literally 100%, not "100%-minus-a-documented-gap," since their untestable functions
-  were moved out rather than left in place.
+  `config_coverage_excluded.rs`/`recorder_coverage_excluded.rs`/
+  `startup/depcheck_coverage_excluded.rs` are held to a *real*, gate-enforced
+  100%-or-explained-gap standard; a regression in any tested function moves the
+  reported number and fails CI, not just those excluded files' untestable wiring.
+  `capture/audio.rs`, `capture/camera.rs`, `config.rs`, `recorder.rs`, and
+  `startup/depcheck.rs` are now literally 100%, not "100%-minus-a-documented-gap,"
+  since their untestable functions were moved out rather than left in place.
 - Adding a new function to `coverage_excluded.rs` is a deliberate signal: it should only
   ever contain thin sequencing/wiring calling into functions defined (and tested)
   elsewhere. If a function there starts accumulating real decision logic, that logic
