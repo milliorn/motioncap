@@ -182,7 +182,7 @@ jobs:
       # pattern above); see docs/adr/0006-coverage-exclusions.md for why and
       # for the per-file reasoning behind this whole list.
       #
-      # 83% (not the ~93.9%+ achievable locally with the model file present)
+      # 83% (not the 97.47% achievable locally with the model file present)
       # is what CI can actually reach without the #[ignore]'d tests; set from
       # the real measured number (84.38%) with a small margin so measurement
       # noise doesn't fail unrelated PRs. Recalibrated up from 77% here: no
