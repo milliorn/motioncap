@@ -62,7 +62,7 @@ use crate::buffer::RingBuffer;
 use crate::config::Config;
 use crate::config_coverage_excluded;
 use crate::detect_coverage_excluded::Detector;
-use crate::motion::MotionGate;
+use crate::motion_coverage_excluded::MotionGate;
 use crate::preview::PreviewWindow;
 use crate::{
     ActiveEvent, AudioParams, CAMERA_RECONNECT_STALL, DETECTION_POLL_INTERVAL, DetectionCamera,

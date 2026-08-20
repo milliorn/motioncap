@@ -157,4 +157,23 @@ mod tests {
         let ratio = changed_ratio(&mask, 0.0).unwrap();
         assert!((ratio - 0.0).abs() < f32::EPSILON);
     }
+
+    #[test]
+    fn changed_ratio_errors_on_a_multi_channel_mask() {
+        // `count_non_zero` requires a single-channel array (OpenCV asserts
+        // `cn == 1`); a 3-channel mask reaches that assertion and surfaces as
+        // an `Err`, unlike `MotionGate::new`/`evaluate`'s other fallible
+        // calls, which tolerate every input this crate can construct.
+        let mask = Mat::new_rows_cols_with_default(
+            4,
+            4,
+            opencv::core::CV_8UC3,
+            opencv::core::Scalar::all(0.0),
+        )
+        .unwrap();
+
+        let result = changed_ratio(&mask, 16.0);
+
+        assert!(result.is_err());
+    }
 }

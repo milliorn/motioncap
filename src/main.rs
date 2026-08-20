@@ -18,8 +18,9 @@ mod detect;
 /// The parts of `detect` that require a real ONNX Runtime session and model
 /// file, and cannot be unit-tested (see that module's doc comment).
 mod detect_coverage_excluded;
-/// Background-subtraction motion gate.
-mod motion;
+/// Background-subtraction motion gate. Excluded from the coverage report for
+/// now via the `coverage_excluded` filename match (see `docs/adr/0006-coverage-exclusions.md`).
+mod motion_coverage_excluded;
 /// Shared `OpenCV` conversion helpers.
 mod opencv_utils;
 /// Output file/folder naming.
@@ -48,7 +49,7 @@ use anyhow::Result;
 use buffer::{RingBuffer, TimestampedAudio, TimestampedFrame};
 use config::Config;
 use detect_coverage_excluded::Detector;
-use motion::MotionGate;
+use motion_coverage_excluded::MotionGate;
 use paths::clip_path;
 use recorder::{RecordingEvent, RecordingEventParams};
 
