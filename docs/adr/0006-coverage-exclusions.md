@@ -235,7 +235,7 @@ genuinely different achievable ceilings:
   honestly (see the Decision section). Re-run the command above to get the exact current
   number rather than trusting a stale figure here.
 - **CI** (`cargo llvm-cov --workspace --fail-under-lines 83 --ignore-filename-regex '...'`,
-  no `--ignored`, the gitignored model file is never fetched in CI): **84.38%**
+  no `--include-ignored`, the gitignored model file is never fetched in CI): **84.38%**
   measured, gated at 83 with a small margin for measurement noise. This is meaningfully
   lower than the local number specifically because the 10 `#[ignore]`'d tests (which
   exercise a large fraction of `detect.rs`'s and `main.rs`'s logic) never run there;
@@ -263,8 +263,8 @@ genuinely different achievable ceilings:
   ever contain thin sequencing/wiring calling into functions defined (and tested)
   elsewhere. If a function there starts accumulating real decision logic, that logic
   belongs in `main.rs`, not `coverage_excluded.rs` — see that module's own doc comment.
-- The CI threshold (83) and local threshold (97.47%, informal, not currently gated by
-  a CI job, since there is no CI runner with the model file present) must be
+- The CI threshold (83) and last recorded local coverage (97.47%, informal, not
+  currently gated by a CI job, since there is no CI runner with the model file present) must be
   re-verified and adjusted together whenever the untestable-function list changes;
   they are not meant to converge, since the gap between them is structural (CI never
   has the model file), not a discrepancy to eliminate.

@@ -164,7 +164,7 @@ jobs:
       - name: Build
         run: cargo build --all-targets
 
-      # 9 tests across detect.rs/main.rs are #[ignore]d: they construct a real
+      # 10 tests across detect_coverage_excluded.rs/main.rs are #[ignore]d: they construct a real
       # Detector (ONNX Runtime session) against models/yolov8n.onnx, which is
       # gitignored and not fetched here, so everything else runs. Coverage (not
       # just pass/fail) is measured by the step below instead of a plain
