@@ -148,23 +148,6 @@ impl ClipState {
         self.last_real_frame_at.elapsed() >= MAX_FRAME_STALL
     }
 
-    /// Test-only: backdates `last_real_frame_at` so `camera_stalled` reads
-    /// true without a real `thread::sleep`, matching this file's own
-    /// `camera_stalled_true_once_max_frame_stall_elapses` test below and
-    /// ADR 7's convention of backdating `Instant`s instead of sleeping in
-    /// real time (real sleeps at durations this close to `MAX_FRAME_STALL`
-    /// are flaky under `cargo test`'s parallel load).
-    #[cfg(test)]
-    #[allow(
-        clippy::arithmetic_side_effects,
-        clippy::unchecked_time_subtraction,
-        reason = "test assertions favor unwrap/indexing/plain time arithmetic for clarity; test \
-                   durations are small hardcoded constants, so underflow is not reachable"
-    )]
-    pub(crate) fn backdate_last_real_frame_at_past_stall(&mut self) {
-        self.last_real_frame_at = Instant::now() - MAX_FRAME_STALL - Duration::from_millis(50);
-    }
-
     /// Duration of one frame-rate tick at this event's configured `frame_rate`.
     fn frame_tick(&self) -> Duration {
         Duration::from_secs_f64(1.0 / f64::from(self.frame_rate))
@@ -281,6 +264,30 @@ impl ClipState {
         Vec<MotionEvent>,
     ) {
         (self.all_classes, self.detections, self.motion_events)
+    }
+}
+
+/// Test-only surface, kept in a separate `impl` block (rather than mixed
+/// into the block above) so production code never has a test-only method
+/// sitting alongside it, per ADR 6/7's convention of splitting
+/// coverage/test-only concerns into their own block/file rather than
+/// interleaving them with the code real callers use.
+#[cfg(test)]
+impl ClipState {
+    /// Backdates `last_real_frame_at` so `camera_stalled` reads true without
+    /// a real `thread::sleep`, matching this file's own
+    /// `camera_stalled_true_once_max_frame_stall_elapses` test below and
+    /// ADR 7's convention of backdating `Instant`s instead of sleeping in
+    /// real time (real sleeps at durations this close to `MAX_FRAME_STALL`
+    /// are flaky under `cargo test`'s parallel load).
+    #[allow(
+        clippy::arithmetic_side_effects,
+        clippy::unchecked_time_subtraction,
+        reason = "test assertions favor unwrap/indexing/plain time arithmetic for clarity; test \
+                   durations are small hardcoded constants, so underflow is not reachable"
+    )]
+    pub(crate) fn backdate_last_real_frame_at_past_stall(&mut self) {
+        self.last_real_frame_at = Instant::now() - MAX_FRAME_STALL - Duration::from_millis(50);
     }
 }
 
@@ -579,7 +586,7 @@ mod tests {
     #[test]
     fn camera_stalled_true_once_max_frame_stall_elapses() {
         let mut state = ClipState::new(15, Instant::now());
-        state.last_real_frame_at = Instant::now() - MAX_FRAME_STALL - Duration::from_millis(50);
+        state.backdate_last_real_frame_at_past_stall();
         assert!(state.camera_stalled());
     }
 
