@@ -164,41 +164,41 @@ jobs:
       - name: Build
         run: cargo build --all-targets
 
-      # 10 tests across detect_coverage_excluded.rs/main.rs are #[ignore]d: they construct a real
+      # 10 tests across detect.rs/main.rs are #[ignore]d: they construct a real
       # Detector (ONNX Runtime session) against models/yolov8n.onnx, which is
       # gitignored and not fetched here, so everything else runs. Coverage (not
       # just pass/fail) is measured by the step below instead of a plain
       # `cargo test`, since llvm-cov's instrumented run already re-runs the
       # full suite; a bare `cargo test` here would just duplicate that work.
       #
-      # coverage_excluded.rs/preview.rs are excluded by file: they need real
-      # camera/audio hardware or a display, which CI (and this repo's
-      # stable-only toolchain, which can't use the nightly-only
-      # #[coverage(off)] attribute for finer-grained exclusion) cannot
-      # provide. capture/camera.rs and capture/audio.rs themselves are
-      # deliberately not in this list (held to real 100%; their hardware-bound
-      # functions live in capture/camera_coverage_excluded.rs and
-      # capture/audio_coverage_excluded.rs, matched by the coverage_excluded.rs
-      # pattern above); see docs/adr/0006-coverage-exclusions.md for why and
-      # for the per-file reasoning behind this whole list.
+      # preview.rs is excluded by file: it needs a real display, which CI
+      # (and this repo's stable-only toolchain, which can't use the
+      # nightly-only #[coverage(off)] attribute for finer-grained exclusion)
+      # cannot provide. The former coverage_excluded.rs sibling-file pattern
+      # (isolating hardware-bound functions like start_camera_capture/
+      # start_audio_capture/run_detection_loop into dedicated
+      # *_coverage_excluded.rs files excluded by regex) was removed: those
+      # functions moved back into their natural homes (capture/camera.rs,
+      # capture/audio.rs, main.rs, etc.), so this repo's real, CI-reachable
+      # coverage ceiling is now visible in the numbers below instead of
+      # hidden behind file exclusion. See docs/adr/0006-coverage-exclusions.md
+      # for the full history of that decision and its reversal.
       #
-      # 81% (not the 97.45% achievable locally with the model file present)
-      # is what CI can actually reach without the #[ignore]'d tests; set from
-      # the real measured *line* coverage. cargo-llvm-cov's summary table
-      # reports Regions/Functions/Lines as three separate columns, and
-      # --fail-under-lines gates on the Lines column specifically (81.86%
-      # measured), not the Regions column, which reads higher (84.38%) for
-      # the exact same run and is not what this flag checks. 81 leaves a
-      # small margin below 81.86% so measurement noise doesn't fail
-      # unrelated PRs. Recalibrated up from 77% here: no code moved across
-      # the testable/untestable boundary this time, the prior 77 threshold
-      # had simply drifted well below the real CI-reachable ceiling and this
-      # brings the gate back in line with it. Recalibrate this number (in
-      # either direction) whenever code moves across the testable/untestable
-      # boundary; see docs/adr/0006-coverage-exclusions.md for the
-      # move-untestable-code-to-its-own-file convention this project uses to
-      # raise the ceiling over time. Never lower it to silence an
+      # 73% is what CI can actually reach without the #[ignore]'d tests or a
+      # real camera/audio/display; set from the real measured *line*
+      # coverage. cargo-llvm-cov's summary table reports Regions/Functions/
+      # Lines as three separate columns, and --fail-under-lines gates on the
+      # Lines column specifically (73.52% measured), not the Regions column,
+      # which reads lower here (75.41%) for the exact same run and is not
+      # what this flag checks. 73 leaves a small margin below 73.52% so
+      # measurement noise doesn't fail unrelated PRs. This is a large drop
+      # from the prior 81 threshold, not a regression: it reflects the same
+      # underlying test coverage newly counted honestly instead of hidden by
+      # file-level exclusion (see docs/adr/0006-coverage-exclusions.md).
+      # Recalibrate this number upward as real tests are added for
+      # capture/camera.rs, capture/audio.rs, and main.rs's loop functions
+      # (the largest current gaps); never lower it to silence an
       # otherwise-unexplained regression.
       - name: Run tests with coverage
         if: github.event_name == 'pull_request'
-        run: cargo llvm-cov --workspace --fail-under-lines 81 --ignore-filename-regex 'coverage_excluded\.rs|preview\.rs'
+        run: cargo llvm-cov --workspace --fail-under-lines 73 --ignore-filename-regex 'preview\.rs'

@@ -3,6 +3,8 @@ use std::process::Command;
 
 use anyhow::{Result, bail};
 
+use crate::config::Config;
+
 /// Checks that `ffmpeg` is on `PATH`, exiting with install instructions if
 /// not. Delegates to `check_ffmpeg_probe`, which tests call directly with a
 /// name that isn't on `PATH` to exercise the not-found path, without needing
@@ -49,6 +51,17 @@ pub(super) fn check_model_file(path: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Verifies hard runtime requirements are present and exits the process with a
+/// clear, actionable message if not. Per ADR 5, this never attempts to install
+/// anything itself, only detects and reports. `check_ffmpeg()?`'s error-propagation
+/// branch is untestable for the same reason documented on `check_ffmpeg` itself
+/// (faking `PATH` needs `unsafe`, denied by this crate).
+pub fn check_dependencies(config: &Config) -> Result<()> {
+    check_ffmpeg()?;
+    check_model_file(&config.model_path)?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     //! Unit tests for startup dependency checks. `check_ffmpeg` is tested
@@ -65,6 +78,7 @@ mod tests {
         reason = "test assertions favor unwrap/indexing for clarity; panics here fail the test, which is the intended behavior"
     )]
 
+    use clap::Parser as _;
     use tempfile::NamedTempFile;
 
     use super::*;
@@ -95,5 +109,25 @@ mod tests {
         let message = err.to_string();
         assert!(message.contains("ONNX model file not found"));
         assert!(message.contains("/nonexistent/path/model.onnx"));
+    }
+
+    #[test]
+    fn check_dependencies_errors_when_model_file_is_missing() {
+        let config =
+            Config::try_parse_from(["motioncap", "--model-path", "/nonexistent/path/model.onnx"])
+                .unwrap();
+
+        let err = check_dependencies(&config).unwrap_err();
+        assert!(err.to_string().contains("ONNX model file not found"));
+    }
+
+    #[test]
+    fn check_dependencies_ok_when_ffmpeg_and_model_present() {
+        let file = NamedTempFile::new().unwrap();
+        let config =
+            Config::try_parse_from(["motioncap", "--model-path", &file.path().to_string_lossy()])
+                .unwrap();
+
+        assert!(check_dependencies(&config).is_ok());
     }
 }

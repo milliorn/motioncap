@@ -1,8 +1,21 @@
-# 6. Coverage exclusions: file-level via `cargo-llvm-cov`, plus a dedicated `coverage_excluded.rs`
+# 6. Coverage exclusions: file-level via `cargo-llvm-cov`, kept to a single `preview.rs`
 
 ## Status
 
-Accepted
+Accepted. Supersedes an earlier version of this same decision (below, kept for its
+still-accurate reasoning about *why* `cargo-llvm-cov`'s tooling constraints exist) that
+isolated every untestable function into a dedicated `*_coverage_excluded.rs` sibling
+file. That sibling-file pattern was reversed: it grew to 8 extra files (one per
+untestable function/small group of functions), which felt like sprawl disproportionate
+to the problem, and it hid the codebase's real CI-reachable coverage ceiling behind a
+number (81.86%) that looked meaningfully better than the honest one. All of that code
+moved back into its natural home file (`main.rs`, `motion.rs`, `recorder.rs`,
+`capture/camera.rs`, `capture/audio.rs`, `config.rs`, `startup/depcheck.rs`,
+`detect.rs`); `preview.rs` is the only file still excluded, since GUI code genuinely has
+no automatable path to coverage on this tool. See the Decision/Consequences sections
+below for the current state and thresholds; the Context section immediately following
+still accurately explains why `--ignore-filename-regex` is the only exclusion mechanism
+available on stable Rust, which remains true and relevant.
 
 ## Context
 
@@ -129,7 +142,131 @@ logic (`confirm_pending`, `expire_stale_pending`, `frame_liveness_advanced`,
 whole-file exclusion would make a regression in any of that logic invisible to the
 coverage gate.
 
-## Decision
+## Decision (current)
+
+**Every function lives in its natural home file; only `preview.rs` is excluded by
+file.** The `*_coverage_excluded.rs` sibling-file pattern described in the superseded
+Decision below (further down this document) was reversed: `coverage_excluded.rs`,
+`motion_coverage_excluded.rs`, `recorder_coverage_excluded.rs`,
+`capture/camera_coverage_excluded.rs`, `capture/audio_coverage_excluded.rs`,
+`config_coverage_excluded.rs`, and `startup/depcheck_coverage_excluded.rs` were all
+deleted; their contents moved back into `main.rs`, `motion.rs`, `recorder.rs`,
+`capture/camera.rs`, `capture/audio.rs`, `config.rs`, and `startup/depcheck.rs`
+respectively. Two reasons drove the reversal, not one:
+
+1. **File-count sprawl.** 8 separate files existed purely to carve out a handful of
+   untestable functions each; `config_coverage_excluded.rs` held exactly one function
+   (`parse_args`) in an 18-line file. The file-level-only exclusion mechanism this ADR's
+   Context section documents (still true, see below) means this sprawl has no fix that
+   preserves fine-grained exclusion on stable Rust; the only real lever was to stop
+   paying for the precision where the codebase didn't need it as badly as it needed
+   fewer files.
+2. **A hidden ceiling.** `motion_coverage_excluded.rs` in particular had drifted from
+   this ADR's own stated model (isolate only the irreducible lines) into a full-file
+   exclusion hiding ~175 lines of pure, already-tested `MotionGate`/`changed_ratio`
+   logic, invisible to the coverage *report*, though never gated behind `#[ignore]`
+   (all 4 of its tests ran in every `cargo test`). More broadly, the CI-gated number
+   (81.86%, see the superseded Decision's threshold section) looked meaningfully
+   healthier than what CI could actually exercise, because the genuinely hardware-bound
+   code (camera/audio device access, the detection/recording/preview loops) was excluded
+   from the count entirely rather than showing up as a real, honest gap the way
+   `main.rs`'s untestable lines already did before any of this pattern existed.
+
+Investigated and rejected alternatives to plain file merging:
+
+- **`#[coverage(off)]`**: still nightly-only (`#![feature(coverage_attribute)]`),
+  reconfirmed against this crate's toolchain; unchanged from the superseded Decision's
+  finding.
+- **`grcov`'s regex-based `--excl-line`/`--excl-start`/`--excl-stop` markers**: real,
+  stable-compatible per-line exclusion exists in this tool, but switching coverage
+  tools for a comment-marker convenience was judged not worth it given `tarpaulin`
+  below turned up a concrete reason to be cautious about ptrace-based tools generally
+  in this codebase.
+- **`tarpaulin`'s `#[cfg(not(tarpaulin_include))]`**: a genuine stable cfg attribute,
+  evaluated specifically for this project and rejected: its ptrace-based instrumentation
+  has a documented history (upstream issue #704) of segfaults and `SIGCHLD` deadlocks in
+  concurrent native-library scenarios, which is exactly the failure class
+  `detect::MODEL_TEST_LOCK` (see below) already exists to prevent. It also needs a
+  `--no-dead-code` flag just to build against the `opencv` crate's FFI bindings, which
+  its own maintainer states makes results less accurate, undercutting the reason to
+  switch tools in the first place.
+
+One important correction to the superseded Decision's own reasoning, discovered while
+re-verifying it during this reversal: its claim that wrapping only the two irreducible
+OpenCV calls in `MotionGate` "was tried and measured not to remove the regions from
+`motion.rs`'s count" is true only for the **Regions** column. The `?`-propagation branch
+marker is attributed to the call site regardless of where the callee lives, so wrapping
+never moves Regions coverage, but the **Lines** column (the only one
+`--fail-under-lines` gates) does reach 100% via that wrapping, since the call-site line
+itself still counts as executed. Confirmed directly: `motion.rs`, `recorder.rs`, and
+`startup/depcheck.rs` all report genuine 100% Lines today with their irreducible `Err`
+arms in place, unmoved, because the call-site line runs regardless of which branch it
+takes.
+
+`preview.rs` remains excluded by file, unchanged from the superseded Decision: it drives
+a real `OpenCV` highgui window, which has no automatable path to coverage on any tool
+available to this project.
+
+Every `#[ignore]`'d test (10 total, across `detect.rs` and `main.rs`) that constructs a
+real `Detector`/ONNX Runtime session and/or a real `MotionGate` still shares one
+`detect::MODEL_TEST_LOCK` mutex, unchanged from the superseded Decision; this
+requirement is orthogonal to the file-layout reversal and remains fully in effect.
+
+Two numeric thresholds are enforced, not one, because CI and local runs have genuinely
+different achievable ceilings:
+
+- **Local** (`cargo llvm-cov --workspace --ignore-filename-regex 'preview\.rs' --
+  --include-ignored`, run on a machine with `models/yolov8n.onnx` and a working ONNX
+  Runtime build already present): last measured at **87.89%** total *line* coverage.
+  `motion.rs`, `recorder.rs`, and `startup/depcheck.rs` are at genuine 100%;
+  `capture/audio.rs` (40.00%) and `capture/camera.rs` (50.67%) are the lowest, since
+  their hardware-opening functions (`start_audio_capture`, `start_camera_capture`,
+  `auto_detect_camera_index`) have no automatable test path even locally; `main.rs`
+  (79.95%) and `detect.rs` (96.33% locally, with the model file present) carry the rest
+  of the gap. Re-run the command above to get the exact current number rather than
+  trusting a stale figure here.
+- **CI** (`cargo llvm-cov --workspace --fail-under-lines 73 --ignore-filename-regex
+  'preview\.rs'`, no `--include-ignored`, the gitignored model file is never fetched in
+  CI): **73.52%** line coverage measured, gated at 73 with a small margin for
+  measurement noise. This is meaningfully lower than the local number both because the
+  10 `#[ignore]`'d tests never run there (as before) and because the file-merge above
+  newly exposes `capture/audio.rs`/`capture/camera.rs`/`main.rs`'s hardware-bound gaps to
+  the CI number for the first time; that combined gap is expected and honest, not a sign
+  of a real regression in what's tested. (Previously gated at 81, informally reaching as
+  high as 83/84 at points in this ADR's history; see the superseded Decision below for
+  that number's own trajectory. The drop to 73 reflects newly-counted code, not newly
+  broken tests.)
+
+## Consequences (current)
+
+- Only `preview.rs` is excluded from the coverage report by file. Every other file,
+  including the ones with the largest real gaps (`capture/audio.rs`,
+  `capture/camera.rs`, `main.rs`), reports its true number; a regression anywhere moves
+  that file's percentage and, in aggregate, the CI gate.
+- The CI threshold (73) and last recorded local line coverage (87.89%, informal, not
+  currently gated by a CI job, since there is no CI runner with the model file present)
+  must be re-verified and adjusted together whenever significant code is added to the
+  hardware-bound loops/capture functions; they are not meant to converge, since the gap
+  between them is structural (CI never has the model file, camera, audio device, or
+  display), not a discrepancy to eliminate.
+- Raising the CI number now requires writing real tests against previously-hidden gaps
+  (particularly `capture/camera.rs`/`capture/audio.rs`'s hardware-opening functions and
+  `main.rs`'s loop functions), not moving code into an excluded file. The largest
+  concrete opportunities, in order of missed-line count: `main.rs` (618 missed),
+  `detect.rs` (73 missed, mostly closed already by the `#[ignore]`'d tests once a model
+  file is available), `capture/audio.rs` (54 missed), `capture/camera.rs` (37 missed).
+- If `#[coverage(off)]` stabilizes on a future stable Rust release, this file-merge
+  decision could be revisited in favor of precise per-line exclusion in place, but this
+  is not currently planned.
+
+---
+
+## Decision (superseded, kept for historical context)
+
+The sections below describe the sibling-file pattern in place from its introduction
+until this ADR's reversal above. The reasoning about *why* `cargo-llvm-cov` only offers
+whole-file exclusion on stable Rust (the two-obstacle Context section above) is still
+accurate; only the response to that constraint changed.
 
 **Isolate every untestable function into its own module, `src/coverage_excluded.rs`,** so
 that file-level exclusion becomes precise instead of a blunt trade-off. `coverage_excluded::run`
@@ -162,120 +299,72 @@ rejected once. A `?`-propagated error branch or a genuinely hardware-bound funct
 (opens a device, drives a GUI, blocks on real time) is worth isolating; a function that's
 merely *sometimes* reached only under real inputs a test can't fabricate is not.
 
-`cargo llvm-cov`'s CI/local invocation excludes files by regex:
+`cargo llvm-cov`'s CI/local invocation excluded files by regex:
 
 ```sh
 --ignore-filename-regex 'coverage_excluded\.rs|preview\.rs'
 ```
 
-`coverage_excluded\.rs` (unanchored) matches both the crate-root `coverage_excluded.rs`
+`coverage_excluded\.rs` (unanchored) matched both the crate-root `coverage_excluded.rs`
 and any `*_coverage_excluded.rs` sibling file, so `capture/camera_coverage_excluded.rs`,
 `capture/audio_coverage_excluded.rs`, `recorder_coverage_excluded.rs`, and
-`motion_coverage_excluded.rs` are covered by this single pattern without needing their
+`motion_coverage_excluded.rs` were covered by this single pattern without needing their
 own entries.
 
 `capture/camera.rs`, `capture/audio.rs`, `config.rs`, `recorder.rs`, and
-`startup/depcheck.rs` all use the same convention: rather than leaving their
+`startup/depcheck.rs` all used the same convention: rather than leaving their
 hardware-/process-bound functions in place under a source comment, each moved them
 entirely into a sibling file (`capture/camera_coverage_excluded.rs`,
 `capture/audio_coverage_excluded.rs`, `config_coverage_excluded.rs`,
 `recorder_coverage_excluded.rs`, `startup/depcheck_coverage_excluded.rs`), mirroring
-the crate-root `coverage_excluded.rs` split. `recorder_coverage_excluded.rs` differs
-from the other siblings in one respect: it holds two `impl RecordingEvent` methods
+the crate-root `coverage_excluded.rs` split. `recorder_coverage_excluded.rs` differed
+from the other siblings in one respect: it held two `impl RecordingEvent` methods
 (`start`, `finish`) rather than free functions, since Rust allows a type's `impl` block
 to be split across files in the same crate, and `RecordingEvent`'s fields needed to
 become `pub` (module-private field access doesn't cross file boundaries the way it
 crosses `mod` boundaries within one file) for the sibling file's `impl` block to
-construct/consume them. `startup/depcheck_coverage_excluded.rs` differs in the opposite
-direction from the others: the function that moved (`check_dependencies`) is not itself
+construct/consume them. `startup/depcheck_coverage_excluded.rs` differed in the opposite
+direction from the others: the function that moved (`check_dependencies`) was not itself
 hardware-bound, only its call site into an untestable sibling function
-(`check_ffmpeg`, which stays behind in `depcheck.rs` since its own body is fully
-testable) makes it unreachable in the `Err` case. These moves report genuine 100%
-coverage on their originating files instead of "100%-minus-a-documented-gap." The
-remaining pure logic (`resolve_pinned_camera_index` in `camera.rs`, `samples_to_f32`/
-`sample_format_supported` in `audio.rs`, `Config`'s own construction via
-`try_parse_from` in `config.rs`) is unit-tested normally.
+(`check_ffmpeg`, which stayed behind in `depcheck.rs` since its own body is fully
+testable) made it unreachable in the `Err` case.
 
-`motion_coverage_excluded.rs` differs from every other sibling above: it's the whole of
-what was `motion.rs` (`MotionGate::new`/`evaluate`, `changed_ratio`, and their tests),
-renamed wholesale rather than split, since `MotionGate`/`changed_ratio`'s `?`-propagated
-error arms are checked at the call site of a `Result`-returning function regardless of
-which file the callee itself lives in; moving only the two-or-three-line irreducible
-OpenCV calls into a wrapper function in a sibling file, while leaving the calling
-functions (and their `?` call sites) in `motion.rs`, was tried and measured not to
-remove the uncovered regions from `motion.rs`'s count. This is a coarser exclusion than
-the other siblings achieve (all of `MotionGate`/`changed_ratio`'s otherwise-tested logic
-loses CI visibility, not just the four irreducible arms), accepted here as an interim
-measure rather than a model for future files in this pattern.
+`motion_coverage_excluded.rs` differed from every other sibling above: it was the whole
+of what was `motion.rs` (`MotionGate::new`/`evaluate`, `changed_ratio`, and their
+tests), renamed wholesale rather than split, since `MotionGate`/`changed_ratio`'s
+`?`-propagated error arms are checked at the call site of a `Result`-returning function
+regardless of which file the callee itself lives in; moving only the two-or-three-line
+irreducible OpenCV calls into a wrapper function in a sibling file, while leaving the
+calling functions (and their `?` call sites) in `motion.rs`, was tried and measured not
+to remove the uncovered *Regions* from `motion.rs`'s count (see the "current" Decision
+section above for the correction: this was true for Regions, but Lines, the metric
+actually gated, did reach 100% via that same wrapping, a distinction not recognized at
+the time this section was originally written).
 
-Every `#[ignore]`'d test (there are 10, split across `detect_coverage_excluded.rs` and
-`main.rs`) that
-constructs a real `Detector`/ONNX Runtime session and/or a real `MotionGate` shares one
-`detect::MODEL_TEST_LOCK` mutex, acquired for the test's full duration before doing
-anything else. This was added after directly reproducing a heap-corruption abort
-("corrupted double-linked list") when `cargo test`'s default parallelism ran multiple
-such tests concurrently — neither `ort`'s `Session` nor `OpenCV`'s
-`BackgroundSubtractorMOG2` are documented as safe to construct/run concurrently across
-independent instances in separate threads, and this crate's own production code never
-does so (YOLO inference and the motion gate both run single-threaded inside the
-detection worker, by design). The lock is `#[cfg(test)]`-only and adds no runtime cost
-to the shipped binary.
+Two numeric thresholds were enforced, not one, because CI and local runs had genuinely
+different achievable ceilings:
 
-Two numeric thresholds are enforced, not one, because CI and local runs have
-genuinely different achievable ceilings:
+- **Local**: last measured at 97.51% total *line* coverage (`main.rs` itself at 94.44%,
+  the lowest of any non-excluded file; every other non-excluded file at 100%).
+- **CI**: **81.86%** line coverage measured, gated at 81 with a small margin for
+  measurement noise. (Previously gated at 77/77.28%, then briefly at 83 after a
+  recalibration that read the Regions column, 84.38%, instead of the Lines column the
+  gate actually checks; that mistake made the 83 gate fail CI outright since real Lines
+  coverage was only 81.86%, and was caught and fixed the same day the 83 value was set.)
 
-- **Local** (`cargo llvm-cov --workspace --ignore-filename-regex '...' -- --include-ignored`,
-  run on a machine with `models/yolov8n.onnx` and a working ONNX Runtime build already
-  present): last measured at 97.45% *line* coverage (cargo-llvm-cov's summary table
-  reports Regions/Functions/Lines as three separate columns; this ADR and the CI
-  workflow track the Lines column specifically, since that is what `--fail-under-lines`
-  gates on, and the Regions column reads a few points higher for the same run) after
-  both `start_audio_capture` and `start_camera_capture`/camera auto-detect moved into
-  their own `*_coverage_excluded.rs` siblings, leaving `capture/audio.rs` and
-  `capture/camera.rs` themselves at genuine 100%. The remaining gap is the
-  `?`-propagated error branches described above, plus
-  `try_start_recording`/`evaluate_active_event`'s confirmed-detection path, which needs
-  a real photo of a living-thing subject to reach honestly (see the Decision section).
-  Re-run the command above to get the exact current number rather than trusting a stale
-  figure here.
-- **CI** (`cargo llvm-cov --workspace --fail-under-lines 81 --ignore-filename-regex '...'`,
-  no `--include-ignored`, the gitignored model file is never fetched in CI): **81.86%**
-  line coverage measured, gated at 81 with a small margin for measurement noise. This is
-  meaningfully lower than the local number specifically because the 10 `#[ignore]`'d
-  tests (which exercise a large fraction of `detect.rs`'s and `main.rs`'s logic) never
-  run there; that gap is expected and documented, not a sign CI is under-testing
-  relative to what it can actually run. (Previously gated at 77/77.28%, then briefly at
-  83 after a recalibration that read the Regions column, 84.38%, instead of the Lines
-  column the gate actually checks; that mistake made the 83 gate fail CI outright since
-  real Lines coverage was only 81.86%, and was caught and fixed the same day the 83
-  value was set.)
-
-## Consequences
+## Consequences (superseded)
 
 - `main.rs` and every file except the fully-excluded `coverage_excluded.rs`/
   `preview.rs`/`capture/camera_coverage_excluded.rs`/`capture/audio_coverage_excluded.rs`/
   `config_coverage_excluded.rs`/`recorder_coverage_excluded.rs`/
-  `motion_coverage_excluded.rs`/`startup/depcheck_coverage_excluded.rs` are held to a
+  `motion_coverage_excluded.rs`/`startup/depcheck_coverage_excluded.rs` were held to a
   *real*, gate-enforced 100%-or-explained-gap standard; a regression in any tested
-  function moves the reported number and fails CI, not just those excluded files'
-  untestable wiring. `capture/audio.rs`, `capture/camera.rs`, `config.rs`, `recorder.rs`,
-  and `startup/depcheck.rs` are now literally 100%, not "100%-minus-a-documented-gap,"
-  since their untestable functions were moved out rather than left in place.
-  `motion_coverage_excluded.rs` is the one exception: it holds all of `MotionGate`'s
-  logic and tests wholesale (see above), not just the four irreducible arms, so it
-  doesn't carry the same "real, gate-enforced" claim the other siblings do; this is
-  flagged as interim, not the target state.
-- Adding a new function to `coverage_excluded.rs` is a deliberate signal: it should only
+  function moved the reported number and failed CI, not just those excluded files'
+  untestable wiring.
+- Adding a new function to `coverage_excluded.rs` was a deliberate signal: it should only
   ever contain thin sequencing/wiring calling into functions defined (and tested)
-  elsewhere. If a function there starts accumulating real decision logic, that logic
-  belongs in `main.rs`, not `coverage_excluded.rs` — see that module's own doc comment.
-- The CI threshold (81) and last recorded local line coverage (97.45%, informal, not
-  currently gated by a CI job, since there is no CI runner with the model file present) must be
-  re-verified and adjusted together whenever the untestable-function list changes;
-  they are not meant to converge, since the gap between them is structural (CI never
-  has the model file), not a discrepancy to eliminate.
+  elsewhere.
 - If `#[coverage(off)]` stabilizes on a future stable Rust release, `coverage_excluded.rs`
   could in principle be dissolved back into `main.rs` with the exclusion moved to
-  precise `#[coverage(off)]` attributes per-function, but this is not planned — the
-  module split has its own value as a visible boundary between "wiring" and "logic"
-  independent of the coverage tooling that motivated it.
+  precise `#[coverage(off)]` attributes per-function; this reasoning still applies to
+  the current, merged-file state as well (see the "current" Consequences section above).
