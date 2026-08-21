@@ -1086,6 +1086,28 @@ mod tests {
     }
 
     #[test]
+    fn close_event_if_done_closes_on_camera_stall() {
+        let dir = tempfile::tempdir().unwrap();
+        let event = Mutex::new(ActiveEvent::Active(test_recording_event(dir.path())));
+
+        // A generous post_buffer means only the camera-stall branch (not the
+        // quiet-window timeout) can be what closes this event. Backdated
+        // rather than a real sleep, per ADR 7 (see
+        // `backdate_last_real_frame_at_past_stall`'s doc comment).
+        event
+            .lock()
+            .unwrap()
+            .as_recording_mut()
+            .unwrap()
+            .state
+            .backdate_last_real_frame_at_past_stall();
+
+        close_event_if_done(event.lock().unwrap(), Duration::from_mins(1)).unwrap();
+
+        assert!(!event.lock().unwrap().is_some());
+    }
+
+    #[test]
     fn close_event_if_done_is_noop_on_pending_or_none() {
         let dir = tempfile::tempdir().unwrap();
         let event = Mutex::new(ActiveEvent::Pending(PendingEvent {
