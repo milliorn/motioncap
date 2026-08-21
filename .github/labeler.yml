@@ -7,7 +7,7 @@ detection:
   - changed-files:
       - any-glob-to-any-file:
           - src/detect.rs
-          - src/motion_coverage_excluded.rs
+          - src/motion.rs
           - src/triggers.rs
           - src/opencv_utils.rs
 

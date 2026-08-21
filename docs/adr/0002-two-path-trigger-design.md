@@ -69,7 +69,7 @@ single motion-gate-plus-YOLO-confirmation design above.
 
 ## Consequences
 
-- The motion module (`motion_coverage_excluded.rs`) only needs to report whole-frame motion; there is
+- The motion module (`motion.rs`) only needs to report whole-frame motion; there is
   no separate zone-based reporting or configuration.
 - The JSON sidecar for each recorded clip records the confirmed classes and their
   timestamps/confidence; there is no "trigger path" distinction to record since there

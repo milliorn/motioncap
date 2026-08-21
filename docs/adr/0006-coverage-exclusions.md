@@ -19,6 +19,14 @@ available on stable Rust, which remains true and relevant.
 
 ## Context
 
+**Note:** this section is retained from the superseded decision and describes the
+codebase as it stood under the `*_coverage_excluded.rs` sibling-file pattern; module
+paths like `motion_coverage_excluded::` and `coverage_excluded::` below reflect that
+historical layout, not where this code lives today (see "Decision (current)" for the
+present module paths and coverage numbers). It's kept because the *reasoning* about why
+`--ignore-filename-regex` is the only exclusion mechanism available on stable Rust is
+still accurate and relevant.
+
 The project added a test suite with `cargo-llvm-cov` as its coverage tool, targeting the
 highest coverage genuinely achievable, not a symbolic percentage, but a number where
 every uncovered line traces to a documented, concrete reason. Two separate obstacles
@@ -149,10 +157,11 @@ file.** The `*_coverage_excluded.rs` sibling-file pattern described in the super
 Decision below (further down this document) was reversed: `coverage_excluded.rs`,
 `motion_coverage_excluded.rs`, `recorder_coverage_excluded.rs`,
 `capture/camera_coverage_excluded.rs`, `capture/audio_coverage_excluded.rs`,
-`config_coverage_excluded.rs`, and `startup/depcheck_coverage_excluded.rs` were all
-deleted; their contents moved back into `main.rs`, `motion.rs`, `recorder.rs`,
-`capture/camera.rs`, `capture/audio.rs`, `config.rs`, and `startup/depcheck.rs`
-respectively. Two reasons drove the reversal, not one:
+`config_coverage_excluded.rs`, `startup/depcheck_coverage_excluded.rs`, and
+`detect_coverage_excluded.rs` were all deleted; their contents moved back into
+`main.rs`, `motion.rs`, `recorder.rs`, `capture/camera.rs`, `capture/audio.rs`,
+`config.rs`, `startup/depcheck.rs`, and `detect.rs` respectively. Two reasons drove the
+reversal, not one:
 
 1. **File-count sprawl.** 8 separate files existed purely to carve out a handful of
    untestable functions each; `config_coverage_excluded.rs` held exactly one function
@@ -267,7 +276,8 @@ The prior decision isolated every untestable function into a dedicated
 `*_coverage_excluded.rs` sibling file per source file (`coverage_excluded.rs`,
 `motion_coverage_excluded.rs`, `recorder_coverage_excluded.rs`,
 `capture/camera_coverage_excluded.rs`, `capture/audio_coverage_excluded.rs`,
-`config_coverage_excluded.rs`, `startup/depcheck_coverage_excluded.rs`), excluded from
+`config_coverage_excluded.rs`, `startup/depcheck_coverage_excluded.rs`,
+`detect_coverage_excluded.rs`), excluded from
 coverage via a single regex (`--ignore-filename-regex
 'coverage_excluded\.rs|preview\.rs'`, unanchored so it matched every sibling). This made
 file-level exclusion precise instead of a blunt whole-file trade-off, at the cost of the

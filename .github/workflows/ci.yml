@@ -182,7 +182,7 @@ jobs:
       # coverage. cargo-llvm-cov's summary table reports Regions/Functions/
       # Lines as three separate columns, and --fail-under-lines gates on the
       # Lines column specifically (73.52% measured), not the Regions column,
-      # which reads lower here (75.41%) for the exact same run and is not
+      # which reads higher here (75.41%) for the exact same run and is not
       # what this flag checks. 73 leaves a small margin below 73.52% so
       # measurement noise doesn't fail unrelated PRs. This is a large drop
       # from the prior 81 threshold, not a regression: it reflects the same
