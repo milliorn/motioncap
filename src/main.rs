@@ -746,16 +746,6 @@ fn seed_and_drain_active_event(ring_buffer: &Mutex<RingBuffer>, active_event: &M
     }
 }
 
-// run_recording_writer_loop and run_preview_loop are testable up to their
-// shutdown-check branch (unit-tested below via a pre-set shutdown flag);
-// past that, both loops spend their steady-state body polling thread::sleep
-// against real wall-clock time and, in run_preview_loop's case, driving
-// OpenCV's highgui window, so neither is exercisable by a test without
-// either running forever or a real display. run_recording_writer_loop's
-// per-tick logic (seed_and_drain_active_event) is independently unit-tested
-// here; run_preview_loop's per-tick logic (PreviewWindow::show) is excluded
-// entirely, along with the rest of preview.rs, per ADR 6.
-
 /// Closes the active recording if either close condition is met: the camera
 /// has stalled (see `RecordingEvent::camera_stalled`), which the motion gate
 /// can never detect on its own since a stalled camera means no new frames
@@ -1003,12 +993,6 @@ fn should_reconnect(
     true
 }
 
-// maybe_reconnect_camera (defined above) is testable only past the
-// should_reconnect guard below (which is what's actually unit-tested): every
-// remaining line calls capture::camera::start_camera_capture, which opens a
-// real /dev/videoN device. The pure threshold/cooldown decision is
-// should_reconnect, tested directly here.
-
 /// `false` while the ring buffer hasn't yet had `pre_buffer_secs` worth of
 /// wall-clock time to refill since the capture stream was last rebuilt by
 /// `maybe_reconnect_camera`.
@@ -1171,14 +1155,6 @@ pub(crate) struct AudioParams {
     /// Number of audio channels in the captured stream.
     pub(crate) channels: u16,
 }
-
-// run_detection_loop (defined above) constructs a real Detector::load
-// unconditionally before its loop body ever runs, so even its shutdown-only
-// path can't be unit-tested without the model file/ONNX Runtime dependency.
-// Every per-tick decision it makes is independently covered here via the
-// functions it calls (try_start_recording, evaluate_active_event,
-// frame_liveness_advanced, maybe_reconnect_camera, finish_event_on_shutdown,
-// etc.).
 
 /// Runs the motion gate and (on trip, then second-poll confirmation) YOLO
 /// detection against `frame` when no recording is currently active, starting
