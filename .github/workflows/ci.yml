@@ -172,17 +172,10 @@ jobs:
       # full suite; a bare `cargo test` here would just duplicate that work.
       #
       # preview.rs is excluded by file: it needs a real display, which CI
-      # (and this repo's stable-only toolchain, which can't use the
-      # nightly-only #[coverage(off)] attribute for finer-grained exclusion)
-      # cannot provide. The former coverage_excluded.rs sibling-file pattern
-      # (isolating hardware-bound functions like start_camera_capture/
-      # start_audio_capture/run_detection_loop into dedicated
-      # *_coverage_excluded.rs files excluded by regex) was removed: those
-      # functions moved back into their natural homes (capture/camera.rs,
-      # capture/audio.rs, main.rs, etc.), so this repo's real, CI-reachable
-      # coverage ceiling is now visible in the numbers below instead of
-      # hidden behind file exclusion. See docs/adr/0006-coverage-exclusions.md
-      # for the full history of that decision and its reversal.
+      # cannot provide. See docs/adr/0006-coverage-exclusions.md for the full
+      # history of the coverage-exclusion strategy and why file-level
+      # exclusion via --ignore-filename-regex is the only mechanism available
+      # on this repo's stable-only toolchain.
       #
       # 73% is what CI can actually reach without the #[ignore]'d tests or a
       # real camera/audio/display; set from the real measured *line*

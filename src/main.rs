@@ -314,7 +314,7 @@ fn run() -> Result<()> {
     let config = config::parse_args();
     init_logging(&config.output_dir)?;
 
-    startup::check_dependencies(&config)?;
+    startup::depcheck::check_dependencies(&config)?;
 
     let pre_buffer = Duration::from_secs(u64::from(config.pre_buffer_secs));
     let ring_buffer = Arc::new(Mutex::new(RingBuffer::new(pre_buffer)));

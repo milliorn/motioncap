@@ -263,108 +263,42 @@ different achievable ceilings:
 
 ## Decision (superseded, kept for historical context)
 
-The sections below describe the sibling-file pattern in place from its introduction
-until this ADR's reversal above. The reasoning about *why* `cargo-llvm-cov` only offers
-whole-file exclusion on stable Rust (the two-obstacle Context section above) is still
-accurate; only the response to that constraint changed.
+The prior decision isolated every untestable function into a dedicated
+`*_coverage_excluded.rs` sibling file per source file (`coverage_excluded.rs`,
+`motion_coverage_excluded.rs`, `recorder_coverage_excluded.rs`,
+`capture/camera_coverage_excluded.rs`, `capture/audio_coverage_excluded.rs`,
+`config_coverage_excluded.rs`, `startup/depcheck_coverage_excluded.rs`), excluded from
+coverage via a single regex (`--ignore-filename-regex
+'coverage_excluded\.rs|preview\.rs'`, unanchored so it matched every sibling). This made
+file-level exclusion precise instead of a blunt whole-file trade-off, at the cost of the
+8-file sprawl and hidden ceiling described in the "Decision (current)" section above;
+see that section's two reasons for the reversal.
 
-**Isolate every untestable function into its own module, `src/coverage_excluded.rs`,** so
-that file-level exclusion becomes precise instead of a blunt trade-off. `coverage_excluded::run`
-(top-level wiring, formerly `main`'s body), `coverage_excluded::init_logging`,
-`coverage_excluded::run_detection_loop`, `coverage_excluded::run_recording_writer_loop`,
-`coverage_excluded::run_preview_loop`, and `coverage_excluded::maybe_reconnect_camera` live
-there; `main.rs`'s own `fn main()` shrinks to a one-line call into `coverage_excluded::run()`.
-The latter three moved out of `main.rs` after initially landing there: each is
-untestable past its own guard/shutdown-check branch for the same reasons as the rest of
-this module (real wall-clock polling, a real `OpenCV` window, or a real camera device),
-and leaving them in `main.rs` meant those specific lines dragged its reported number
-down for no different a reason than the functions already isolated here. Every pure
-decision function the detection loop (or these newly-moved functions) calls
-(`try_start_recording`, `evaluate_active_event`, `close_event_if_done`,
-`finish_event_on_shutdown`, `frame_liveness_advanced`, `should_reconnect`,
-`seed_and_drain_active_event`, `confirm_pending`, `expire_stale_pending`, ...) stays in
-`main.rs`, made `pub(crate)` where `coverage_excluded.rs` needs to call it, and is
-unit-tested directly there.
+Two details from that era are worth preserving since they're easy to get wrong if
+re-attempted:
 
-Not every function with an untestable branch moved, though: `try_start_recording` and
-`evaluate_active_event` still call `RecordingEvent::start` (spawns ffmpeg) on their
-confirmed-detection path, which no test reaches, since doing so honestly (not just to
-satisfy the coverage tool) requires a real photo of a living-thing subject for YOLO to
-confirm, the same category of dependency as `detect.rs`'s `#[ignore]`'d tests. That gap
-was deliberately left in place rather than extracted: splitting the ffmpeg-spawning tail
-out of either function would fragment cohesive decision logic (which classes to record,
-whether to start at all) away from its own tests purely to move a handful of lines,
-exactly the "erasing real coverage signal" trade-off this ADR's Context section already
-rejected once. A `?`-propagated error branch or a genuinely hardware-bound function
-(opens a device, drives a GUI, blocks on real time) is worth isolating; a function that's
-merely *sometimes* reached only under real inputs a test can't fabricate is not.
+- **`RecordingEvent::start`/`finish` required `pub` fields.** Splitting an `impl` block
+  across files works in Rust, but module-private field access doesn't cross file
+  boundaries the way it crosses `mod` boundaries within one file, so
+  `recorder_coverage_excluded.rs`'s `impl RecordingEvent` block needed the struct's
+  fields to be `pub`, not just `pub(crate)`. Reversing the split let those fields go back
+  to private (see the current `src/recorder.rs`).
+- **Wrapping only the fallible call, not the whole function, doesn't help the Regions
+  column, but it does help Lines**, the column `--fail-under-lines` actually gates. This
+  ADR's original text claimed wrapping just the irreducible OpenCV calls in `motion.rs`
+  "was tried and measured not to remove the regions," which is true only for Regions;
+  Lines reaches 100% either way, since the call-site line itself counts as executed
+  regardless of which branch it takes. `motion.rs` was moved wholesale anyway, before
+  this distinction was recognized.
 
-`cargo llvm-cov`'s CI/local invocation excluded files by regex:
-
-```sh
---ignore-filename-regex 'coverage_excluded\.rs|preview\.rs'
-```
-
-`coverage_excluded\.rs` (unanchored) matched both the crate-root `coverage_excluded.rs`
-and any `*_coverage_excluded.rs` sibling file, so `capture/camera_coverage_excluded.rs`,
-`capture/audio_coverage_excluded.rs`, `recorder_coverage_excluded.rs`, and
-`motion_coverage_excluded.rs` were covered by this single pattern without needing their
-own entries.
-
-`capture/camera.rs`, `capture/audio.rs`, `config.rs`, `recorder.rs`, and
-`startup/depcheck.rs` all used the same convention: rather than leaving their
-hardware-/process-bound functions in place under a source comment, each moved them
-entirely into a sibling file (`capture/camera_coverage_excluded.rs`,
-`capture/audio_coverage_excluded.rs`, `config_coverage_excluded.rs`,
-`recorder_coverage_excluded.rs`, `startup/depcheck_coverage_excluded.rs`), mirroring
-the crate-root `coverage_excluded.rs` split. `recorder_coverage_excluded.rs` differed
-from the other siblings in one respect: it held two `impl RecordingEvent` methods
-(`start`, `finish`) rather than free functions, since Rust allows a type's `impl` block
-to be split across files in the same crate, and `RecordingEvent`'s fields needed to
-become `pub` (module-private field access doesn't cross file boundaries the way it
-crosses `mod` boundaries within one file) for the sibling file's `impl` block to
-construct/consume them. `startup/depcheck_coverage_excluded.rs` differed in the opposite
-direction from the others: the function that moved (`check_dependencies`) was not itself
-hardware-bound, only its call site into an untestable sibling function
-(`check_ffmpeg`, which stayed behind in `depcheck.rs` since its own body is fully
-testable) made it unreachable in the `Err` case.
-
-`motion_coverage_excluded.rs` differed from every other sibling above: it was the whole
-of what was `motion.rs` (`MotionGate::new`/`evaluate`, `changed_ratio`, and their
-tests), renamed wholesale rather than split, since `MotionGate`/`changed_ratio`'s
-`?`-propagated error arms are checked at the call site of a `Result`-returning function
-regardless of which file the callee itself lives in; moving only the two-or-three-line
-irreducible OpenCV calls into a wrapper function in a sibling file, while leaving the
-calling functions (and their `?` call sites) in `motion.rs`, was tried and measured not
-to remove the uncovered *Regions* from `motion.rs`'s count (see the "current" Decision
-section above for the correction: this was true for Regions, but Lines, the metric
-actually gated, did reach 100% via that same wrapping, a distinction not recognized at
-the time this section was originally written).
-
-Two numeric thresholds were enforced, not one, because CI and local runs had genuinely
-different achievable ceilings:
-
-- **Local**: last measured at 97.51% total *line* coverage (`main.rs` itself at 94.44%,
-  the lowest of any non-excluded file; every other non-excluded file at 100%).
-- **CI**: **81.86%** line coverage measured, gated at 81 with a small margin for
-  measurement noise. (Previously gated at 77/77.28%, then briefly at 83 after a
-  recalibration that read the Regions column, 84.38%, instead of the Lines column the
-  gate actually checks; that mistake made the 83 gate fail CI outright since real Lines
-  coverage was only 81.86%, and was caught and fixed the same day the 83 value was set.)
+Numeric thresholds at the time: local coverage was last measured at 97.51%; CI was gated
+at **81** (81.86% measured, up from an earlier 77/77.28%, with one same-day-caught
+mistake where a recalibration briefly set the gate to 83 by misreading the Regions
+column instead of Lines).
 
 ## Consequences (superseded)
 
-- `main.rs` and every file except the fully-excluded `coverage_excluded.rs`/
-  `preview.rs`/`capture/camera_coverage_excluded.rs`/`capture/audio_coverage_excluded.rs`/
-  `config_coverage_excluded.rs`/`recorder_coverage_excluded.rs`/
-  `motion_coverage_excluded.rs`/`startup/depcheck_coverage_excluded.rs` were held to a
-  *real*, gate-enforced 100%-or-explained-gap standard; a regression in any tested
-  function moved the reported number and failed CI, not just those excluded files'
-  untestable wiring.
-- Adding a new function to `coverage_excluded.rs` was a deliberate signal: it should only
-  ever contain thin sequencing/wiring calling into functions defined (and tested)
-  elsewhere.
-- If `#[coverage(off)]` stabilizes on a future stable Rust release, `coverage_excluded.rs`
-  could in principle be dissolved back into `main.rs` with the exclusion moved to
-  precise `#[coverage(off)]` attributes per-function; this reasoning still applies to
-  the current, merged-file state as well (see the "current" Consequences section above).
+Every file except the excluded siblings and `preview.rs` was held to a genuine
+100%-or-explained-gap standard, so a regression anywhere else still failed CI.
+`coverage_excluded.rs` itself was meant to hold only thin sequencing/wiring, never real
+logic; a deliberate signal for what belonged there versus in `main.rs`.
