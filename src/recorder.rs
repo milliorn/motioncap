@@ -1,13 +1,14 @@
 use std::collections::BTreeSet;
 use std::io::Write;
-use std::process::Child;
+use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
 
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use chrono::{DateTime, Local};
 use serde::Serialize;
 
 use crate::buffer::{TimestampedAudio, TimestampedFrame};
+use crate::paths::{clip_path, sidecar_path};
 
 /// How long the camera may go without delivering a real frame before
 /// `camera_stalled` reports true. Must be well above ordinary jitter between
@@ -253,9 +254,9 @@ impl ClipState {
     }
 
     /// Consumes this state, handing ownership of the accumulated class list
-    /// and sidecar records to the caller. Used by
-    /// `recorder_coverage_excluded`'s `RecordingEvent::finish` to build the
-    /// final filename's class list and the `Sidecar` written alongside it.
+    /// and sidecar records to the caller. Used by `RecordingEvent::finish`
+    /// to build the final filename's class list and the `Sidecar` written
+    /// alongside it.
     pub fn into_parts(
         self,
     ) -> (
@@ -301,32 +302,190 @@ impl ClipState {
 /// are streamed live via ffmpeg's stdin as they arrive.
 pub struct RecordingEvent {
     /// The running ffmpeg process encoding video, fed live via its stdin.
-    pub ffmpeg_video: Child,
+    ffmpeg_video: Child,
     /// Path to the temporary raw PCM file audio is buffered into.
-    pub audio_tmp_path: std::path::PathBuf,
+    audio_tmp_path: std::path::PathBuf,
     /// Open handle to `audio_tmp_path`, written to as audio arrives.
-    pub audio_file: std::fs::File,
+    audio_file: std::fs::File,
     /// Where the finished, muxed clip is written on `finish`, before any
     /// class-list rename (see `all_classes`).
-    pub final_clip_path: std::path::PathBuf,
+    final_clip_path: std::path::PathBuf,
     /// Directory recordings are written under, needed to recompute
     /// `final_clip_path` at `finish` if `all_classes` grew since `start`.
-    pub output_dir: std::path::PathBuf,
+    output_dir: std::path::PathBuf,
     /// Wall-clock time the clip started, needed (alongside `output_dir`) to
     /// recompute `final_clip_path` at `finish` via the same `clip_path`
     /// naming convention it was originally built with.
-    pub started_at: DateTime<Local>,
+    started_at: DateTime<Local>,
     /// Path to the temporary video-only file ffmpeg encodes into.
-    pub video_tmp_path: std::path::PathBuf,
+    video_tmp_path: std::path::PathBuf,
     /// Sample rate of the buffered audio, needed to mux correctly.
-    pub audio_sample_rate: u32,
+    audio_sample_rate: u32,
     /// Channel count of the buffered audio, needed to mux correctly.
-    pub audio_channels: u16,
-    /// Pure timing/bookkeeping state for this clip (see `ClipState`).
-    pub state: ClipState,
+    audio_channels: u16,
+    /// Pure timing/bookkeeping state for this clip (see `ClipState`). Kept
+    /// `pub(crate)` (not fully private) so `main.rs`'s tests can reach
+    /// `ClipState`'s own test-only helpers (e.g.
+    /// `backdate_last_real_frame_at_past_stall`) directly.
+    pub(crate) state: ClipState,
 }
 
 impl RecordingEvent {
+    /// Starts a new event: launches the video-encoding ffmpeg process and
+    /// creates the temp audio file. `final_clip_path` should already reflect
+    /// the trigger's classes/timestamp per the output layout convention
+    /// (ADR 4); this module only performs the actual encoding/muxing, not
+    /// path naming.
+    ///
+    /// `audio_sample_rate`/`audio_channels` must match whatever format the
+    /// caller's audio samples were captured/converted to (see
+    /// `capture::audio::AudioStreamInfo`), since the mux step needs the real
+    /// values to interpret the buffered PCM correctly.
+    ///
+    /// Deliberately does *not* write the pre-buffer here. See `seed`.
+    /// Writing dozens of frames synchronously on the caller's thread would
+    /// block it for long enough that real wall-clock time passes with
+    /// nothing being recorded, which shows up as a skip/jump right at the
+    /// start of the clip once live writing resumes. Callers should invoke
+    /// `seed` from whatever thread is responsible for steady-paced frame
+    /// writing instead.
+    ///
+    /// `clip_timeline_start` should be the capture timestamp of the earliest
+    /// pre-buffer frame that will be seeded into this clip (i.e. the actual
+    /// start of the video file), not the trigger instant. It's the zero
+    /// point `DetectionRecord::offset_secs` is measured from, so detections
+    /// recorded against footage that predates the trigger (the pre-buffer
+    /// window) get correct nonzero offsets instead of all reading ~0.
+    ///
+    /// `output_dir`/`started_at` must be the same values `final_clip_path`
+    /// was originally built from via `clip_path`, so `finish` can recompute
+    /// the filename with the full class list accumulated over the clip's
+    /// lifetime (ADR 4) and rename to it if it grew since `start`.
+    ///
+    /// Contains at least one `Err` arm (`spawn_video_encoder`'s/
+    /// `Command::spawn`'s exec failure) reachable only if `ffmpeg` is absent
+    /// from `PATH`, the same condition `startup::depcheck::check_ffmpeg`'s
+    /// "not found" branch already refuses to start without (ADR 5). Faking
+    /// that from a test would mean mutating the process's real `PATH` via
+    /// `std::env::set_var`, which requires `unsafe` on current stable Rust;
+    /// this crate denies `unsafe_code` outright, and mutating global process
+    /// state mid-suite would race every other test that shells out,
+    /// regardless. Everything else here (temp-file creation) is reachable
+    /// and covered by tests below.
+    pub fn start(params: RecordingEventParams) -> Result<Self> {
+        let RecordingEventParams {
+            final_clip_path,
+            output_dir,
+            started_at,
+            width,
+            height,
+            frame_rate,
+            audio_sample_rate,
+            audio_channels,
+            clip_timeline_start,
+        } = params;
+
+        let video_tmp_path = final_clip_path.with_extension("video.tmp.mp4");
+        let audio_tmp_path = final_clip_path.with_extension("audio.tmp.pcm");
+
+        let ffmpeg_video = spawn_video_encoder(&video_tmp_path, width, height, frame_rate)?;
+        let audio_file = std::fs::File::create(&audio_tmp_path).with_context(|| {
+            format!(
+                "failed to create temp audio file {}",
+                audio_tmp_path.display()
+            )
+        })?;
+
+        Ok(Self {
+            ffmpeg_video,
+            audio_tmp_path,
+            audio_file,
+            final_clip_path,
+            output_dir,
+            started_at,
+            video_tmp_path,
+            audio_sample_rate,
+            audio_channels,
+            state: ClipState::new(frame_rate, clip_timeline_start),
+        })
+    }
+
+    /// Stops encoding, muxes the buffered audio into the video, and writes
+    /// the JSON sidecar alongside the final clip.
+    ///
+    /// Contains one further irreducible `Err` arm: `Child::wait` returning
+    /// `Err` is, per the standard library's own Unix implementation, only
+    /// reachable if the process was already reaped by something else
+    /// calling `waitpid` on the same PID first (`ECHILD`). `RecordingEvent`
+    /// is the sole owner of its `Child` and this crate has no `unsafe`
+    /// escape hatch to reap a PID out from under it, so that arm is equally
+    /// unreachable from safe code. Every other path here (ffmpeg exit
+    /// status, the mux step's own nonzero-exit handling, the class-list
+    /// rename, and the sidecar write) is reachable and covered by
+    /// fault-injection tests below.
+    pub fn finish(mut self) -> Result<()> {
+        drop(self.ffmpeg_video.stdin.take());
+
+        let mut stderr = String::new();
+
+        if let Some(mut stderr_pipe) = self.ffmpeg_video.stderr.take() {
+            let _ = std::io::Read::read_to_string(&mut stderr_pipe, &mut stderr);
+        }
+
+        let status = self
+            .ffmpeg_video
+            .wait()
+            .context("ffmpeg video encoder failed")?;
+
+        if !status.success() {
+            bail!(
+                "ffmpeg video encoder exited with {status}: {}",
+                stderr.trim()
+            );
+        }
+
+        drop(self.audio_file);
+
+        mux_audio_into_video(
+            &self.video_tmp_path,
+            &self.audio_tmp_path,
+            &self.final_clip_path,
+            self.audio_sample_rate,
+            self.audio_channels,
+        )?;
+
+        let _ = std::fs::remove_file(&self.video_tmp_path);
+        let _ = std::fs::remove_file(&self.audio_tmp_path);
+
+        let (all_classes_set, detections, motion_events) = self.state.into_parts();
+        let all_classes: Vec<&str> = all_classes_set.iter().copied().collect();
+        let renamed_path = clip_path(&self.output_dir, self.started_at, &all_classes)?;
+
+        if renamed_path != self.final_clip_path {
+            std::fs::rename(&self.final_clip_path, &renamed_path).with_context(|| {
+                format!(
+                    "failed to rename clip {} to {} (reflecting every class detected during the clip, per ADR 4)",
+                    self.final_clip_path.display(),
+                    renamed_path.display()
+                )
+            })?;
+            self.final_clip_path = renamed_path;
+        }
+
+        let sidecar = Sidecar {
+            detections,
+            motion_events,
+        };
+
+        let sidecar_json =
+            serde_json::to_string_pretty(&sidecar).context("failed to serialize sidecar")?;
+
+        std::fs::write(sidecar_path(&self.final_clip_path), sidecar_json)
+            .context("failed to write sidecar file")?;
+
+        Ok(())
+    }
+
     /// Writes the pre-event buffer (frames captured before the trigger
     /// fired) into a freshly-started event. Must be called once, as the
     /// first write against a new event, before any live `write_frame`/
@@ -510,6 +669,101 @@ impl RecordingEvent {
     pub fn quiet_for(&self) -> Duration {
         self.state.quiet_for()
     }
+}
+
+/// Spawns ffmpeg to encode raw RGB frames fed via stdin into an H.264 file.
+///
+/// `Command::spawn`'s exec-failure arm is only reachable if `ffmpeg` is
+/// absent from `PATH`; see `RecordingEvent::start`'s doc comment for why
+/// that's not safely fakeable from a test.
+fn spawn_video_encoder(
+    path: &std::path::Path,
+    width: u32,
+    height: u32,
+    frame_rate: u32,
+) -> Result<Child> {
+    #[cfg(unix)]
+    use std::os::unix::process::CommandExt;
+
+    let mut command = Command::new("ffmpeg");
+
+    command
+        .args(["-y", "-loglevel", "error"])
+        .args(["-f", "rawvideo", "-pixel_format", "rgb24"])
+        .args(["-video_size", &format!("{width}x{height}")])
+        .args(["-framerate", &frame_rate.to_string()])
+        .args(["-i", "-"])
+        .args(["-c:v", "libx264", "-pix_fmt", "yuv420p"])
+        .arg(path)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped());
+
+    // Put ffmpeg in its own process group so a terminal SIGINT (Ctrl+C)
+    // doesn't reach it directly. It shares the foreground process group
+    // with motioncap by default, so without this, Ctrl+C kills ffmpeg at
+    // the same instant as motioncap's own ctrlc handler tries to close it
+    // gracefully (closing stdin, then waiting), racing ffmpeg's own SIGINT
+    // handling and producing a nonzero exit even when the output file is
+    // actually complete and valid. Graceful shutdown should be the only
+    // thing that ever tells ffmpeg to stop.
+    #[cfg(unix)]
+    command.process_group(0);
+
+    command
+        .spawn()
+        .context("failed to spawn ffmpeg video encoder")
+}
+
+/// Muxes the buffered raw audio into the encoded video. `-shortest` is
+/// deliberately not used: with independently-accumulated video/audio streams,
+/// whichever stream is shorter due to minor drift would otherwise have the
+/// *other* stream silently truncated to match, losing recorded content.
+/// Instead, the audio stream is padded with silence (`apad`) to at least the
+/// video's duration and `-shortest` is applied only to that padded output, so
+/// the result is exactly the video's length with no dropped video frames.
+///
+/// `.output()`'s exec-failure arm is only reachable if `ffmpeg` is absent
+/// from `PATH`; see `RecordingEvent::start`'s doc comment for why that's not
+/// safely fakeable from a test.
+fn mux_audio_into_video(
+    video_path: &std::path::Path,
+    audio_path: &std::path::Path,
+    output_path: &std::path::Path,
+    sample_rate: u32,
+    channels: u16,
+) -> Result<()> {
+    let output = Command::new("ffmpeg")
+        .args(["-y", "-i"])
+        .arg(video_path)
+        .args([
+            "-f",
+            "f32le",
+            "-ar",
+            &sample_rate.to_string(),
+            "-ac",
+            &channels.to_string(),
+        ])
+        .arg("-i")
+        .arg(audio_path)
+        .args(["-c:v", "copy", "-af", "apad", "-c:a", "aac", "-shortest"])
+        .arg(output_path)
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped())
+        .output()
+        .context("failed to spawn ffmpeg for audio muxing")?;
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+
+        bail!(
+            "ffmpeg audio mux exited with {}: {}",
+            output.status,
+            stderr.trim()
+        );
+    }
+
+    Ok(())
 }
 
 /// Downsamples timestamped frames to approximately `frame_rate` frames per

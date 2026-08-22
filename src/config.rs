@@ -50,6 +50,15 @@ impl Config {
     }
 }
 
+/// Parses `Config` from the process's command-line arguments. Calls clap's
+/// `Config::parse()`, which reads the real process's `std::env::args()`; a
+/// test can't safely override argv for the running test binary the way
+/// `Config::try_parse_from` lets tests supply synthetic argv, so this
+/// function itself is not covered by an automated test.
+pub fn parse_args() -> Config {
+    Config::parse()
+}
+
 #[cfg(test)]
 mod tests {
     //! Unit tests for `Config`'s CLI flag defaults and overrides.

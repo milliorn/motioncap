@@ -23,7 +23,7 @@ production code).
 mechanism `rustc`/`cargo` ship) rather than tarpaulin's ptrace-based approach.
 tarpaulin's ptrace mode has known issues with subprocess-spawning tests and FFI
 boundaries, both of which this crate has throughout (`recorder.rs` spawns real
-`ffmpeg` subprocesses — `detect.rs`/`motion_coverage_excluded.rs`/`opencv_utils.rs` cross into ONNX
+`ffmpeg` subprocesses — `detect.rs`/`motion.rs`/`opencv_utils.rs` cross into ONNX
 Runtime and OpenCV via FFI). `cargo-llvm-cov` is actively maintained, integrates with
 `cargo test` directly, and produces `--fail-under-lines`-style gates usable in CI
 alongside human-readable HTML/lcov output for local debugging. See ADR 6 for how its
