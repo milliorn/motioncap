@@ -3,6 +3,14 @@ use std::time::{Duration, Instant};
 
 use image::RgbImage;
 
+/// Common shape shared by every kind of ring-buffer entry (frames, audio),
+/// so eviction and since-filtering can be written once and reused for both
+/// rather than duplicated per entry type.
+trait Timestamped {
+    /// When this entry was captured.
+    fn timestamp(&self) -> Instant;
+}
+
 /// A captured video frame paired with the instant it arrived.
 #[derive(Clone)]
 pub struct TimestampedFrame {
@@ -12,6 +20,12 @@ pub struct TimestampedFrame {
     pub image: RgbImage,
 }
 
+impl Timestamped for TimestampedFrame {
+    fn timestamp(&self) -> Instant {
+        self.timestamp
+    }
+}
+
 /// A chunk of captured audio samples paired with the instant it arrived.
 #[derive(Clone)]
 pub struct TimestampedAudio {
@@ -19,6 +33,36 @@ pub struct TimestampedAudio {
     pub timestamp: Instant,
     /// Interleaved PCM samples for this chunk.
     pub samples: Vec<f32>,
+}
+
+impl Timestamped for TimestampedAudio {
+    fn timestamp(&self) -> Instant {
+        self.timestamp
+    }
+}
+
+/// Drops entries older than `retention` relative to `now`, oldest first.
+/// Shared by `RingBuffer::evict_frames`/`evict_audio` so the two never
+/// implement the eviction rule independently.
+fn evict<T: Timestamped>(deque: &mut VecDeque<T>, now: Instant, retention: Duration) {
+    while let Some(front) = deque.front() {
+        if now.duration_since(front.timestamp()) > retention {
+            deque.pop_front();
+        } else {
+            break;
+        }
+    }
+}
+
+/// Entries pushed strictly after `since`, oldest first. Shared by
+/// `RingBuffer::frames_since`/`audio_since` so the two never implement the
+/// same filter independently.
+fn since<T: Timestamped + Clone>(deque: &VecDeque<T>, since: Instant) -> Vec<T> {
+    deque
+        .iter()
+        .filter(|entry| entry.timestamp() > since)
+        .cloned()
+        .collect()
 }
 
 /// Rolling window of the last `retention` worth of frames and audio, so a
@@ -64,24 +108,12 @@ impl RingBuffer {
 
     /// Drops frames older than `retention` relative to `now`.
     fn evict_frames(&mut self, now: Instant) {
-        while let Some(front) = self.frames.front() {
-            if now.duration_since(front.timestamp) > self.retention {
-                self.frames.pop_front();
-            } else {
-                break;
-            }
-        }
+        evict(&mut self.frames, now, self.retention);
     }
 
     /// Drops audio chunks older than `retention` relative to `now`.
     fn evict_audio(&mut self, now: Instant) {
-        while let Some(front) = self.audio.front() {
-            if now.duration_since(front.timestamp) > self.retention {
-                self.audio.pop_front();
-            } else {
-                break;
-            }
-        }
+        evict(&mut self.audio, now, self.retention);
     }
 
     /// Snapshot of everything currently buffered, oldest first. Used to seed a
@@ -104,24 +136,16 @@ impl RingBuffer {
     /// latest silently skips any frame that arrived and was superseded
     /// before the writer's next poll, which shows up as a visible jump in
     /// the subject's position despite otherwise-correct frame timestamps.
-    pub fn frames_since(&self, since: Instant) -> Vec<TimestampedFrame> {
-        self.frames
-            .iter()
-            .filter(|frame| frame.timestamp > since)
-            .cloned()
-            .collect()
+    pub fn frames_since(&self, since_ts: Instant) -> Vec<TimestampedFrame> {
+        since(&self.frames, since_ts)
     }
 
     /// Audio chunks pushed strictly after `since`, oldest first. Used to drain
     /// newly-captured audio into an active recording each poll, so live clips
     /// keep accumulating audio for their full duration instead of only ever
     /// containing the pre-buffer's audio.
-    pub fn audio_since(&self, since: Instant) -> Vec<TimestampedAudio> {
-        self.audio
-            .iter()
-            .filter(|chunk| chunk.timestamp > since)
-            .cloned()
-            .collect()
+    pub fn audio_since(&self, since_ts: Instant) -> Vec<TimestampedAudio> {
+        since(&self.audio, since_ts)
     }
 }
 
