@@ -53,7 +53,7 @@ use anyhow::{Context, Result};
 
 use buffer::RingBuffer;
 use config::Config;
-use confirmation::PendingConfirmation;
+use confirmation::{ActiveEventPending, PreTriggerPending};
 use detect::Detector;
 use event_lifecycle::{
     ActiveEvent, close_event_if_done, finish_event_on_shutdown, seed_and_drain_active_event,
@@ -256,15 +256,15 @@ fn run_detection_loop(
     let mut reconnected_at: Option<std::time::Instant> = None;
     // A first, unconfirmed living-thing sighting awaiting a second one to
     // start a recording (see `confirm_pending` / `PENDING_CONFIRMATION_WINDOW`).
-    let mut pending_confirmation: Option<PendingConfirmation> = None;
+    let mut pending_confirmation = PreTriggerPending::default();
     // The equivalent pending state for a recording already in progress (see
-    // `evaluate_active_event`). Kept separate from `pending_confirmation`
-    // rather than shared: they answer different questions (whether to start
-    // a new recording vs. whether to trust a hit enough to extend one
-    // already justified by an earlier confirmed detection), and sharing
-    // state across that boundary would let a stale pre-recording sighting
-    // spuriously confirm a hit against an event it had nothing to do with.
-    let mut active_pending_confirmation: Option<PendingConfirmation> = None;
+    // `evaluate_active_event`). A distinct type from `pending_confirmation`
+    // (not just a second `Option<PendingConfirmation>`) rather than shared:
+    // see `PreTriggerPending`'s doc comment for why sharing state across that
+    // boundary would let a stale pre-recording sighting spuriously confirm a
+    // hit against an event it had nothing to do with, and why the type
+    // system (not just convention) now rules that out.
+    let mut active_pending_confirmation = ActiveEventPending::default();
 
     loop {
         if shutdown.load(Ordering::SeqCst) {
@@ -328,7 +328,7 @@ fn run_detection_loop(
             continue;
         }
 
-        active_pending_confirmation = None;
+        active_pending_confirmation = ActiveEventPending::default();
 
         try_start_recording(
             &config,

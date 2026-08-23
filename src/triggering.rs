@@ -5,7 +5,7 @@ use anyhow::Result;
 
 use crate::buffer::RingBuffer;
 use crate::config::Config;
-use crate::confirmation::{PendingConfirmation, poll_confirmed_detections};
+use crate::confirmation::{ActiveEventPending, PreTriggerPending, poll_confirmed_detections};
 use crate::detect::Detector;
 use crate::event_lifecycle::{ActiveEvent, PendingEvent, close_event_if_done};
 use crate::motion::MotionGate;
@@ -69,7 +69,7 @@ pub fn evaluate_active_event(
     frame: &image::RgbImage,
     frame_timestamp: std::time::Instant,
     post_buffer: Duration,
-    pending_confirmation: &mut Option<PendingConfirmation>,
+    pending_confirmation: &mut ActiveEventPending,
 ) -> Result<()> {
     let motion = motion_gate.evaluate(frame)?;
 
@@ -78,7 +78,7 @@ pub fn evaluate_active_event(
     // to keep writing frames/audio at a steady pace while this runs, not
     // blocked waiting on this lock.
     let confirmed = if motion.tripped {
-        poll_confirmed_detections(detector, config, frame, pending_confirmation)?
+        poll_confirmed_detections(detector, config, frame, &mut pending_confirmation.0)?
     } else {
         None
     };
@@ -144,7 +144,7 @@ pub fn try_start_recording(
     audio: &AudioParams,
     frame: &image::RgbImage,
     frame_timestamp: std::time::Instant,
-    pending_confirmation: &mut Option<PendingConfirmation>,
+    pending_confirmation: &mut PreTriggerPending,
     reconnected_at: Option<std::time::Instant>,
 ) -> Result<()> {
     let motion = motion_gate.evaluate(frame)?;
@@ -170,7 +170,7 @@ pub fn try_start_recording(
         // otherwise left untouched so a still-present subject simply
         // re-confirms and retries on the next poll instead of needing a
         // fresh two-poll confirmation cycle once the buffer is ready.
-        crate::confirmation::expire_stale_pending(pending_confirmation, frame_timestamp);
+        crate::confirmation::expire_stale_pending(&mut pending_confirmation.0, frame_timestamp);
 
         log::debug!(
             "motion tripped but recording start held back; ring buffer still refilling after \
@@ -180,7 +180,8 @@ pub fn try_start_recording(
         return Ok(());
     }
 
-    let Some(confirmed) = poll_confirmed_detections(detector, config, frame, pending_confirmation)?
+    let Some(confirmed) =
+        poll_confirmed_detections(detector, config, frame, &mut pending_confirmation.0)?
     else {
         return Ok(());
     };
@@ -240,7 +241,7 @@ pub fn try_start_recording(
     // first poll if it happens to land within the window, exactly the
     // stale-state hazard `active_pending_confirmation` is kept separate from
     // `pending_confirmation` to avoid on the active-event side.
-    *pending_confirmation = None;
+    pending_confirmation.0 = None;
 
     Ok(())
 }
@@ -263,6 +264,7 @@ mod tests {
 
     use clap::Parser as _;
 
+    use crate::confirmation::PendingConfirmation;
     use crate::detect;
     use crate::test_support::test_recording_event;
 
@@ -346,7 +348,7 @@ mod tests {
         let mut motion_gate = MotionGate::new(config.motion_threshold).unwrap();
         let mut detector = test_detector();
         let active_event = Arc::new(Mutex::new(ActiveEvent::None));
-        let mut pending = None;
+        let mut pending = ActiveEventPending::default();
 
         let result = evaluate_active_event(
             &config,
@@ -377,7 +379,7 @@ mod tests {
         let active_event = Arc::new(Mutex::new(ActiveEvent::Active(test_recording_event(
             dir.path(),
         ))));
-        let mut pending = None;
+        let mut pending = ActiveEventPending::default();
 
         for _ in 0..5 {
             motion_gate.evaluate(&background_frame()).unwrap();
@@ -423,7 +425,7 @@ mod tests {
         let active_event = Arc::new(Mutex::new(ActiveEvent::Active(test_recording_event(
             dir.path(),
         ))));
-        let mut pending = None;
+        let mut pending = ActiveEventPending::default();
 
         for _ in 0..5 {
             motion_gate.evaluate(&background_frame()).unwrap();
@@ -476,7 +478,7 @@ mod tests {
         let active_event = Arc::new(Mutex::new(ActiveEvent::Active(test_recording_event(
             dir.path(),
         ))));
-        let mut pending = None;
+        let mut pending = ActiveEventPending::default();
 
         for _ in 0..5 {
             motion_gate.evaluate(&background_frame()).unwrap();
@@ -514,7 +516,7 @@ mod tests {
             sample_rate: 8000,
             channels: 1,
         };
-        let mut pending = None;
+        let mut pending = PreTriggerPending::default();
 
         for _ in 0..5 {
             motion_gate.evaluate(&background_frame()).unwrap();
@@ -554,7 +556,7 @@ mod tests {
             sample_rate: 8000,
             channels: 1,
         };
-        let mut pending = None;
+        let mut pending = PreTriggerPending::default();
 
         for _ in 0..5 {
             motion_gate.evaluate(&background_frame()).unwrap();
@@ -620,7 +622,7 @@ mod tests {
             sample_rate: 8000,
             channels: 1,
         };
-        let mut pending = None;
+        let mut pending = PreTriggerPending::default();
 
         for _ in 0..5 {
             motion_gate.evaluate(&background_frame()).unwrap();
@@ -672,10 +674,10 @@ mod tests {
             sample_rate: 8000,
             channels: 1,
         };
-        let mut pending = Some(PendingConfirmation {
+        let mut pending = PreTriggerPending(Some(PendingConfirmation {
             class_name: "person",
             first_seen: Instant::now(),
-        });
+        }));
 
         for _ in 0..5 {
             motion_gate.evaluate(&background_frame()).unwrap();
@@ -701,6 +703,6 @@ mod tests {
         // a still-present subject should simply re-confirm and retry on the
         // next poll instead of needing a fresh two-poll confirmation cycle
         // once the buffer is ready.
-        assert_eq!(pending.map(|p| p.class_name), Some("person"));
+        assert_eq!(pending.0.map(|p| p.class_name), Some("person"));
     }
 }

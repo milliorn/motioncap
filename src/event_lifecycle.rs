@@ -315,7 +315,7 @@ mod tests {
             .unwrap()
             .as_recording_mut()
             .unwrap()
-            .state
+            .state_mut()
             .backdate_last_real_frame_at_past_stall();
 
         close_event_if_done(event.lock().unwrap(), Duration::from_mins(1)).unwrap();

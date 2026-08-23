@@ -72,14 +72,19 @@ pub struct RecordingEvent {
     audio_sample_rate: u32,
     /// Channel count of the buffered audio, needed to mux correctly.
     audio_channels: u16,
-    /// Pure timing/bookkeeping state for this clip (see `ClipState`). Kept
-    /// `pub(crate)` (not fully private) so `event_lifecycle.rs`'s tests can
-    /// reach `ClipState`'s own test-only helpers (e.g.
-    /// `backdate_last_real_frame_at_past_stall`) directly.
-    pub(crate) state: ClipState,
+    /// Pure timing/bookkeeping state for this clip (see `ClipState`).
+    state: ClipState,
 }
 
 impl RecordingEvent {
+    /// Exposes the pure `ClipState` for tests elsewhere (e.g.
+    /// `event_lifecycle.rs`) that need to reach its test-only helpers (e.g.
+    /// `backdate_last_real_frame_at_past_stall`) directly.
+    #[cfg(test)]
+    pub(crate) const fn state_mut(&mut self) -> &mut ClipState {
+        &mut self.state
+    }
+
     /// Starts a new event: launches the video-encoding ffmpeg process and
     /// creates the temp audio file. `final_clip_path` should already reflect
     /// the trigger's classes/timestamp per the output layout convention
