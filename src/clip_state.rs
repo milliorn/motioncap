@@ -29,33 +29,33 @@ pub fn frame_tick(frame_rate: u32) -> Duration {
 /// `RecordingEvent` still owns and drives through this struct's methods.
 pub struct ClipState {
     /// Configured video frame rate for this clip.
-    pub frame_rate: u32,
+    pub(crate) frame_rate: u32,
     /// Capture timestamp of the clip's first frame (the start of the
     /// pre-buffer window, not the trigger instant), used as the zero point
     /// for `DetectionRecord::offset_secs`.
     clip_timeline_start: Instant,
     /// When the most recent triggering detection occurred (drives the post-buffer quiet window).
-    pub last_trigger_at: Instant,
+    pub(crate) last_trigger_at: Instant,
     /// Timestamp up to which audio has already been drained.
-    pub last_audio_drain_at: Instant,
+    pub(crate) last_audio_drain_at: Instant,
     /// Timestamp up to which frames have already been drained.
-    pub last_frame_drain_at: Instant,
+    pub(crate) last_frame_drain_at: Instant,
     /// The next frame-rate tick due to be written, if any.
-    pub next_frame_due: Option<Instant>,
+    pub(crate) next_frame_due: Option<Instant>,
     /// Wall-clock time a real, camera-delivered frame was last written. Used
     /// by `camera_stalled` to detect when the camera has stopped delivering
     /// frames. A security recording must never paper over a gap by
     /// fabricating footage, so unlike a naive resampler this never duplicates
     /// a frame to fill a missed tick; it reports the stall instead.
-    pub last_real_frame_at: Instant,
+    pub(crate) last_real_frame_at: Instant,
     /// Every distinct class detected so far during this clip (ADR 4: the
     /// final filename must reflect every class seen over the clip's
     /// lifetime, not just the classes that triggered it).
-    pub all_classes: BTreeSet<&'static str>,
+    pub(crate) all_classes: BTreeSet<&'static str>,
     /// Every detection recorded so far during this clip.
-    pub detections: Vec<DetectionRecord>,
+    pub(crate) detections: Vec<DetectionRecord>,
     /// Every motion-gate trip recorded so far during this clip.
-    pub motion_events: Vec<MotionEvent>,
+    pub(crate) motion_events: Vec<MotionEvent>,
 }
 
 impl ClipState {

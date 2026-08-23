@@ -73,8 +73,8 @@ pub struct RecordingEvent {
     /// Channel count of the buffered audio, needed to mux correctly.
     audio_channels: u16,
     /// Pure timing/bookkeeping state for this clip (see `ClipState`). Kept
-    /// `pub(crate)` (not fully private) so `main.rs`'s tests can reach
-    /// `ClipState`'s own test-only helpers (e.g.
+    /// `pub(crate)` (not fully private) so `event_lifecycle.rs`'s tests can
+    /// reach `ClipState`'s own test-only helpers (e.g.
     /// `backdate_last_real_frame_at_past_stall`) directly.
     pub(crate) state: ClipState,
 }

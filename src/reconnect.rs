@@ -114,7 +114,7 @@ pub fn frame_liveness_advanced(
 /// last reconnect attempt (if any) was more than `CAMERA_RECONNECT_COOLDOWN`
 /// ago, so a camera that stays absent doesn't get a rebuild attempt on every
 /// single poll tick while it's gone.
-pub fn should_reconnect(
+fn should_reconnect(
     last_seen: Option<&FrameLiveness>,
     last_reconnect_attempt: Option<std::time::Instant>,
     now: std::time::Instant,

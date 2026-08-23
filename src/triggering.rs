@@ -204,6 +204,9 @@ pub fn try_start_recording(
 
     let started_at = chrono::Local::now();
     let path = clip_path(&config.output_dir, started_at, &classes)?;
+
+    log::info!("recording started: {classes:?} -> {}", path.display());
+
     let mut event = RecordingEvent::start(RecordingEventParams {
         final_clip_path: path,
         output_dir: config.output_dir.clone(),
@@ -221,8 +224,6 @@ pub fn try_start_recording(
     for d in &confirmed {
         event.record_detection(d.class_name, d.confidence, frame_timestamp);
     }
-
-    log::info!("recording started: {classes:?}");
 
     *active_event.lock().expect("active event lock poisoned") =
         ActiveEvent::Pending(PendingEvent {
