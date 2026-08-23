@@ -4,13 +4,13 @@ use std::time::Duration;
 use anyhow::Result;
 
 use crate::buffer::RingBuffer;
+use crate::clip_state::pre_buffer_ready;
 use crate::config::Config;
 use crate::confirmation::{ActiveEventPending, PreTriggerPending, poll_confirmed_detections};
 use crate::detect::Detector;
 use crate::event_lifecycle::{ActiveEvent, PendingEvent, close_event_if_done};
 use crate::motion::MotionGate;
 use crate::paths::clip_path;
-use crate::reconnect::pre_buffer_ready;
 use crate::recorder::{RecordingEvent, RecordingEventParams};
 
 /// Recorded video frame rate, used by the writer thread and the video

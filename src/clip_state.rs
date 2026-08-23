@@ -21,6 +21,37 @@ pub fn frame_tick(frame_rate: u32) -> Duration {
     Duration::from_secs_f64(1.0 / f64::from(frame_rate))
 }
 
+/// `false` while the ring buffer hasn't yet had `pre_buffer_secs` worth of
+/// wall-clock time to refill since the capture stream was last rebuilt by
+/// `reconnect::maybe_reconnect_camera`.
+///
+/// A reconnect drops the old `CallbackCamera` and opens a fresh one (see
+/// `maybe_reconnect_camera`'s doc comment), so the ring buffer starts
+/// effectively empty at that instant: it only evicts on `push_frame`, but
+/// nothing pushes *new* frames into it during the stall, and any frames
+/// still sitting in it are the stale pre-stall ones the trigger's pre-buffer
+/// snapshot has no use for as genuine lead-in. If a trigger fires before the
+/// buffer has had a full `pre_buffer_secs` to refill from the rebuilt
+/// stream, `try_start_recording` would seed the new clip with only the
+/// handful of seconds actually captured since reconnect, instead of the
+/// configured lead-in, producing a clip that opens abruptly mid-action
+/// rather than easing in (observed directly: a reconnect completing ~4s
+/// before the next confirmed trigger produced a clip with ~4s of pre-roll
+/// against a configured 10s). `reconnected_at` is `None` before any
+/// reconnect has happened this run, in which case the buffer has had the
+/// entire process lifetime to fill and this always returns `true`.
+pub fn pre_buffer_ready(
+    reconnected_at: Option<Instant>,
+    pre_buffer_secs: u32,
+    now: Instant,
+) -> bool {
+    let Some(reconnected_at) = reconnected_at else {
+        return true;
+    };
+
+    now.duration_since(reconnected_at) >= Duration::from_secs(u64::from(pre_buffer_secs))
+}
+
 /// Pure timing/bookkeeping state for a single recorded clip, split out from
 /// `RecordingEvent` so it can be unit-tested by constructing a bare
 /// `ClipState` directly, with no ffmpeg process or temp files involved. Holds
@@ -244,6 +275,34 @@ mod tests {
     )]
 
     use super::*;
+
+    // --- pre_buffer_ready ---
+
+    #[test]
+    fn pre_buffer_ready_true_when_no_reconnect_tracked() {
+        let now = Instant::now();
+        assert!(pre_buffer_ready(None, 10, now));
+    }
+
+    #[test]
+    fn pre_buffer_ready_false_before_pre_buffer_secs_have_elapsed() {
+        let now = Instant::now();
+        let reconnected_at = now - Duration::from_secs(4);
+        assert!(!pre_buffer_ready(Some(reconnected_at), 10, now));
+    }
+
+    #[test]
+    fn pre_buffer_ready_true_once_pre_buffer_secs_have_elapsed() {
+        let now = Instant::now();
+        let reconnected_at = now - Duration::from_secs(10);
+        assert!(pre_buffer_ready(Some(reconnected_at), 10, now));
+    }
+
+    #[test]
+    fn pre_buffer_ready_true_immediately_when_pre_buffer_secs_is_zero() {
+        let now = Instant::now();
+        assert!(pre_buffer_ready(Some(now), 0, now));
+    }
 
     // --- ClipState ---
 

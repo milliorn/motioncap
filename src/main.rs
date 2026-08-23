@@ -17,6 +17,8 @@ mod detect;
 mod event_lifecycle;
 /// ffmpeg subprocess helpers (video encoder, audio mux, resampling).
 mod ffmpeg;
+/// Camera liveness/stall detection (no camera dependency).
+mod liveness;
 /// Logging setup (`init_logging`, `TeeWriter`).
 mod logging;
 /// Background-subtraction motion gate.
@@ -27,7 +29,7 @@ mod opencv_utils;
 mod paths;
 /// Opt-in live preview window.
 mod preview;
-/// Camera liveness/stall detection and reconnect logic.
+/// Camera reconnect gating and stream-rebuild mechanism.
 mod reconnect;
 /// Recording lifecycle and ffmpeg-backed encoding.
 mod recorder;
@@ -58,13 +60,11 @@ use detect::Detector;
 use event_lifecycle::{
     ActiveEvent, close_event_if_done, finish_event_on_shutdown, seed_and_drain_active_event,
 };
+use liveness::{FrameLiveness, frame_liveness_advanced, reset_liveness_after_reconnect};
 use logging::init_logging;
 use motion::MotionGate;
 use preview::PreviewWindow;
-use reconnect::{
-    DetectionCamera, FrameLiveness, frame_liveness_advanced, maybe_reconnect_camera,
-    reset_liveness_after_reconnect,
-};
+use reconnect::{DetectionCamera, maybe_reconnect_camera};
 use triggering::{
     AudioParams, RECORDING_POLL_INTERVAL, evaluate_active_event, try_start_recording,
 };

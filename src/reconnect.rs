@@ -3,7 +3,7 @@ use std::time::Duration;
 
 use crate::buffer::RingBuffer;
 use crate::capture;
-use crate::clip_state;
+use crate::liveness::FrameLiveness;
 
 /// How long a camera stall (see `FrameLiveness`) must persist before
 /// `run_detection_loop` tears down and rebuilds the capture stream, rather
@@ -25,30 +25,6 @@ pub const CAMERA_RECONNECT_STALL: Duration = Duration::from_secs(15);
 /// reopen attempt on every single detection poll while it's absent.
 pub const CAMERA_RECONNECT_COOLDOWN: Duration = Duration::from_secs(10);
 
-/// Tracks the most recent frame timestamp `run_detection_loop` has evaluated,
-/// and how long that timestamp has been unchanged, to detect a stalled camera
-/// before any recording has started (see `frame_liveness_advanced`).
-pub struct FrameLiveness {
-    /// The last frame timestamp actually evaluated.
-    timestamp: std::time::Instant,
-    /// When `timestamp` was first observed to still be the latest frame.
-    unchanged_since: std::time::Instant,
-    /// Whether the stall warning has already been logged for this
-    /// `timestamp`, so a still-stalled camera logs once per episode instead
-    /// of once per poll.
-    warned: bool,
-}
-
-impl FrameLiveness {
-    /// How long `timestamp` has been the latest frame seen, as of `now`.
-    /// Shared by every threshold checked against this stall (see
-    /// `frame_liveness_advanced`, `maybe_reconnect_camera`) so they all read
-    /// one computation over `unchanged_since` instead of each re-deriving it.
-    fn stalled_for(&self, now: std::time::Instant) -> Duration {
-        now.duration_since(self.unchanged_since)
-    }
-}
-
 /// The shared camera handle `run_detection_loop` polls liveness against and,
 /// on a prolonged stall, rebuilds via `maybe_reconnect_camera`. Bundled
 /// together (rather than passed as two separate `run_detection_loop`
@@ -63,49 +39,6 @@ pub struct DetectionCamera {
     /// The originally configured device (or `None` for auto-detect), reused
     /// unchanged on every reconnect attempt.
     pub device: Option<std::path::PathBuf>,
-}
-
-/// Updates `last_seen` for a newly-polled `latest_frame` timestamp and
-/// reports whether the loop should proceed with it. Returns `false` once the
-/// same timestamp has recurred for `clip_state::MAX_FRAME_STALL`, i.e.
-/// `latest_frame()` is returning a frame the camera delivered a while ago,
-/// not a fresh one, which otherwise would get silently re-run through
-/// motion/YOLO on every poll and cascade into duplicate recordings. A
-/// same-timestamp recurrence shorter than that is ordinary jitter between
-/// polls and camera delivery, not a stall, so it's allowed through unlogged.
-/// The stall is logged once (not once per poll) when it's first detected.
-pub fn frame_liveness_advanced(
-    last_seen: &mut Option<FrameLiveness>,
-    frame_timestamp: std::time::Instant,
-) -> bool {
-    let now = std::time::Instant::now();
-
-    match last_seen {
-        Some(seen) if seen.timestamp == frame_timestamp => {
-            if seen.stalled_for(now) < clip_state::MAX_FRAME_STALL {
-                return true;
-            }
-
-            if !seen.warned {
-                log::warn!(
-                    "camera appears stalled: no new frame since {:?}; skipping detection ticks until it recovers",
-                    seen.timestamp
-                );
-                seen.warned = true;
-            }
-
-            false
-        }
-        _ => {
-            *last_seen = Some(FrameLiveness {
-                timestamp: frame_timestamp,
-                unchanged_since: now,
-                warned: false,
-            });
-
-            true
-        }
-    }
 }
 
 /// The pure threshold/cooldown decision behind `maybe_reconnect_camera`,
@@ -193,65 +126,12 @@ pub fn maybe_reconnect_camera(
     }
 }
 
-/// `false` while the ring buffer hasn't yet had `pre_buffer_secs` worth of
-/// wall-clock time to refill since the capture stream was last rebuilt by
-/// `maybe_reconnect_camera`.
-///
-/// A reconnect drops the old `CallbackCamera` and opens a fresh one (see
-/// `maybe_reconnect_camera`'s doc comment), so the ring buffer starts
-/// effectively empty at that instant: it only evicts on `push_frame`, but
-/// nothing pushes *new* frames into it during the stall, and any frames
-/// still sitting in it are the stale pre-stall ones the trigger's pre-buffer
-/// snapshot has no use for as genuine lead-in. If a trigger fires before the
-/// buffer has had a full `pre_buffer_secs` to refill from the rebuilt
-/// stream, `try_start_recording` would seed the new clip with only the
-/// handful of seconds actually captured since reconnect, instead of the
-/// configured lead-in, producing a clip that opens abruptly mid-action
-/// rather than easing in (observed directly: a reconnect completing ~4s
-/// before the next confirmed trigger produced a clip with ~4s of pre-roll
-/// against a configured 10s). `reconnected_at` is `None` before any
-/// reconnect has happened this run, in which case the buffer has had the
-/// entire process lifetime to fill and this always returns `true`.
-pub fn pre_buffer_ready(
-    reconnected_at: Option<std::time::Instant>,
-    pre_buffer_secs: u32,
-    now: std::time::Instant,
-) -> bool {
-    let Some(reconnected_at) = reconnected_at else {
-        return true;
-    };
-
-    now.duration_since(reconnected_at) >= Duration::from_secs(u64::from(pre_buffer_secs))
-}
-
-/// Called after `maybe_reconnect_camera` rebuilds the stream, in place of
-/// clearing `last_seen` to `None`.
-///
-/// The ring buffer only evicts frames on `push_frame`, so `latest_frame()`
-/// can keep returning the pre-reconnect stale frame until the rebuilt stream
-/// delivers its first one. Clearing to `None` would let
-/// `frame_liveness_advanced` treat that same stale frame as freshly "live" on
-/// the very next tick (its `_` match arm resets unconditionally), skipping
-/// the `MAX_FRAME_STALL` grace period entirely and re-running motion/YOLO on
-/// stale data. Keeping `timestamp` as-is means a still-stale frame is still
-/// recognized as unchanged, while resetting `unchanged_since` to now restarts
-/// both the `MAX_FRAME_STALL` pause clock and (via `stalled_for`) the
-/// `CAMERA_RECONNECT_STALL` clock, so a rebuilt stream that stalls again
-/// immediately doesn't instantly qualify for another reconnect attempt.
-/// `warned` is also reset so the next stall episode logs again.
-pub fn reset_liveness_after_reconnect(last_seen: &mut Option<FrameLiveness>) {
-    if let Some(seen) = last_seen {
-        seen.unchanged_since = std::time::Instant::now();
-        seen.warned = false;
-    }
-}
-
 #[cfg(test)]
 mod tests {
-    //! Unit tests for the pure decision logic backing camera stall detection
-    //! and reconnect gating. `maybe_reconnect_camera` itself opens a real
-    //! camera device past its `should_reconnect` guard, so it's not
-    //! unit-tested directly; the guard logic is tested here instead.
+    //! Unit tests for the pure decision logic backing reconnect gating.
+    //! `maybe_reconnect_camera` itself opens a real camera device past its
+    //! `should_reconnect` guard, so it's not unit-tested directly; the guard
+    //! logic is tested here instead.
     #![allow(
         clippy::unwrap_used,
         clippy::missing_panics_doc,
@@ -263,92 +143,6 @@ mod tests {
     use std::time::{Duration, Instant};
 
     use super::*;
-
-    // --- frame_liveness_advanced ---
-
-    #[test]
-    fn frame_liveness_advanced_true_on_first_observation() {
-        let mut last_seen = None;
-        let ts = Instant::now();
-
-        assert!(frame_liveness_advanced(&mut last_seen, ts));
-        assert!(last_seen.is_some());
-    }
-
-    #[test]
-    fn frame_liveness_advanced_true_on_new_timestamp() {
-        let mut last_seen = Some(FrameLiveness {
-            timestamp: Instant::now(),
-            unchanged_since: Instant::now(),
-            warned: true,
-        });
-
-        let new_ts = Instant::now() + Duration::from_millis(100);
-        assert!(frame_liveness_advanced(&mut last_seen, new_ts));
-        // Resets tracking for the new timestamp.
-        assert_eq!(last_seen.unwrap().timestamp, new_ts);
-    }
-
-    #[test]
-    fn frame_liveness_advanced_true_on_same_timestamp_within_stall_threshold() {
-        let ts = Instant::now();
-        let mut last_seen = Some(FrameLiveness {
-            timestamp: ts,
-            unchanged_since: Instant::now(),
-            warned: false,
-        });
-
-        assert!(frame_liveness_advanced(&mut last_seen, ts));
-    }
-
-    #[test]
-    fn frame_liveness_advanced_false_and_warns_once_past_stall_threshold() {
-        // clip_state::MAX_FRAME_STALL is a hardcoded const (1.5s), not
-        // injectable, so this test genuinely waits it out rather than
-        // asserting the boundary logic through a shortened duration.
-        let ts = Instant::now();
-        let mut last_seen = Some(FrameLiveness {
-            timestamp: ts,
-            unchanged_since: Instant::now()
-                - clip_state::MAX_FRAME_STALL
-                - Duration::from_millis(50),
-            warned: false,
-        });
-
-        assert!(!frame_liveness_advanced(&mut last_seen, ts));
-        assert!(last_seen.as_ref().unwrap().warned);
-
-        // A second poll past the threshold must not re-log (warned stays true,
-        // not reset), matching "logged once per episode, not once per poll".
-        assert!(!frame_liveness_advanced(&mut last_seen, ts));
-        assert!(last_seen.unwrap().warned);
-    }
-
-    // --- reset_liveness_after_reconnect ---
-
-    #[test]
-    fn reset_liveness_after_reconnect_resets_warned_and_clock_but_not_timestamp() {
-        let original_ts = Instant::now() - Duration::from_secs(30);
-        let mut last_seen = Some(FrameLiveness {
-            timestamp: original_ts,
-            unchanged_since: original_ts,
-            warned: true,
-        });
-
-        reset_liveness_after_reconnect(&mut last_seen);
-
-        let seen = last_seen.unwrap();
-        assert_eq!(seen.timestamp, original_ts);
-        assert!(!seen.warned);
-        assert!(seen.unchanged_since > original_ts);
-    }
-
-    #[test]
-    fn reset_liveness_after_reconnect_is_noop_on_none() {
-        let mut last_seen: Option<FrameLiveness> = None;
-        reset_liveness_after_reconnect(&mut last_seen);
-        assert!(last_seen.is_none());
-    }
 
     // --- should_reconnect ---
 
@@ -402,33 +196,5 @@ mod tests {
         };
         let last_attempt = now - CAMERA_RECONNECT_COOLDOWN - Duration::from_secs(1);
         assert!(should_reconnect(Some(&seen), Some(last_attempt), now));
-    }
-
-    // --- pre_buffer_ready ---
-
-    #[test]
-    fn pre_buffer_ready_true_when_no_reconnect_tracked() {
-        let now = Instant::now();
-        assert!(pre_buffer_ready(None, 10, now));
-    }
-
-    #[test]
-    fn pre_buffer_ready_false_before_pre_buffer_secs_have_elapsed() {
-        let now = Instant::now();
-        let reconnected_at = now - Duration::from_secs(4);
-        assert!(!pre_buffer_ready(Some(reconnected_at), 10, now));
-    }
-
-    #[test]
-    fn pre_buffer_ready_true_once_pre_buffer_secs_have_elapsed() {
-        let now = Instant::now();
-        let reconnected_at = now - Duration::from_secs(10);
-        assert!(pre_buffer_ready(Some(reconnected_at), 10, now));
-    }
-
-    #[test]
-    fn pre_buffer_ready_true_immediately_when_pre_buffer_secs_is_zero() {
-        let now = Instant::now();
-        assert!(pre_buffer_ready(Some(now), 0, now));
     }
 }
