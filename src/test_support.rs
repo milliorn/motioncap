@@ -8,6 +8,43 @@ use crate::buffer::TimestampedFrame;
 use crate::paths::clip_path;
 use crate::recorder::{RecordingEvent, RecordingEventParams};
 
+/// Starts a real (ffmpeg-backed) 2x2 `RecordingEvent` in `dir`, unseeded, for
+/// tests that need to exercise the `Pending` (not yet seeded) state itself,
+/// e.g. wrapping the result in `ActiveEvent::Pending` to test
+/// `seed_and_drain_active_event`. Most tests want an already-seeded event
+/// instead; see `test_recording_event`.
+///
+/// Takes `clip_timeline_start` as a parameter, rather than generating its own
+/// `Instant::now()`, so a caller that goes on to seed the event (as
+/// `test_recording_event` does) can timestamp that first frame at exactly
+/// `clip_timeline_start` per `RecordingEventParams`'s contract ("the capture
+/// timestamp of the earliest pre-buffer frame"), instead of a slightly later
+/// `Instant` that would throw off `offset_secs` for that frame.
+#[allow(
+    clippy::unwrap_used,
+    reason = "test fixture; panics here fail whichever test called it, which is the intended behavior"
+)]
+pub fn test_pending_recording_event(
+    dir: &std::path::Path,
+    clip_timeline_start: std::time::Instant,
+) -> RecordingEvent {
+    let started_at = chrono::Local::now();
+    let path = clip_path(dir, started_at, &[]).unwrap();
+
+    RecordingEvent::start(RecordingEventParams {
+        final_clip_path: path,
+        output_dir: dir.to_path_buf(),
+        started_at,
+        width: 2,
+        height: 2,
+        frame_rate: 5,
+        audio_sample_rate: 8000,
+        audio_channels: 1,
+        clip_timeline_start,
+    })
+    .unwrap()
+}
+
 /// Starts a real (ffmpeg-backed) 2x2 `RecordingEvent` in `dir` and seeds it
 /// with one frame, for tests that need an actual `ActiveEvent::Active`
 /// rather than `None`.
@@ -28,27 +65,13 @@ use crate::recorder::{RecordingEvent, RecordingEventParams};
 )]
 pub fn test_recording_event(dir: &std::path::Path) -> RecordingEvent {
     let clip_timeline_start = std::time::Instant::now();
-    let started_at = chrono::Local::now();
-    let path = clip_path(dir, started_at, &[]).unwrap();
-
-    let mut event = RecordingEvent::start(RecordingEventParams {
-        final_clip_path: path,
-        output_dir: dir.to_path_buf(),
-        started_at,
-        width: 2,
-        height: 2,
-        frame_rate: 5,
-        audio_sample_rate: 8000,
-        audio_channels: 1,
-        clip_timeline_start,
-    })
-    .unwrap();
+    let mut event = test_pending_recording_event(dir, clip_timeline_start);
 
     event
         .seed(
             &[TimestampedFrame {
                 timestamp: clip_timeline_start,
-                image: image::RgbImage::new(2, 2),
+                image: std::sync::Arc::new(image::RgbImage::new(2, 2)),
             }],
             &[],
         )

@@ -477,7 +477,7 @@ mod tests {
     fn even_sized_frame_at(timestamp: Instant) -> TimestampedFrame {
         TimestampedFrame {
             timestamp,
-            image: image::RgbImage::new(2, 2),
+            image: std::sync::Arc::new(image::RgbImage::new(2, 2)),
         }
     }
 

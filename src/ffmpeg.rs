@@ -159,7 +159,7 @@ mod tests {
     fn frame_at(timestamp: Instant) -> TimestampedFrame {
         TimestampedFrame {
             timestamp,
-            image: image::RgbImage::new(1, 1),
+            image: std::sync::Arc::new(image::RgbImage::new(1, 1)),
         }
     }
 

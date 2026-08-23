@@ -205,7 +205,7 @@ mod tests {
         reason = "test assertions favor unwrap for clarity; panics here fail the test, which is the intended behavior"
     )]
 
-    use crate::test_support::test_recording_event;
+    use crate::test_support::{test_pending_recording_event, test_recording_event};
 
     use super::*;
 
@@ -400,30 +400,17 @@ mod tests {
     fn seed_and_drain_active_event_seeds_a_pending_event_into_active() {
         let dir = tempfile::tempdir().unwrap();
         let clip_timeline_start = std::time::Instant::now();
-        let started_at = chrono::Local::now();
-        let path = crate::paths::clip_path(dir.path(), started_at, &[]).unwrap();
-
-        let event = RecordingEvent::start(crate::recorder::RecordingEventParams {
-            final_clip_path: path,
-            output_dir: dir.path().to_path_buf(),
-            started_at,
-            width: 2,
-            height: 2,
-            frame_rate: 5,
-            audio_sample_rate: 8000,
-            audio_channels: 1,
-            clip_timeline_start,
-        })
-        .unwrap();
+        let event = test_pending_recording_event(dir.path(), clip_timeline_start);
 
         let active_event = Mutex::new(ActiveEvent::Pending(PendingEvent {
             event,
             pre_frames: vec![TimestampedFrame {
                 timestamp: clip_timeline_start,
-                image: image::RgbImage::new(2, 2),
+                image: std::sync::Arc::new(image::RgbImage::new(2, 2)),
             }],
             pre_audio: Vec::new(),
         }));
+        
         let ring_buffer = Mutex::new(RingBuffer::new(Duration::from_secs(10)));
 
         seed_and_drain_active_event(&ring_buffer, &active_event);
