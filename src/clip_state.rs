@@ -117,7 +117,11 @@ impl ClipState {
         self.last_real_frame_at.elapsed() >= MAX_FRAME_STALL
     }
 
-    /// Duration of one frame-rate tick at this event's configured `frame_rate`.
+    /// Duration of one frame-rate tick at this event's configured
+    /// `frame_rate`. Forwards to the free `frame_tick` function (the actual
+    /// formula), which `ffmpeg::resample_to_frame_rate` also calls directly
+    /// since it only has a raw frame rate, not a `ClipState`; keep both call
+    /// sites in mind if the formula ever changes.
     pub fn frame_tick(&self) -> Duration {
         frame_tick(self.frame_rate)
     }

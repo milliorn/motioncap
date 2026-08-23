@@ -155,23 +155,26 @@ pub fn try_start_recording(
         return Ok(());
     }
 
+    // Runs unconditionally, before either branch below, so no future
+    // early-return added to this function can silently skip it (unlike
+    // relying on each branch to remember the call itself). Idempotent to
+    // call again inside `poll_confirmed_detections` a few lines down: it
+    // only clears an already-stale `pending_confirmation`, so running it
+    // twice with the same/later `frame_timestamp` is a no-op the second
+    // time. See `expire_stale_pending`'s doc comment for why skipping it on
+    // any tripped-motion poll (not just ones that reach YOLO) reproduces the
+    // stale-confirmation bug this gate exists to prevent.
+    crate::confirmation::expire_stale_pending(&mut pending_confirmation.0, frame_timestamp);
+
     if !pre_buffer_ready(reconnected_at, config.pre_buffer_secs, frame_timestamp) {
         // The capture stream was rebuilt too recently for the ring buffer to
         // have refilled a full pre-buffer window; skip the expensive YOLO
         // call entirely rather than running inference on every tripped-motion
         // poll for the whole grace window, only to discard the result (see
-        // `pre_buffer_ready`). `expire_stale_pending` is still called
-        // directly (bypassing `poll_confirmed_detections`, which only runs
-        // it as a side effect of an inference call this path deliberately
-        // skips) so a `pending_confirmation` older than
-        // `PENDING_CONFIRMATION_WINDOW` can't sit unexpired for the whole
-        // grace window and then spuriously confirm against an unrelated
-        // sighting once inference resumes. `pending_confirmation` is
-        // otherwise left untouched so a still-present subject simply
-        // re-confirms and retries on the next poll instead of needing a
-        // fresh two-poll confirmation cycle once the buffer is ready.
-        crate::confirmation::expire_stale_pending(&mut pending_confirmation.0, frame_timestamp);
-
+        // `pre_buffer_ready`). `pending_confirmation` is otherwise left
+        // untouched so a still-present subject simply re-confirms and
+        // retries on the next poll instead of needing a fresh two-poll
+        // confirmation cycle once the buffer is ready.
         log::debug!(
             "motion tripped but recording start held back; ring buffer still refilling after \
              camera reconnect"
