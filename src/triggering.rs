@@ -26,7 +26,7 @@ pub const RECORDING_FRAME_RATE: u32 = 15;
 /// Poll interval derived from `RECORDING_FRAME_RATE`, used by
 /// `run_recording_writer_loop`.
 pub const RECORDING_POLL_INTERVAL: Duration =
-    Duration::from_millis(1000 / RECORDING_FRAME_RATE as u64);
+    Duration::from_millis(crate::MILLIS_PER_SEC / RECORDING_FRAME_RATE as u64);
 
 /// Runs the motion gate and (on trip) YOLO confirmation against `frame` for
 /// an already-active recording, records the result into its sidecar, and
@@ -269,9 +269,45 @@ mod tests {
 
     use crate::confirmation::PendingConfirmation;
     use crate::detect;
-    use crate::test_support::test_recording_event;
+    use crate::test_support::{
+        TEST_AUDIO_CHANNELS, TEST_AUDIO_SAMPLE_RATE, TEST_FRAME_DIM, test_recording_event,
+    };
 
     use super::*;
+
+    /// Ring-buffer retention window for `refresh_event_liveness`'s throwaway
+    /// buffer; its exact value doesn't matter since only one frame is ever
+    /// pushed into it before being drained.
+    const LIVENESS_REFRESH_RETENTION: Duration = Duration::from_secs(10);
+
+    /// Frame dimension for `background_frame`/`changed_frame`; large enough
+    /// to contain a meaningfully sized changed region, small enough to keep
+    /// `MotionGate` warm-up fast.
+    const SCENE_FRAME_DIM: u32 = 64;
+
+    /// A neutral background fill color for `background_frame`.
+    const SCENE_BACKGROUND_COLOR: [u8; 3] = [50, 50, 50];
+
+    /// Side length of the deliberately-changed square region within
+    /// `changed_frame`.
+    const CHANGED_REGION_SIZE: u32 = 32;
+
+    /// A fill color for `changed_frame`'s changed region, chosen to contrast
+    /// sharply against `SCENE_BACKGROUND_COLOR`.
+    const CHANGED_REGION_COLOR: [u8; 3] = [250, 250, 250];
+
+    /// Number of frames fed through `MotionGate` before asserting against a
+    /// stable background, giving MOG2's model time to settle.
+    const MOTION_WARMUP_ITERATIONS: u32 = 5;
+
+    /// Ring-buffer retention window used by tests that only care about
+    /// draining/seeding behavior, not eviction.
+    const AMPLE_RETENTION: Duration = Duration::from_secs(10);
+
+    /// A post-buffer window generous enough that it never elapses during a
+    /// fast-running test, used wherever a test wants to isolate a different
+    /// close condition from the quiet-window timeout.
+    const GENEROUS_POST_BUFFER: Duration = Duration::from_mins(1);
 
     /// Pushes one fresh frame through `event.drain_frames`, refreshing its
     /// `last_real_frame_at` (the `camera_stalled` clock) to "now". Needed
@@ -284,12 +320,12 @@ mod tests {
     /// a freshly-seeded event without this refresh passed reliably alone but
     /// flaked under `cargo test`'s default full-suite parallelism.
     fn refresh_event_liveness(event: &mut RecordingEvent) {
-        let ring_buffer = Mutex::new(RingBuffer::new(Duration::from_secs(10)));
+        let ring_buffer = Mutex::new(RingBuffer::new(LIVENESS_REFRESH_RETENTION));
 
         ring_buffer
             .lock()
             .unwrap()
-            .push_frame(image::RgbImage::new(2, 2));
+            .push_frame(image::RgbImage::new(TEST_FRAME_DIM, TEST_FRAME_DIM));
         event.drain_frames(&ring_buffer).unwrap();
     }
 
@@ -319,18 +355,22 @@ mod tests {
             .expect("failed to load model, is models/yolov8n.onnx present?")
     }
 
-    /// A 64x64 solid-color frame, for warming up `MotionGate`'s background model.
+    /// A solid-color frame, for warming up `MotionGate`'s background model.
     fn background_frame() -> image::RgbImage {
-        image::RgbImage::from_pixel(64, 64, image::Rgb([50, 50, 50]))
+        image::RgbImage::from_pixel(
+            SCENE_FRAME_DIM,
+            SCENE_FRAME_DIM,
+            image::Rgb(SCENE_BACKGROUND_COLOR),
+        )
     }
 
     /// Same dimensions as `background_frame` but with a large changed region,
     /// reliably tripping a `MotionGate` already warmed up on the background.
     fn changed_frame() -> image::RgbImage {
         let mut frame = background_frame();
-        for y in 0..32 {
-            for x in 0..32 {
-                frame.put_pixel(x, y, image::Rgb([250, 250, 250]));
+        for y in 0..CHANGED_REGION_SIZE {
+            for x in 0..CHANGED_REGION_SIZE {
+                frame.put_pixel(x, y, image::Rgb(CHANGED_REGION_COLOR));
             }
         }
         frame
@@ -360,7 +400,7 @@ mod tests {
             &active_event,
             &background_frame(),
             Instant::now(),
-            Duration::from_mins(1),
+            GENEROUS_POST_BUFFER,
             &mut pending,
         );
 
@@ -384,7 +424,7 @@ mod tests {
         ))));
         let mut pending = ActiveEventPending::default();
 
-        for _ in 0..5 {
+        for _ in 0..MOTION_WARMUP_ITERATIONS {
             motion_gate.evaluate(&background_frame()).unwrap();
         }
 
@@ -399,7 +439,7 @@ mod tests {
             &active_event,
             &background_frame(),
             Instant::now(),
-            Duration::from_mins(1),
+            GENEROUS_POST_BUFFER,
             &mut pending,
         )
         .unwrap();
@@ -430,7 +470,7 @@ mod tests {
         ))));
         let mut pending = ActiveEventPending::default();
 
-        for _ in 0..5 {
+        for _ in 0..MOTION_WARMUP_ITERATIONS {
             motion_gate.evaluate(&background_frame()).unwrap();
         }
 
@@ -445,7 +485,7 @@ mod tests {
             &active_event,
             &changed_frame(),
             Instant::now(),
-            Duration::from_mins(1),
+            GENEROUS_POST_BUFFER,
             &mut pending,
         )
         .unwrap();
@@ -483,7 +523,7 @@ mod tests {
         ))));
         let mut pending = ActiveEventPending::default();
 
-        for _ in 0..5 {
+        for _ in 0..MOTION_WARMUP_ITERATIONS {
             motion_gate.evaluate(&background_frame()).unwrap();
         }
 
@@ -513,15 +553,15 @@ mod tests {
         let config = test_config(dir.path());
         let mut motion_gate = MotionGate::new(config.motion_threshold).unwrap();
         let mut detector = test_detector();
-        let ring_buffer = Arc::new(Mutex::new(RingBuffer::new(Duration::from_secs(10))));
+        let ring_buffer = Arc::new(Mutex::new(RingBuffer::new(AMPLE_RETENTION)));
         let active_event = Arc::new(Mutex::new(ActiveEvent::None));
         let audio = AudioParams {
-            sample_rate: 8000,
-            channels: 1,
+            sample_rate: TEST_AUDIO_SAMPLE_RATE,
+            channels: TEST_AUDIO_CHANNELS,
         };
         let mut pending = PreTriggerPending::default();
 
-        for _ in 0..5 {
+        for _ in 0..MOTION_WARMUP_ITERATIONS {
             motion_gate.evaluate(&background_frame()).unwrap();
         }
 
@@ -553,15 +593,15 @@ mod tests {
         let config = test_config(dir.path());
         let mut motion_gate = MotionGate::new(config.motion_threshold).unwrap();
         let mut detector = test_detector();
-        let ring_buffer = Arc::new(Mutex::new(RingBuffer::new(Duration::from_secs(10))));
+        let ring_buffer = Arc::new(Mutex::new(RingBuffer::new(AMPLE_RETENTION)));
         let active_event = Arc::new(Mutex::new(ActiveEvent::None));
         let audio = AudioParams {
-            sample_rate: 8000,
-            channels: 1,
+            sample_rate: TEST_AUDIO_SAMPLE_RATE,
+            channels: TEST_AUDIO_CHANNELS,
         };
         let mut pending = PreTriggerPending::default();
 
-        for _ in 0..5 {
+        for _ in 0..MOTION_WARMUP_ITERATIONS {
             motion_gate.evaluate(&background_frame()).unwrap();
         }
 
@@ -619,15 +659,15 @@ mod tests {
         let config = test_config(dir.path());
         let mut motion_gate = MotionGate::new(config.motion_threshold).unwrap();
         let mut detector = test_detector();
-        let ring_buffer = Arc::new(Mutex::new(RingBuffer::new(Duration::from_secs(10))));
+        let ring_buffer = Arc::new(Mutex::new(RingBuffer::new(AMPLE_RETENTION)));
         let active_event = Arc::new(Mutex::new(ActiveEvent::None));
         let audio = AudioParams {
-            sample_rate: 8000,
-            channels: 1,
+            sample_rate: TEST_AUDIO_SAMPLE_RATE,
+            channels: TEST_AUDIO_CHANNELS,
         };
         let mut pending = PreTriggerPending::default();
 
-        for _ in 0..5 {
+        for _ in 0..MOTION_WARMUP_ITERATIONS {
             motion_gate.evaluate(&background_frame()).unwrap();
         }
 
@@ -670,19 +710,19 @@ mod tests {
         let config = test_config(dir.path());
         let mut motion_gate = MotionGate::new(config.motion_threshold).unwrap();
         let mut detector = test_detector();
-        let ring_buffer = Arc::new(Mutex::new(RingBuffer::new(Duration::from_secs(10))));
+        let ring_buffer = Arc::new(Mutex::new(RingBuffer::new(AMPLE_RETENTION)));
         ring_buffer.lock().unwrap().push_frame(background_frame());
         let active_event = Arc::new(Mutex::new(ActiveEvent::None));
         let audio = AudioParams {
-            sample_rate: 8000,
-            channels: 1,
+            sample_rate: TEST_AUDIO_SAMPLE_RATE,
+            channels: TEST_AUDIO_CHANNELS,
         };
         let mut pending = PreTriggerPending(Some(PendingConfirmation {
             class_name: "person",
             first_seen: Instant::now(),
         }));
 
-        for _ in 0..5 {
+        for _ in 0..MOTION_WARMUP_ITERATIONS {
             motion_gate.evaluate(&background_frame()).unwrap();
         }
 

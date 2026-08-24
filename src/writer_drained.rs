@@ -46,6 +46,11 @@ mod tests {
 
     use super::*;
 
+    /// Delay before signaling, in the blocking test, long enough that
+    /// `wait()` would return immediately (a bug) rather than actually
+    /// blocking if it didn't work.
+    const SIGNAL_DELAY: Duration = Duration::from_millis(50);
+
     #[test]
     fn writer_drained_signal_then_wait_returns_immediately() {
         let drained = WriterDrained::default();
@@ -59,7 +64,7 @@ mod tests {
         let signaler = Arc::clone(&drained);
 
         let handle = std::thread::spawn(move || {
-            std::thread::sleep(Duration::from_millis(50));
+            std::thread::sleep(SIGNAL_DELAY);
             signaler.signal();
         });
 

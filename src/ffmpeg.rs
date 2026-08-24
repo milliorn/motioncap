@@ -156,17 +156,32 @@ mod tests {
 
     use super::*;
 
+    /// Frame dimension for this file's fixtures: no real ffmpeg encoding
+    /// happens here (only timestamp-based selection is under test), so
+    /// there's no libx264 even-dimension requirement to satisfy; 1x1 is the
+    /// smallest placeholder.
+    const PLACEHOLDER_FRAME_DIM: u32 = 1;
+
+    /// Test frame rate used wherever these tests need a nonzero rate; its
+    /// exact value doesn't matter beyond being > 0 and matching the
+    /// documented ~66.7ms tick used to reason about the millisecond spacing
+    /// chosen for each fixture below.
+    const TEST_FRAME_RATE: u32 = 15;
+
     fn frame_at(timestamp: Instant) -> TimestampedFrame {
         TimestampedFrame {
             timestamp,
-            image: std::sync::Arc::new(image::RgbImage::new(1, 1)),
+            image: std::sync::Arc::new(image::RgbImage::new(
+                PLACEHOLDER_FRAME_DIM,
+                PLACEHOLDER_FRAME_DIM,
+            )),
         }
     }
 
     #[test]
     fn resample_empty_input_yields_empty_output() {
         let frames: Vec<TimestampedFrame> = Vec::new();
-        assert!(resample_to_frame_rate(&frames, 15).is_empty());
+        assert!(resample_to_frame_rate(&frames, TEST_FRAME_RATE).is_empty());
     }
 
     #[test]
@@ -178,7 +193,7 @@ mod tests {
             frame_at(start + Duration::from_millis(2)),
         ];
 
-        assert_eq!(resample_to_frame_rate(&frames, 0).len(), 3);
+        assert_eq!(resample_to_frame_rate(&frames, 0).len(), frames.len());
     }
 
     #[test]
@@ -191,7 +206,7 @@ mod tests {
             frame_at(start + Duration::from_millis(10)),
         ];
 
-        assert_eq!(resample_to_frame_rate(&frames, 15).len(), 1);
+        assert_eq!(resample_to_frame_rate(&frames, TEST_FRAME_RATE).len(), 1);
     }
 
     #[test]
@@ -203,6 +218,9 @@ mod tests {
             frame_at(start + Duration::from_millis(200)),
         ];
 
-        assert_eq!(resample_to_frame_rate(&frames, 15).len(), 3);
+        assert_eq!(
+            resample_to_frame_rate(&frames, TEST_FRAME_RATE).len(),
+            frames.len()
+        );
     }
 }

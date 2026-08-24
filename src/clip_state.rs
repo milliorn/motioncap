@@ -280,26 +280,95 @@ mod tests {
 
     use super::*;
 
+    /// Test frame rate used throughout this module wherever a `ClipState`
+    /// needs one but its exact value doesn't matter to the test.
+    const TEST_FRAME_RATE: u32 = 15;
+
+    /// A representative `pre_buffer_secs` value for `pre_buffer_ready` tests.
+    const TEST_PRE_BUFFER_SECS: u32 = 10;
+
+    /// An elapsed-seconds offset shorter than `TEST_PRE_BUFFER_SECS`, to
+    /// exercise the "not ready yet" branch.
+    const SHORT_OF_PRE_BUFFER_SECS: u64 = 4;
+
+    /// A quiet-window offset long enough that `quiet_for` unambiguously
+    /// reports "not recent" before a touch/detection resets it.
+    const STALE_QUIET_OFFSET_SECS: u64 = 5;
+
+    /// Upper bound `quiet_for` must read under immediately after a
+    /// touch/detection resets it.
+    const FRESH_QUIET_UPPER_BOUND_SECS: u64 = 1;
+
+    /// A quiet-window offset used by `record_motion_appends_without_touching_quiet_window`,
+    /// distinct from `STALE_QUIET_OFFSET_SECS` only so its own assertion bound
+    /// (`RECORD_MOTION_QUIET_LOWER_BOUND_SECS`) reads clearly as "just under
+    /// this test's own offset," not coincidentally reusing another test's
+    /// unrelated constant.
+    const RECORD_MOTION_QUIET_OFFSET_SECS: u64 = 10;
+
+    /// Lower bound `quiet_for` must still read at or above, proving
+    /// `record_motion` didn't reset the quiet window the way `touch` does.
+    const RECORD_MOTION_QUIET_LOWER_BOUND_SECS: u64 = 9;
+
+    /// Offset into a clip's timeline used to verify `offset_secs` computes
+    /// elapsed time correctly.
+    const OFFSET_SECS_PROBE_SECS: u64 = 5;
+
+    /// Tolerance for comparing a computed `offset_secs` float against its
+    /// expected value.
+    const OFFSET_SECS_TOLERANCE: f64 = 0.01;
+
+    /// Offset before a clip's timeline start, used to verify `offset_secs`
+    /// clamps to zero rather than going negative.
+    const BEFORE_CLIP_START_SECS: u64 = 2;
+
+    /// First test detection's confidence value.
+    const DOG_FIRST_CONFIDENCE: f32 = 0.5;
+
+    /// Second test detection's confidence value, for a different class.
+    const PERSON_CONFIDENCE: f32 = 0.9;
+
+    /// Third test detection's confidence value: a repeat of the first
+    /// detection's class at a different confidence, to verify
+    /// deduplication doesn't depend on matching confidence too.
+    const DOG_SECOND_CONFIDENCE: f32 = 0.6;
+
+    /// A representative changed-pixel ratio for `record_motion` tests; its
+    /// exact value doesn't matter, only that it gets recorded verbatim.
+    const TEST_CHANGED_RATIO: f32 = 0.05;
+
+    /// A sub-tick offset, small enough to land strictly before the next
+    /// frame-rate tick regardless of `TEST_FRAME_RATE`.
+    const SUB_TICK_OFFSET: Duration = Duration::from_millis(1);
+
     // --- pre_buffer_ready ---
 
     #[test]
     fn pre_buffer_ready_true_when_no_reconnect_tracked() {
         let now = Instant::now();
-        assert!(pre_buffer_ready(None, 10, now));
+        assert!(pre_buffer_ready(None, TEST_PRE_BUFFER_SECS, now));
     }
 
     #[test]
     fn pre_buffer_ready_false_before_pre_buffer_secs_have_elapsed() {
         let now = Instant::now();
-        let reconnected_at = now - Duration::from_secs(4);
-        assert!(!pre_buffer_ready(Some(reconnected_at), 10, now));
+        let reconnected_at = now - Duration::from_secs(SHORT_OF_PRE_BUFFER_SECS);
+        assert!(!pre_buffer_ready(
+            Some(reconnected_at),
+            TEST_PRE_BUFFER_SECS,
+            now
+        ));
     }
 
     #[test]
     fn pre_buffer_ready_true_once_pre_buffer_secs_have_elapsed() {
         let now = Instant::now();
-        let reconnected_at = now - Duration::from_secs(10);
-        assert!(pre_buffer_ready(Some(reconnected_at), 10, now));
+        let reconnected_at = now - Duration::from_secs(u64::from(TEST_PRE_BUFFER_SECS));
+        assert!(pre_buffer_ready(
+            Some(reconnected_at),
+            TEST_PRE_BUFFER_SECS,
+            now
+        ));
     }
 
     #[test]
@@ -312,64 +381,69 @@ mod tests {
 
     #[test]
     fn camera_stalled_false_when_recently_touched() {
-        let state = ClipState::new(15, Instant::now());
+        let state = ClipState::new(TEST_FRAME_RATE, Instant::now());
         assert!(!state.camera_stalled());
     }
 
     #[test]
     fn camera_stalled_true_once_max_frame_stall_elapses() {
-        let mut state = ClipState::new(15, Instant::now());
+        let mut state = ClipState::new(TEST_FRAME_RATE, Instant::now());
         state.backdate_last_real_frame_at_past_stall();
         assert!(state.camera_stalled());
     }
 
     #[test]
     fn quiet_for_reflects_time_since_touch() {
-        let mut state = ClipState::new(15, Instant::now());
-        state.last_trigger_at = Instant::now() - Duration::from_secs(5);
+        let mut state = ClipState::new(TEST_FRAME_RATE, Instant::now());
+        state.last_trigger_at = Instant::now() - Duration::from_secs(STALE_QUIET_OFFSET_SECS);
 
-        assert!(state.quiet_for() >= Duration::from_secs(5));
+        assert!(state.quiet_for() >= Duration::from_secs(STALE_QUIET_OFFSET_SECS));
 
         state.touch();
-        assert!(state.quiet_for() < Duration::from_secs(1));
+        assert!(state.quiet_for() < Duration::from_secs(FRESH_QUIET_UPPER_BOUND_SECS));
     }
 
     #[test]
     fn quiet_for_reflects_time_since_record_detection() {
-        let mut state = ClipState::new(15, Instant::now());
-        state.last_trigger_at = Instant::now() - Duration::from_secs(5);
+        let mut state = ClipState::new(TEST_FRAME_RATE, Instant::now());
+        state.last_trigger_at = Instant::now() - Duration::from_secs(STALE_QUIET_OFFSET_SECS);
 
-        state.record_detection("person", 0.9, Instant::now());
+        state.record_detection("person", PERSON_CONFIDENCE, Instant::now());
 
-        assert!(state.quiet_for() < Duration::from_secs(1));
+        assert!(state.quiet_for() < Duration::from_secs(FRESH_QUIET_UPPER_BOUND_SECS));
     }
 
     #[test]
     fn offset_secs_relative_to_clip_timeline_start() {
         let start = Instant::now();
-        let state = ClipState::new(15, start);
+        let state = ClipState::new(TEST_FRAME_RATE, start);
 
-        let five_secs_in = start + Duration::from_secs(5);
-        assert!((state.offset_secs(five_secs_in) - 5.0).abs() < 0.01);
+        let five_secs_in = start + Duration::from_secs(OFFSET_SECS_PROBE_SECS);
+        #[allow(
+            clippy::cast_precision_loss,
+            reason = "OFFSET_SECS_PROBE_SECS is a small hardcoded test constant, far below f64's exact-integer range"
+        )]
+        let expected = OFFSET_SECS_PROBE_SECS as f64;
+        assert!((state.offset_secs(five_secs_in) - expected).abs() < OFFSET_SECS_TOLERANCE);
     }
 
     #[test]
     fn offset_secs_clamps_to_zero_for_timestamp_before_clip_start() {
         let start = Instant::now();
-        let state = ClipState::new(15, start);
+        let state = ClipState::new(TEST_FRAME_RATE, start);
 
-        let before_start = start - Duration::from_secs(2);
+        let before_start = start - Duration::from_secs(BEFORE_CLIP_START_SECS);
         assert!((state.offset_secs(before_start) - 0.0).abs() < f64::EPSILON);
     }
 
     #[test]
     fn record_detection_deduplicates_and_sorts_classes() {
-        let mut state = ClipState::new(15, Instant::now());
+        let mut state = ClipState::new(TEST_FRAME_RATE, Instant::now());
         let now = Instant::now();
 
-        state.record_detection("dog", 0.5, now);
-        state.record_detection("person", 0.9, now);
-        state.record_detection("dog", 0.6, now);
+        state.record_detection("dog", DOG_FIRST_CONFIDENCE, now);
+        state.record_detection("person", PERSON_CONFIDENCE, now);
+        state.record_detection("dog", DOG_SECOND_CONFIDENCE, now);
 
         let classes: Vec<&str> = state.all_classes.iter().copied().collect();
         assert_eq!(classes, vec!["dog", "person"]);
@@ -378,18 +452,19 @@ mod tests {
 
     #[test]
     fn record_motion_appends_without_touching_quiet_window() {
-        let mut state = ClipState::new(15, Instant::now());
-        state.last_trigger_at = Instant::now() - Duration::from_secs(10);
+        let mut state = ClipState::new(TEST_FRAME_RATE, Instant::now());
+        state.last_trigger_at =
+            Instant::now() - Duration::from_secs(RECORD_MOTION_QUIET_OFFSET_SECS);
 
-        state.record_motion(0.05, Instant::now());
+        state.record_motion(TEST_CHANGED_RATIO, Instant::now());
 
         assert_eq!(state.motion_events.len(), 1);
-        assert!(state.quiet_for() >= Duration::from_secs(9));
+        assert!(state.quiet_for() >= Duration::from_secs(RECORD_MOTION_QUIET_LOWER_BOUND_SECS));
     }
 
     #[test]
     fn should_write_frame_true_on_first_call_with_no_prior_due_tick() {
-        let mut state = ClipState::new(15, Instant::now());
+        let mut state = ClipState::new(TEST_FRAME_RATE, Instant::now());
         assert!(state.next_frame_due.is_none());
 
         assert!(state.should_write_frame(Instant::now()));
@@ -398,17 +473,17 @@ mod tests {
 
     #[test]
     fn should_write_frame_false_before_the_next_due_tick() {
-        let mut state = ClipState::new(15, Instant::now());
+        let mut state = ClipState::new(TEST_FRAME_RATE, Instant::now());
         let first = Instant::now();
         assert!(state.should_write_frame(first));
 
-        let just_after = first + Duration::from_millis(1);
+        let just_after = first + SUB_TICK_OFFSET;
         assert!(!state.should_write_frame(just_after));
     }
 
     #[test]
     fn should_write_frame_true_once_the_next_tick_is_reached() {
-        let mut state = ClipState::new(15, Instant::now());
+        let mut state = ClipState::new(TEST_FRAME_RATE, Instant::now());
         let first = Instant::now();
         assert!(state.should_write_frame(first));
 
@@ -418,7 +493,7 @@ mod tests {
 
     #[test]
     fn anchor_next_tick_after_seed_schedules_one_tick_past_the_seeded_frame() {
-        let mut state = ClipState::new(15, Instant::now());
+        let mut state = ClipState::new(TEST_FRAME_RATE, Instant::now());
         let last_seeded = Instant::now();
         let tick = state.frame_tick();
 

@@ -70,6 +70,10 @@ use triggering::{
 };
 use writer_drained::WriterDrained;
 
+/// Milliseconds in one second, used to convert a frames-per-second rate into
+/// a poll interval (`1000 / fps`).
+pub(crate) const MILLIS_PER_SEC: u64 = 1000;
+
 /// Motion-gate + YOLO evaluation cadence. Kept separate from the recording
 /// frame rate below since inference cost doesn't scale down usefully at
 /// higher polling rates. 15fps is plenty for deciding whether a subject is
@@ -77,12 +81,13 @@ use writer_drained::WriterDrained;
 const DETECTION_FRAME_RATE: u32 = 15;
 /// Poll interval derived from `DETECTION_FRAME_RATE`.
 pub(crate) const DETECTION_POLL_INTERVAL: Duration =
-    Duration::from_millis(1000 / DETECTION_FRAME_RATE as u64);
+    Duration::from_millis(MILLIS_PER_SEC / DETECTION_FRAME_RATE as u64);
 
 /// Live preview window refresh rate (diagnostic only; see `preview.rs`).
 const PREVIEW_FRAME_RATE: u32 = 30;
 /// Poll interval derived from `PREVIEW_FRAME_RATE`.
-const PREVIEW_POLL_INTERVAL: Duration = Duration::from_millis(1000 / PREVIEW_FRAME_RATE as u64);
+const PREVIEW_POLL_INTERVAL: Duration =
+    Duration::from_millis(MILLIS_PER_SEC / PREVIEW_FRAME_RATE as u64);
 
 /// Entry point. Opens the real camera/audio devices and spawns long-lived
 /// worker threads, so it's not exercised by an automated test.
@@ -442,9 +447,14 @@ mod tests {
 
     use super::*;
 
+    /// Ring-buffer retention window used by this file's tests; its exact
+    /// value doesn't matter since both tests exercise immediate-shutdown
+    /// paths that never actually drain or read from the buffer.
+    const AMPLE_RETENTION: Duration = Duration::from_secs(10);
+
     #[test]
     fn run_recording_writer_loop_drains_and_signals_on_immediate_shutdown() {
-        let ring_buffer = Arc::new(Mutex::new(RingBuffer::new(Duration::from_secs(10))));
+        let ring_buffer = Arc::new(Mutex::new(RingBuffer::new(AMPLE_RETENTION)));
         let active_event = Arc::new(Mutex::new(ActiveEvent::None));
         let shutdown = Arc::new(AtomicBool::new(true));
         let writer_drained = Arc::new(WriterDrained::default());
@@ -462,7 +472,7 @@ mod tests {
 
     #[test]
     fn run_preview_loop_returns_immediately_on_shutdown_without_preview() {
-        let ring_buffer = Arc::new(Mutex::new(RingBuffer::new(Duration::from_secs(10))));
+        let ring_buffer = Arc::new(Mutex::new(RingBuffer::new(AMPLE_RETENTION)));
         let shutdown = Arc::new(AtomicBool::new(true));
 
         // show_preview=false skips PreviewWindow::open() entirely, so this

@@ -205,9 +205,18 @@ mod tests {
         reason = "test assertions favor unwrap for clarity; panics here fail the test, which is the intended behavior"
     )]
 
-    use crate::test_support::{test_pending_recording_event, test_recording_event};
+    use crate::test_support::{TEST_FRAME_DIM, test_pending_recording_event, test_recording_event};
 
     use super::*;
+
+    /// A post-buffer window generous enough that it never elapses during a
+    /// fast-running test, used wherever a test wants to isolate a different
+    /// close condition (e.g. camera stall) from the quiet-window timeout.
+    const GENEROUS_POST_BUFFER: Duration = Duration::from_mins(1);
+
+    /// Ring-buffer retention window used by tests that only care about
+    /// draining/seeding behavior, not eviction.
+    const AMPLE_RETENTION: Duration = Duration::from_secs(10);
 
     // --- ActiveEvent::None behavior ---
 
@@ -282,7 +291,7 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let event = Mutex::new(ActiveEvent::Active(test_recording_event(dir.path())));
 
-        close_event_if_done(event.lock().unwrap(), Duration::from_mins(1)).unwrap();
+        close_event_if_done(event.lock().unwrap(), GENEROUS_POST_BUFFER).unwrap();
 
         // Still active: neither camera_stalled nor the (60s) post-buffer
         // window has elapsed on a freshly-started event.
@@ -318,7 +327,7 @@ mod tests {
             .state_mut()
             .backdate_last_real_frame_at_past_stall();
 
-        close_event_if_done(event.lock().unwrap(), Duration::from_mins(1)).unwrap();
+        close_event_if_done(event.lock().unwrap(), GENEROUS_POST_BUFFER).unwrap();
 
         assert!(!event.lock().unwrap().is_some());
     }
@@ -406,12 +415,12 @@ mod tests {
             event,
             pre_frames: vec![TimestampedFrame {
                 timestamp: clip_timeline_start,
-                image: std::sync::Arc::new(image::RgbImage::new(2, 2)),
+                image: std::sync::Arc::new(image::RgbImage::new(TEST_FRAME_DIM, TEST_FRAME_DIM)),
             }],
             pre_audio: Vec::new(),
         }));
-        
-        let ring_buffer = Mutex::new(RingBuffer::new(Duration::from_secs(10)));
+
+        let ring_buffer = Mutex::new(RingBuffer::new(AMPLE_RETENTION));
 
         seed_and_drain_active_event(&ring_buffer, &active_event);
 
@@ -430,11 +439,11 @@ mod tests {
     fn seed_and_drain_active_event_drains_new_frames_into_an_already_active_event() {
         let dir = tempfile::tempdir().unwrap();
         let active_event = Mutex::new(ActiveEvent::Active(test_recording_event(dir.path())));
-        let ring_buffer = Mutex::new(RingBuffer::new(Duration::from_secs(10)));
+        let ring_buffer = Mutex::new(RingBuffer::new(AMPLE_RETENTION));
         ring_buffer
             .lock()
             .unwrap()
-            .push_frame(image::RgbImage::new(2, 2));
+            .push_frame(image::RgbImage::new(TEST_FRAME_DIM, TEST_FRAME_DIM));
 
         // Must not panic/error against a genuinely Active (not Pending) event.
         seed_and_drain_active_event(&ring_buffer, &active_event);
@@ -452,7 +461,7 @@ mod tests {
     #[test]
     fn seed_and_drain_active_event_is_noop_on_none() {
         let active_event = Mutex::new(ActiveEvent::None);
-        let ring_buffer = Mutex::new(RingBuffer::new(Duration::from_secs(10)));
+        let ring_buffer = Mutex::new(RingBuffer::new(AMPLE_RETENTION));
 
         seed_and_drain_active_event(&ring_buffer, &active_event);
 

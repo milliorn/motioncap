@@ -144,6 +144,15 @@ mod tests {
 
     use super::*;
 
+    /// A stall duration shorter than `CAMERA_RECONNECT_STALL`, used to
+    /// exercise the "not stalled long enough yet" branch.
+    const BELOW_STALL_THRESHOLD_OFFSET: Duration = Duration::from_secs(5);
+
+    /// Margin added past a threshold (`CAMERA_RECONNECT_STALL` or
+    /// `CAMERA_RECONNECT_COOLDOWN`) so a test unambiguously lands past it
+    /// rather than right at its boundary.
+    const PAST_THRESHOLD_MARGIN: Duration = Duration::from_secs(1);
+
     // --- should_reconnect ---
 
     #[test]
@@ -157,7 +166,7 @@ mod tests {
         let now = Instant::now();
         let seen = FrameLiveness {
             timestamp: now,
-            unchanged_since: now - Duration::from_secs(5),
+            unchanged_since: now - BELOW_STALL_THRESHOLD_OFFSET,
             warned: false,
         };
         assert!(!should_reconnect(Some(&seen), None, now));
@@ -168,7 +177,7 @@ mod tests {
         let now = Instant::now();
         let seen = FrameLiveness {
             timestamp: now,
-            unchanged_since: now - CAMERA_RECONNECT_STALL - Duration::from_secs(1),
+            unchanged_since: now - CAMERA_RECONNECT_STALL - PAST_THRESHOLD_MARGIN,
             warned: false,
         };
         assert!(should_reconnect(Some(&seen), None, now));
@@ -179,10 +188,10 @@ mod tests {
         let now = Instant::now();
         let seen = FrameLiveness {
             timestamp: now,
-            unchanged_since: now - CAMERA_RECONNECT_STALL - Duration::from_secs(1),
+            unchanged_since: now - CAMERA_RECONNECT_STALL - PAST_THRESHOLD_MARGIN,
             warned: false,
         };
-        let last_attempt = now - Duration::from_secs(1);
+        let last_attempt = now - PAST_THRESHOLD_MARGIN;
         assert!(!should_reconnect(Some(&seen), Some(last_attempt), now));
     }
 
@@ -191,10 +200,10 @@ mod tests {
         let now = Instant::now();
         let seen = FrameLiveness {
             timestamp: now,
-            unchanged_since: now - CAMERA_RECONNECT_STALL - Duration::from_secs(1),
+            unchanged_since: now - CAMERA_RECONNECT_STALL - PAST_THRESHOLD_MARGIN,
             warned: false,
         };
-        let last_attempt = now - CAMERA_RECONNECT_COOLDOWN - Duration::from_secs(1);
+        let last_attempt = now - CAMERA_RECONNECT_COOLDOWN - PAST_THRESHOLD_MARGIN;
         assert!(should_reconnect(Some(&seen), Some(last_attempt), now));
     }
 }

@@ -211,10 +211,18 @@ mod tests {
 
     use super::*;
 
+    /// Fixture confidence for synthetic test detections; its exact value
+    /// doesn't matter to any test here, only the class name being confirmed.
+    const FIXTURE_CONFIDENCE: f32 = 0.9;
+
+    /// Margin used to push a timestamp just past or just within a window
+    /// boundary in these tests.
+    const WINDOW_MARGIN: Duration = Duration::from_secs(1);
+
     fn detection(class_name: &'static str) -> Detection {
         Detection {
             class_name,
-            confidence: 0.9,
+            confidence: FIXTURE_CONFIDENCE,
         }
     }
 
@@ -225,7 +233,7 @@ mod tests {
         let now = Instant::now();
         let mut pending = Some(PendingConfirmation {
             class_name: "person",
-            first_seen: now - PENDING_CONFIRMATION_WINDOW - Duration::from_secs(1),
+            first_seen: now - PENDING_CONFIRMATION_WINDOW - WINDOW_MARGIN,
         });
 
         expire_stale_pending(&mut pending, now);
@@ -276,7 +284,7 @@ mod tests {
         let first = Instant::now();
         confirm_pending(&mut pending, vec![detection("person")], first);
 
-        let second = first + Duration::from_secs(1);
+        let second = first + WINDOW_MARGIN;
         let result = confirm_pending(&mut pending, vec![detection("person")], second);
 
         assert!(result.is_some());
@@ -292,7 +300,7 @@ mod tests {
         let first = Instant::now();
         confirm_pending(&mut pending, vec![detection("person")], first);
 
-        let second = first + Duration::from_secs(1);
+        let second = first + WINDOW_MARGIN;
         let result = confirm_pending(&mut pending, vec![detection("dog")], second);
 
         assert!(result.is_none());
@@ -305,7 +313,7 @@ mod tests {
         let first = Instant::now();
         confirm_pending(&mut pending, vec![detection("person")], first);
 
-        let after_expiry = first + PENDING_CONFIRMATION_WINDOW + Duration::from_secs(1);
+        let after_expiry = first + PENDING_CONFIRMATION_WINDOW + WINDOW_MARGIN;
         let result = confirm_pending(&mut pending, vec![detection("person")], after_expiry);
 
         assert!(result.is_none());

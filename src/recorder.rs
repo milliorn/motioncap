@@ -446,6 +446,9 @@ mod tests {
 
     use super::*;
     use crate::paths::{clip_path, sidecar_path};
+    use crate::test_support::{
+        TEST_AUDIO_CHANNELS, TEST_AUDIO_SAMPLE_RATE, TEST_FRAME_DIM, TEST_FRAME_RATE,
+    };
 
     // --- RecordingEvent end-to-end (real ffmpeg subprocess) ---
 
@@ -472,18 +475,85 @@ mod tests {
         serde_json::from_slice(&output.stdout).expect("ffprobe produced invalid JSON")
     }
 
-    /// A 2x2 timestamped frame; libx264 requires even width/height, so this
-    /// is used for the ffmpeg round-trip tests below.
+    /// A timestamped frame sized `TEST_FRAME_DIM` x `TEST_FRAME_DIM`; libx264
+    /// requires even width/height, and `TEST_FRAME_DIM` (2) is the smallest
+    /// value that satisfies that. Used for the ffmpeg round-trip tests below.
     fn even_sized_frame_at(timestamp: Instant) -> TimestampedFrame {
         TimestampedFrame {
             timestamp,
-            image: std::sync::Arc::new(image::RgbImage::new(2, 2)),
+            image: std::sync::Arc::new(image::RgbImage::new(TEST_FRAME_DIM, TEST_FRAME_DIM)),
         }
     }
 
+    /// A small, arbitrary sample count for fixture audio chunks; large
+    /// enough to be a non-trivial write, small enough to keep test data
+    /// tiny.
+    const SEED_AUDIO_SAMPLES: usize = 100;
+
+    /// A larger sample count for the round-trip test's pre-buffer audio
+    /// chunk; distinct from `SEED_AUDIO_SAMPLES` only because this is a
+    /// different (larger) fixture used by a different test, not because the
+    /// exact size matters to either.
+    const PRE_AUDIO_SAMPLES: usize = 800;
+
+    /// Spacing between the round-trip test's two pre-buffer frames, wide
+    /// enough to be a meaningfully distinct second frame.
+    const PRE_FRAME_SPACING: Duration = Duration::from_millis(250);
+
+    /// A representative changed-pixel ratio for `record_motion` calls in
+    /// this module's tests; its exact value doesn't matter, only that it
+    /// gets recorded verbatim into the sidecar.
+    const TEST_CHANGED_RATIO: f32 = 0.02;
+
+    /// A representative detection confidence for `record_detection` calls in
+    /// this module's tests.
+    const DETECTION_CONFIDENCE: f32 = 0.95;
+
+    /// A second representative detection confidence, used by tests that
+    /// don't otherwise care about the specific value; distinct from
+    /// `DETECTION_CONFIDENCE` only because it was already in use at these
+    /// call sites, not because the difference is meaningful.
+    const OTHER_DETECTION_CONFIDENCE: f32 = 0.9;
+
+    /// Sample count for `write_audio`/`seed`'s audio fault-injection test
+    /// buffers.
+    const WRITE_AUDIO_TEST_SAMPLES: usize = 10;
+
+    /// Upper bound `quiet_for` must read under immediately after a
+    /// touch/detection resets it.
+    const FRESH_QUIET_UPPER_BOUND: Duration = Duration::from_secs(1);
+
+    /// Sleep past a frame-rate tick before pushing new content into the ring
+    /// buffer, so `drain_frames`/`drain_audio` see it as genuinely due
+    /// rather than arriving before its scheduled tick. At `TEST_FRAME_RATE`
+    /// (5fps), one tick is 200ms, so this comfortably clears it.
+    const PAST_TICK_SLEEP: Duration = Duration::from_millis(250);
+
+    /// Ring-buffer retention window for tests that drain freshly-pushed
+    /// content shortly after pushing it; ample margin so nothing evicts
+    /// before the test reads it back.
+    const DRAIN_TEST_RETENTION: Duration = Duration::from_secs(30);
+
+    /// A representative audio fill value for ring-buffer fixture pushes; its
+    /// exact value doesn't matter, only that draining writes it through.
+    const DRAIN_TEST_AUDIO_SAMPLE: f32 = 0.5;
+
+    /// Sample count for the drain tests' pushed audio chunk.
+    const DRAIN_TEST_AUDIO_SAMPLES: usize = 100;
+
+    /// Upper bound on retry attempts before giving up on observing a broken
+    /// pipe; generous relative to `BROKEN_PIPE_POLL_INTERVAL` so the retry
+    /// loop only fails if the pipe genuinely never breaks, not due to
+    /// scheduling jitter under a loaded `cargo test` run.
+    const BROKEN_PIPE_MAX_RETRIES: u32 = 200;
+
+    /// Interval between broken-pipe retry attempts.
+    const BROKEN_PIPE_POLL_INTERVAL: Duration = Duration::from_millis(10);
+
     /// Starts a `RecordingEvent` with the field values shared by most tests
-    /// in this module (2x2 frames, 5fps, 8kHz mono audio), overriding only
-    /// the fields a given test needs to vary.
+    /// in this module (`TEST_FRAME_DIM` square frames, `TEST_FRAME_RATE`fps,
+    /// `TEST_AUDIO_SAMPLE_RATE`Hz mono audio), overriding only the fields a
+    /// given test needs to vary.
     fn start_event(
         dir: &std::path::Path,
         final_clip_path: std::path::PathBuf,
@@ -499,11 +569,44 @@ mod tests {
             started_at,
             width,
             height,
-            frame_rate: 5,
+            frame_rate: TEST_FRAME_RATE,
             audio_sample_rate,
-            audio_channels: 1,
+            audio_channels: TEST_AUDIO_CHANNELS,
             clip_timeline_start,
         })
+    }
+
+    /// A deliberately invalid (zero) width/height, used to force ffmpeg to
+    /// reject `-video_size 0x0` and exit nonzero, exercising `finish`'s
+    /// nonzero-exit error arm.
+    const INVALID_DIM: u32 = 0;
+
+    /// A deliberately invalid (zero) audio sample rate, used to force
+    /// ffmpeg's mux step to reject `-ar 0`, exercising `finish`'s mux-failure
+    /// error arm.
+    const INVALID_SAMPLE_RATE: u32 = 0;
+
+    /// Starts a `RecordingEvent` with every field at this module's standard
+    /// test values (see `start_event`'s doc comment); for the (large
+    /// majority of) tests that don't need to vary width/height/sample rate
+    /// away from the shared fixture values. Tests that deliberately need an
+    /// invalid dimension/rate (e.g. to force an ffmpeg failure) call
+    /// `start_event` directly instead.
+    fn start_event_standard(
+        dir: &std::path::Path,
+        final_clip_path: std::path::PathBuf,
+        started_at: DateTime<Local>,
+        clip_timeline_start: Instant,
+    ) -> Result<RecordingEvent> {
+        start_event(
+            dir,
+            final_clip_path,
+            started_at,
+            clip_timeline_start,
+            TEST_FRAME_DIM,
+            TEST_FRAME_DIM,
+            TEST_AUDIO_SAMPLE_RATE,
+        )
     }
 
     /// Seeds `event` with a single even-sized frame and a small audio chunk,
@@ -515,7 +618,7 @@ mod tests {
                 &[even_sized_frame_at(clip_timeline_start)],
                 &[TimestampedAudio {
                     timestamp: clip_timeline_start,
-                    samples: vec![0.0; 100],
+                    samples: vec![0.0; SEED_AUDIO_SAMPLES],
                 }],
             )
             .unwrap();
@@ -534,33 +637,24 @@ mod tests {
         let initial_path = clip_path(dir.path(), started_at, &[]).unwrap();
         let expected_final_path = clip_path(dir.path(), started_at, &["person"]).unwrap();
 
-        let mut event = RecordingEvent::start(RecordingEventParams {
-            final_clip_path: initial_path,
-            output_dir: dir.path().to_path_buf(),
-            started_at,
-            width: 2,
-            height: 2,
-            frame_rate: 5,
-            audio_sample_rate: 8000,
-            audio_channels: 1,
-            clip_timeline_start,
-        })
-        .unwrap();
+        let mut event =
+            start_event_standard(dir.path(), initial_path, started_at, clip_timeline_start)
+                .unwrap();
 
         let pre_frames = vec![
             even_sized_frame_at(clip_timeline_start),
-            even_sized_frame_at(clip_timeline_start + Duration::from_millis(250)),
+            even_sized_frame_at(clip_timeline_start + PRE_FRAME_SPACING),
         ];
         let pre_audio = vec![TimestampedAudio {
             timestamp: clip_timeline_start,
-            samples: vec![0.0; 800],
+            samples: vec![0.0; PRE_AUDIO_SAMPLES],
         }];
 
         event.seed(&pre_frames, &pre_audio).unwrap();
 
-        event.record_motion(0.02, clip_timeline_start);
-        event.record_detection("person", 0.95, clip_timeline_start);
-        assert!(event.quiet_for() < Duration::from_secs(1));
+        event.record_motion(TEST_CHANGED_RATIO, clip_timeline_start);
+        event.record_detection("person", DETECTION_CONFIDENCE, clip_timeline_start);
+        assert!(event.quiet_for() < FRESH_QUIET_UPPER_BOUND);
         event.touch();
 
         event.finish().unwrap();
@@ -599,16 +693,9 @@ mod tests {
 
         let initial_path = clip_path(dir.path(), started_at, &[]).unwrap();
 
-        let mut event = start_event(
-            dir.path(),
-            initial_path,
-            started_at,
-            clip_timeline_start,
-            2,
-            2,
-            8000,
-        )
-        .unwrap();
+        let mut event =
+            start_event_standard(dir.path(), initial_path, started_at, clip_timeline_start)
+                .unwrap();
 
         seed_one_frame(&mut event, clip_timeline_start);
 
@@ -616,14 +703,14 @@ mod tests {
         // sleeping past that before pushing ensures the newly-buffered frame
         // is actually due and gets written (not silently skipped for arriving
         // before its tick), exercising drain_frames' write branch for real.
-        std::thread::sleep(Duration::from_millis(250));
+        std::thread::sleep(PAST_TICK_SLEEP);
 
         let ring_buffer =
-            std::sync::Mutex::new(crate::buffer::RingBuffer::new(Duration::from_secs(30)));
+            std::sync::Mutex::new(crate::buffer::RingBuffer::new(DRAIN_TEST_RETENTION));
         {
             let mut buf = ring_buffer.lock().unwrap();
-            buf.push_frame(image::RgbImage::new(2, 2));
-            buf.push_audio(vec![0.5; 100]);
+            buf.push_frame(image::RgbImage::new(TEST_FRAME_DIM, TEST_FRAME_DIM));
+            buf.push_audio(vec![DRAIN_TEST_AUDIO_SAMPLE; DRAIN_TEST_AUDIO_SAMPLES]);
         }
 
         // Both must succeed without error against real newly-buffered content
@@ -650,17 +737,9 @@ mod tests {
         let missing_subdir = dir.path().join("does-not-exist");
         let final_clip_path = missing_subdir.join("clip.mp4");
 
-        let err = start_event(
-            dir.path(),
-            final_clip_path,
-            started_at,
-            Instant::now(),
-            2,
-            2,
-            8000,
-        )
-        .err()
-        .unwrap();
+        let err = start_event_standard(dir.path(), final_clip_path, started_at, Instant::now())
+            .err()
+            .unwrap();
 
         assert!(err.to_string().contains("failed to create temp audio file"));
     }
@@ -672,16 +751,17 @@ mod tests {
         let started_at = chrono::Local::now();
         let initial_path = clip_path(dir.path(), started_at, &[]).unwrap();
 
-        // width/height of 0 makes ffmpeg reject "-video_size 0x0" and exit
-        // nonzero immediately, without needing any frames written to stdin.
+        // An invalid (zero) width/height makes ffmpeg reject "-video_size
+        // 0x0" and exit nonzero immediately, without needing any frames
+        // written to stdin.
         let event = start_event(
             dir.path(),
             initial_path,
             started_at,
             clip_timeline_start,
-            0,
-            0,
-            8000,
+            INVALID_DIM,
+            INVALID_DIM,
+            TEST_AUDIO_SAMPLE_RATE,
         )
         .unwrap();
 
@@ -706,9 +786,9 @@ mod tests {
             initial_path,
             started_at,
             clip_timeline_start,
-            2,
-            2,
-            0,
+            TEST_FRAME_DIM,
+            TEST_FRAME_DIM,
+            INVALID_SAMPLE_RATE,
         )
         .unwrap();
 
@@ -731,16 +811,9 @@ mod tests {
         let renamed_path = clip_path(dir.path(), started_at, &["person"]).unwrap();
         std::fs::create_dir_all(&renamed_path).unwrap();
 
-        let mut event = start_event(
-            dir.path(),
-            initial_path,
-            started_at,
-            clip_timeline_start,
-            2,
-            2,
-            8000,
-        )
-        .unwrap();
+        let mut event =
+            start_event_standard(dir.path(), initial_path, started_at, clip_timeline_start)
+                .unwrap();
 
         // Unlike finish_errors_when_audio_mux_fails' -ar 0 (which fails
         // fast), this test uses a valid sample rate so finish() actually
@@ -751,7 +824,7 @@ mod tests {
         // so a real frame/audio chunk must be seeded first.
         seed_one_frame(&mut event, clip_timeline_start);
 
-        event.record_detection("person", 0.9, clip_timeline_start);
+        event.record_detection("person", OTHER_DETECTION_CONFIDENCE, clip_timeline_start);
 
         let err = event.finish().unwrap_err();
 
@@ -768,23 +841,18 @@ mod tests {
         let started_at = chrono::Local::now();
         let initial_path = clip_path(dir.path(), started_at, &[]).unwrap();
 
-        let mut event = start_event(
-            dir.path(),
-            initial_path,
-            started_at,
-            clip_timeline_start,
-            2,
-            2,
-            8000,
-        )
-        .unwrap();
+        let mut event =
+            start_event_standard(dir.path(), initial_path, started_at, clip_timeline_start)
+                .unwrap();
 
         // Taking stdin out from under the event (rather than anything ffmpeg
         // does) is what write_frame's own "already closed" arm guards
         // against; drop it here to force that arm directly.
         drop(event.ffmpeg_video.stdin.take());
 
-        let err = event.write_frame(&image::RgbImage::new(2, 2)).unwrap_err();
+        let err = event
+            .write_frame(&image::RgbImage::new(TEST_FRAME_DIM, TEST_FRAME_DIM))
+            .unwrap_err();
         assert!(err.to_string().contains("ffmpeg stdin was already closed"));
 
         // ffmpeg_video is still a live child with no stdin ever supplied a
@@ -803,16 +871,9 @@ mod tests {
         let started_at = chrono::Local::now();
         let initial_path = clip_path(dir.path(), started_at, &[]).unwrap();
 
-        let mut event = start_event(
-            dir.path(),
-            initial_path,
-            started_at,
-            clip_timeline_start,
-            2,
-            2,
-            8000,
-        )
-        .unwrap();
+        let mut event =
+            start_event_standard(dir.path(), initial_path, started_at, clip_timeline_start)
+                .unwrap();
 
         drop(event.ffmpeg_video.stdin.take());
 
@@ -831,25 +892,18 @@ mod tests {
         let started_at = chrono::Local::now();
         let initial_path = clip_path(dir.path(), started_at, &[]).unwrap();
 
-        let mut event = start_event(
-            dir.path(),
-            initial_path,
-            started_at,
-            clip_timeline_start,
-            2,
-            2,
-            8000,
-        )
-        .unwrap();
+        let mut event =
+            start_event_standard(dir.path(), initial_path, started_at, clip_timeline_start)
+                .unwrap();
 
         seed_one_frame(&mut event, clip_timeline_start);
-        std::thread::sleep(Duration::from_millis(250));
+        std::thread::sleep(PAST_TICK_SLEEP);
 
         let ring_buffer =
-            std::sync::Mutex::new(crate::buffer::RingBuffer::new(Duration::from_secs(30)));
+            std::sync::Mutex::new(crate::buffer::RingBuffer::new(DRAIN_TEST_RETENTION));
         {
             let mut buf = ring_buffer.lock().unwrap();
-            buf.push_frame(image::RgbImage::new(2, 2));
+            buf.push_frame(image::RgbImage::new(TEST_FRAME_DIM, TEST_FRAME_DIM));
         }
 
         drop(event.ffmpeg_video.stdin.take());
@@ -867,16 +921,9 @@ mod tests {
         let started_at = chrono::Local::now();
         let initial_path = clip_path(dir.path(), started_at, &[]).unwrap();
 
-        let mut event = start_event(
-            dir.path(),
-            initial_path,
-            started_at,
-            clip_timeline_start,
-            2,
-            2,
-            8000,
-        )
-        .unwrap();
+        let mut event =
+            start_event_standard(dir.path(), initial_path, started_at, clip_timeline_start)
+                .unwrap();
 
         // Kill the encoder out from under the event so its stdin pipe becomes
         // a broken pipe (the process is gone, but the Stdio::piped() handle
@@ -889,16 +936,18 @@ mod tests {
         // arm instead of the one this test targets.
         event.ffmpeg_video.kill().unwrap();
 
-        let mut result = event.write_frame(&image::RgbImage::new(2, 2));
+        let broken_pipe_frame = || image::RgbImage::new(TEST_FRAME_DIM, TEST_FRAME_DIM);
+
+        let mut result = event.write_frame(&broken_pipe_frame());
         // A single write can land in the pipe buffer before the kernel
         // notices the reader is gone; retry briefly until the broken pipe is
         // actually observed rather than asserting on a racy first attempt.
-        for _ in 0..200 {
+        for _ in 0..BROKEN_PIPE_MAX_RETRIES {
             if result.is_err() {
                 break;
             }
-            std::thread::sleep(Duration::from_millis(10));
-            result = event.write_frame(&image::RgbImage::new(2, 2));
+            std::thread::sleep(BROKEN_PIPE_POLL_INTERVAL);
+            result = event.write_frame(&broken_pipe_frame());
         }
 
         let err = result.unwrap_err();
@@ -920,16 +969,9 @@ mod tests {
         let started_at = chrono::Local::now();
         let initial_path = clip_path(dir.path(), started_at, &[]).unwrap();
 
-        let mut event = start_event(
-            dir.path(),
-            initial_path,
-            started_at,
-            clip_timeline_start,
-            2,
-            2,
-            8000,
-        )
-        .unwrap();
+        let mut event =
+            start_event_standard(dir.path(), initial_path, started_at, clip_timeline_start)
+                .unwrap();
 
         // Swap in a read-only handle to the same temp file so write_all
         // itself fails (EBADF) rather than anything about the path/directory
@@ -937,7 +979,9 @@ mod tests {
         // here as a same-module test.
         event.audio_file = std::fs::File::open(&event.audio_tmp_path).unwrap();
 
-        let err = event.write_audio(&[0.0; 10]).unwrap_err();
+        let err = event
+            .write_audio(&[0.0; WRITE_AUDIO_TEST_SAMPLES])
+            .unwrap_err();
         assert!(
             err.to_string()
                 .contains("failed to write audio samples to temp file"),
@@ -955,16 +999,9 @@ mod tests {
         let started_at = chrono::Local::now();
         let initial_path = clip_path(dir.path(), started_at, &[]).unwrap();
 
-        let mut event = start_event(
-            dir.path(),
-            initial_path,
-            started_at,
-            clip_timeline_start,
-            2,
-            2,
-            8000,
-        )
-        .unwrap();
+        let mut event =
+            start_event_standard(dir.path(), initial_path, started_at, clip_timeline_start)
+                .unwrap();
 
         event.audio_file = std::fs::File::open(&event.audio_tmp_path).unwrap();
 
@@ -973,7 +1010,7 @@ mod tests {
                 &[],
                 &[TimestampedAudio {
                     timestamp: clip_timeline_start,
-                    samples: vec![0.0; 10],
+                    samples: vec![0.0; WRITE_AUDIO_TEST_SAMPLES],
                 }],
             )
             .unwrap_err();
@@ -994,24 +1031,17 @@ mod tests {
         let started_at = chrono::Local::now();
         let initial_path = clip_path(dir.path(), started_at, &[]).unwrap();
 
-        let mut event = start_event(
-            dir.path(),
-            initial_path,
-            started_at,
-            clip_timeline_start,
-            2,
-            2,
-            8000,
-        )
-        .unwrap();
+        let mut event =
+            start_event_standard(dir.path(), initial_path, started_at, clip_timeline_start)
+                .unwrap();
 
         seed_one_frame(&mut event, clip_timeline_start);
 
         let ring_buffer =
-            std::sync::Mutex::new(crate::buffer::RingBuffer::new(Duration::from_secs(30)));
+            std::sync::Mutex::new(crate::buffer::RingBuffer::new(DRAIN_TEST_RETENTION));
         {
             let mut buf = ring_buffer.lock().unwrap();
-            buf.push_audio(vec![0.5; 100]);
+            buf.push_audio(vec![DRAIN_TEST_AUDIO_SAMPLE; DRAIN_TEST_AUDIO_SAMPLES]);
         }
 
         event.audio_file = std::fs::File::open(&event.audio_tmp_path).unwrap();
@@ -1034,19 +1064,12 @@ mod tests {
         let started_at = chrono::Local::now();
         let initial_path = clip_path(dir.path(), started_at, &[]).unwrap();
 
-        let mut event = start_event(
-            dir.path(),
-            initial_path,
-            started_at,
-            clip_timeline_start,
-            2,
-            2,
-            8000,
-        )
-        .unwrap();
+        let mut event =
+            start_event_standard(dir.path(), initial_path, started_at, clip_timeline_start)
+                .unwrap();
 
         seed_one_frame(&mut event, clip_timeline_start);
-        event.record_detection("person", 0.9, clip_timeline_start);
+        event.record_detection("person", OTHER_DETECTION_CONFIDENCE, clip_timeline_start);
 
         // finish()'s `if let Some(stderr_pipe) = self.ffmpeg_video.stderr.take()`
         // only has stderr to capture the first time it runs; pre-taking it
@@ -1071,16 +1094,9 @@ mod tests {
         let sidecar_target = sidecar_path(&initial_path);
         std::fs::create_dir_all(&sidecar_target).unwrap();
 
-        let mut event = start_event(
-            dir.path(),
-            initial_path,
-            started_at,
-            clip_timeline_start,
-            2,
-            2,
-            8000,
-        )
-        .unwrap();
+        let mut event =
+            start_event_standard(dir.path(), initial_path, started_at, clip_timeline_start)
+                .unwrap();
 
         seed_one_frame(&mut event, clip_timeline_start);
 
@@ -1098,19 +1114,12 @@ mod tests {
         let started_at = chrono::Local::now();
         let initial_path = clip_path(dir.path(), started_at, &[]).unwrap();
 
-        let mut event = start_event(
-            dir.path(),
-            initial_path,
-            started_at,
-            clip_timeline_start,
-            2,
-            2,
-            8000,
-        )
-        .unwrap();
+        let mut event =
+            start_event_standard(dir.path(), initial_path, started_at, clip_timeline_start)
+                .unwrap();
 
         seed_one_frame(&mut event, clip_timeline_start);
-        event.record_detection("person", 0.9, clip_timeline_start);
+        event.record_detection("person", OTHER_DETECTION_CONFIDENCE, clip_timeline_start);
 
         // finish() recomputes the final path via clip_path(&self.output_dir,
         // ...), which create_dir_all()s the day directory under output_dir.

@@ -46,24 +46,48 @@ mod tests {
 
     use super::*;
 
+    /// Fixture detection offset, in seconds from the clip start.
+    const DETECTION_OFFSET_SECS: f64 = 1.5;
+
+    /// Fixture detection confidence.
+    const DETECTION_CONFIDENCE: f32 = 0.87;
+
+    /// Fixture motion-event offset, in seconds from the clip start.
+    const MOTION_OFFSET_SECS: f64 = 0.2;
+
+    /// Fixture motion-event changed-pixel ratio.
+    const MOTION_CHANGED_RATIO: f32 = 0.05;
+
+    /// Tolerance for comparing a round-tripped JSON float against its
+    /// original fixture value.
+    const JSON_FLOAT_TOLERANCE: f64 = 0.001;
+
     #[test]
     fn sidecar_serializes_with_expected_shape() {
         let sidecar = Sidecar {
             detections: vec![DetectionRecord {
-                offset_secs: 1.5,
+                offset_secs: DETECTION_OFFSET_SECS,
                 class_name: "person".to_string(),
-                confidence: 0.87,
+                confidence: DETECTION_CONFIDENCE,
             }],
             motion_events: vec![MotionEvent {
-                offset_secs: 0.2,
-                changed_ratio: 0.05,
+                offset_secs: MOTION_OFFSET_SECS,
+                changed_ratio: MOTION_CHANGED_RATIO,
             }],
         };
 
         let json = serde_json::to_value(&sidecar).unwrap();
 
         assert_eq!(json["detections"][0]["class_name"], "person");
-        assert!((json["detections"][0]["offset_secs"].as_f64().unwrap() - 1.5).abs() < 0.001);
-        assert!((json["motion_events"][0]["changed_ratio"].as_f64().unwrap() - 0.05).abs() < 0.001);
+        assert!(
+            (json["detections"][0]["offset_secs"].as_f64().unwrap() - DETECTION_OFFSET_SECS).abs()
+                < JSON_FLOAT_TOLERANCE
+        );
+        assert!(
+            (json["motion_events"][0]["changed_ratio"].as_f64().unwrap()
+                - f64::from(MOTION_CHANGED_RATIO))
+            .abs()
+                < JSON_FLOAT_TOLERANCE
+        );
     }
 }

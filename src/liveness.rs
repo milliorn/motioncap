@@ -107,6 +107,19 @@ mod tests {
 
     use super::*;
 
+    /// An arbitrary forward offset used only to construct "a later
+    /// timestamp than the one already tracked."
+    const LATER_TIMESTAMP_OFFSET: Duration = Duration::from_millis(100);
+
+    /// Margin added past `clip_state::MAX_FRAME_STALL` so a test
+    /// unambiguously lands past the stall threshold rather than right at its
+    /// boundary.
+    const PAST_STALL_MARGIN: Duration = Duration::from_millis(50);
+
+    /// An arbitrary "long ago" offset, unrelated to any specific threshold,
+    /// used only to give a fixture a timestamp clearly in the past.
+    const ARBITRARY_PAST_OFFSET: Duration = Duration::from_secs(30);
+
     // --- frame_liveness_advanced ---
 
     #[test]
@@ -126,7 +139,7 @@ mod tests {
             warned: true,
         });
 
-        let new_ts = Instant::now() + Duration::from_millis(100);
+        let new_ts = Instant::now() + LATER_TIMESTAMP_OFFSET;
         assert!(frame_liveness_advanced(&mut last_seen, new_ts));
         // Resets tracking for the new timestamp.
         assert_eq!(last_seen.unwrap().timestamp, new_ts);
@@ -152,9 +165,7 @@ mod tests {
         let ts = Instant::now();
         let mut last_seen = Some(FrameLiveness {
             timestamp: ts,
-            unchanged_since: Instant::now()
-                - clip_state::MAX_FRAME_STALL
-                - Duration::from_millis(50),
+            unchanged_since: Instant::now() - clip_state::MAX_FRAME_STALL - PAST_STALL_MARGIN,
             warned: false,
         });
 
@@ -171,7 +182,7 @@ mod tests {
 
     #[test]
     fn reset_liveness_after_reconnect_resets_warned_and_clock_but_not_timestamp() {
-        let original_ts = Instant::now() - Duration::from_secs(30);
+        let original_ts = Instant::now() - ARBITRARY_PAST_OFFSET;
         let mut last_seen = Some(FrameLiveness {
             timestamp: original_ts,
             unchanged_since: original_ts,

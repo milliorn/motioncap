@@ -48,6 +48,26 @@ const LIVING_THING_CLASSES: &[(usize, &str)] = &[
 /// `YOLOv8`'s fixed square input resolution.
 const MODEL_INPUT_SIZE: u32 = 640;
 
+/// Divides an unpadded dimension in half to center it within
+/// `MODEL_INPUT_SIZE`'s letterbox padding.
+const LETTERBOX_CENTER_DIVISOR: u32 = 2;
+
+/// Maximum value of an 8-bit color channel, used to normalize pixel values
+/// into the `[0, 1]` range the model expects.
+const PIXEL_MAX_VALUE: f32 = 255.0;
+
+/// Standard YOLO letterbox pad color (mid-grey, `114` out of `255`), matching
+/// the padding value `YOLOv8` itself is trained with.
+const LETTERBOX_PAD_VALUE: f32 = 114.0;
+
+/// `YOLOv8`'s standard per-anchor output channel count: 4 box coordinates
+/// plus one score per COCO class (80 classes).
+const YOLO_OUTPUT_CHANNELS: usize = 84;
+
+/// Number of leading channels per anchor that encode box coordinates (before
+/// the per-class scores begin), in `YOLOv8`'s standard output layout.
+const YOLO_BOX_COORD_CHANNELS: usize = 4;
+
 /// A single YOLO detection above the confidence threshold.
 pub struct Detection {
     /// The detected COCO class name (person or an animal, see `LIVING_THING_CLASSES`).
@@ -94,16 +114,16 @@ pub fn preprocess(frame: &RgbImage) -> Array4<f32> {
         clippy::arithmetic_side_effects,
         reason = "new_w/new_h <= MODEL_INPUT_SIZE, proven above"
     )]
-    let pad_x = (MODEL_INPUT_SIZE - new_w) / 2;
+    let pad_x = (MODEL_INPUT_SIZE - new_w) / LETTERBOX_CENTER_DIVISOR;
     #[allow(
         clippy::arithmetic_side_effects,
         reason = "new_w/new_h <= MODEL_INPUT_SIZE, proven above"
     )]
-    let pad_y = (MODEL_INPUT_SIZE - new_h) / 2;
+    let pad_y = (MODEL_INPUT_SIZE - new_h) / LETTERBOX_CENTER_DIVISOR;
 
     let mut tensor = Array4::<f32>::from_elem(
         (1, 3, MODEL_INPUT_SIZE as usize, MODEL_INPUT_SIZE as usize),
-        114.0 / 255.0,
+        LETTERBOX_PAD_VALUE / PIXEL_MAX_VALUE,
     );
     for (x, y, pixel) in resized.enumerate_pixels() {
         #[allow(
@@ -121,9 +141,9 @@ pub fn preprocess(frame: &RgbImage) -> Array4<f32> {
             reason = "dst_x, dst_y < MODEL_INPUT_SIZE, matching tensor's allocated shape"
         )]
         {
-            tensor[[0, 0, dst_y, dst_x]] = f32::from(pixel[0]) / 255.0;
-            tensor[[0, 1, dst_y, dst_x]] = f32::from(pixel[1]) / 255.0;
-            tensor[[0, 2, dst_y, dst_x]] = f32::from(pixel[2]) / 255.0;
+            tensor[[0, 0, dst_y, dst_x]] = f32::from(pixel[0]) / PIXEL_MAX_VALUE;
+            tensor[[0, 1, dst_y, dst_x]] = f32::from(pixel[1]) / PIXEL_MAX_VALUE;
+            tensor[[0, 2, dst_y, dst_x]] = f32::from(pixel[2]) / PIXEL_MAX_VALUE;
         }
     }
     tensor
@@ -145,19 +165,19 @@ pub fn postprocess(shape: &Shape, data: &[f32], confidence_threshold: f32) -> Ve
         log::warn!("unexpected YOLO output shape: {dims:?}");
         return Vec::new();
     };
-    if class_dim != 84 {
+    if class_dim != YOLO_OUTPUT_CHANNELS {
         log::warn!("unexpected YOLO output shape: {dims:?}");
         return Vec::new();
     }
 
-    let view = ndarray::ArrayView2::from_shape((84, num_anchors), data)
+    let view = ndarray::ArrayView2::from_shape((YOLO_OUTPUT_CHANNELS, num_anchors), data)
         .expect("output tensor size should match its own reported shape");
 
     let mut best_per_class: std::collections::HashMap<usize, f32> =
         std::collections::HashMap::new();
 
     for anchor in 0..num_anchors {
-        let scores = view.slice(s![4..84, anchor]);
+        let scores = view.slice(s![YOLO_BOX_COORD_CHANNELS..YOLO_OUTPUT_CHANNELS, anchor]);
         for (class_idx, &score) in scores.iter().enumerate() {
             if score < confidence_threshold {
                 continue;
@@ -300,14 +320,40 @@ mod tests {
 
     use super::*;
 
-    /// Builds a synthetic `[1, 84, num_anchors]` YOLO output buffer where every
-    /// anchor's class scores are zero except the ones set via `scores`, a list
-    /// of `(anchor, class_idx, score)` triples (`class_idx` is 0-based over the
-    /// 80 COCO classes, matching `LIVING_THING_CLASSES`' indices).
+    /// A representative detection confidence threshold, used wherever a test
+    /// needs one but its exact value isn't the thing under test.
+    const TEST_CONFIDENCE_THRESHOLD: f32 = 0.3;
+
+    /// A score used to demonstrate "clearly above `TEST_CONFIDENCE_THRESHOLD`".
+    const ABOVE_THRESHOLD_SCORE: f32 = 0.9;
+
+    /// A score used to demonstrate "clearly below `TEST_CONFIDENCE_THRESHOLD`".
+    const BELOW_THRESHOLD_SCORE: f32 = 0.1;
+
+    /// The lower of two same-class scores across anchors, used to prove
+    /// `postprocess` keeps the best (not first-seen) score per class.
+    const LOWER_REPEAT_SCORE: f32 = 0.4;
+
+    /// The higher of two same-class scores across anchors. See `LOWER_REPEAT_SCORE`.
+    const HIGHER_REPEAT_SCORE: f32 = 0.95;
+
+    /// A channel count that deliberately does not match `YOLO_OUTPUT_CHANNELS`,
+    /// to exercise `postprocess`'s wrong-shape guard.
+    const WRONG_CLASS_DIM: usize = 85;
+
+    /// An anchor count used only by the wrong-shape tests, where its exact
+    /// value is irrelevant to what's being proven.
+    const WRONG_SHAPE_TEST_ANCHORS: usize = 10;
+
+    /// Builds a synthetic `[1, YOLO_OUTPUT_CHANNELS, num_anchors]` YOLO output
+    /// buffer where every anchor's class scores are zero except the ones set
+    /// via `scores`, a list of `(anchor, class_idx, score)` triples
+    /// (`class_idx` is 0-based over the 80 COCO classes, matching
+    /// `LIVING_THING_CLASSES`' indices).
     fn synthetic_output(num_anchors: usize, scores: &[(usize, usize, f32)]) -> Vec<f32> {
-        let mut data = vec![0.0_f32; 84 * num_anchors];
+        let mut data = vec![0.0_f32; YOLO_OUTPUT_CHANNELS * num_anchors];
         for &(anchor, class_idx, score) in scores {
-            let row = 4 + class_idx;
+            let row = YOLO_BOX_COORD_CHANNELS + class_idx;
             data[row * num_anchors + anchor] = score;
         }
         data
@@ -318,23 +364,26 @@ mod tests {
         let num_anchors = 2;
         // class_idx 0 = person (living-thing, above threshold);
         // class_idx 1 = bicycle (not in LIVING_THING_CLASSES, ignored).
-        let data = synthetic_output(num_anchors, &[(0, 0, 0.9), (1, 1, 0.9)]);
-        let shape = Shape::from(vec![1_i64, 84, num_anchors as i64]);
+        let data = synthetic_output(
+            num_anchors,
+            &[(0, 0, ABOVE_THRESHOLD_SCORE), (1, 1, ABOVE_THRESHOLD_SCORE)],
+        );
+        let shape = Shape::from(vec![1_i64, YOLO_OUTPUT_CHANNELS as i64, num_anchors as i64]);
 
-        let detections = postprocess(&shape, &data, 0.3);
+        let detections = postprocess(&shape, &data, TEST_CONFIDENCE_THRESHOLD);
 
         assert_eq!(detections.len(), 1);
         assert_eq!(detections[0].class_name, "person");
-        assert!((detections[0].confidence - 0.9).abs() < f32::EPSILON);
+        assert!((detections[0].confidence - ABOVE_THRESHOLD_SCORE).abs() < f32::EPSILON);
     }
 
     #[test]
     fn postprocess_excludes_scores_below_threshold() {
         let num_anchors = 1;
-        let data = synthetic_output(num_anchors, &[(0, 0, 0.1)]);
-        let shape = Shape::from(vec![1_i64, 84, num_anchors as i64]);
+        let data = synthetic_output(num_anchors, &[(0, 0, BELOW_THRESHOLD_SCORE)]);
+        let shape = Shape::from(vec![1_i64, YOLO_OUTPUT_CHANNELS as i64, num_anchors as i64]);
 
-        let detections = postprocess(&shape, &data, 0.3);
+        let detections = postprocess(&shape, &data, TEST_CONFIDENCE_THRESHOLD);
 
         assert!(detections.is_empty());
     }
@@ -342,81 +391,140 @@ mod tests {
     #[test]
     fn postprocess_keeps_best_score_per_class_across_anchors() {
         let num_anchors = 2;
-        let data = synthetic_output(num_anchors, &[(0, 0, 0.4), (1, 0, 0.95)]);
-        let shape = Shape::from(vec![1_i64, 84, num_anchors as i64]);
+        let data = synthetic_output(
+            num_anchors,
+            &[(0, 0, LOWER_REPEAT_SCORE), (1, 0, HIGHER_REPEAT_SCORE)],
+        );
+        let shape = Shape::from(vec![1_i64, YOLO_OUTPUT_CHANNELS as i64, num_anchors as i64]);
 
-        let detections = postprocess(&shape, &data, 0.3);
+        let detections = postprocess(&shape, &data, TEST_CONFIDENCE_THRESHOLD);
 
         assert_eq!(detections.len(), 1);
-        assert!((detections[0].confidence - 0.95).abs() < f32::EPSILON);
+        assert!((detections[0].confidence - HIGHER_REPEAT_SCORE).abs() < f32::EPSILON);
     }
 
     #[test]
     fn postprocess_keeps_first_best_score_when_later_anchor_scores_lower() {
         let num_anchors = 2;
-        let data = synthetic_output(num_anchors, &[(0, 0, 0.95), (1, 0, 0.4)]);
-        let shape = Shape::from(vec![1_i64, 84, num_anchors as i64]);
+        let data = synthetic_output(
+            num_anchors,
+            &[(0, 0, HIGHER_REPEAT_SCORE), (1, 0, LOWER_REPEAT_SCORE)],
+        );
+        let shape = Shape::from(vec![1_i64, YOLO_OUTPUT_CHANNELS as i64, num_anchors as i64]);
 
-        let detections = postprocess(&shape, &data, 0.3);
+        let detections = postprocess(&shape, &data, TEST_CONFIDENCE_THRESHOLD);
 
         assert_eq!(detections.len(), 1);
-        assert!((detections[0].confidence - 0.95).abs() < f32::EPSILON);
+        assert!((detections[0].confidence - HIGHER_REPEAT_SCORE).abs() < f32::EPSILON);
     }
 
     #[test]
     fn postprocess_returns_empty_on_wrong_class_dim() {
-        let shape = Shape::from(vec![1_i64, 85, 10_i64]);
-        let data = vec![0.0_f32; 85 * 10];
+        let shape = Shape::from(vec![
+            1_i64,
+            WRONG_CLASS_DIM as i64,
+            WRONG_SHAPE_TEST_ANCHORS as i64,
+        ]);
+        let data = vec![0.0_f32; WRONG_CLASS_DIM * WRONG_SHAPE_TEST_ANCHORS];
 
-        assert!(postprocess(&shape, &data, 0.3).is_empty());
+        assert!(postprocess(&shape, &data, TEST_CONFIDENCE_THRESHOLD).is_empty());
     }
 
     #[test]
     fn postprocess_returns_empty_on_wrong_rank() {
-        let shape = Shape::from(vec![84_i64, 10_i64]);
-        let data = vec![0.0_f32; 84 * 10];
+        let shape = Shape::from(vec![
+            YOLO_OUTPUT_CHANNELS as i64,
+            WRONG_SHAPE_TEST_ANCHORS as i64,
+        ]);
+        let data = vec![0.0_f32; YOLO_OUTPUT_CHANNELS * WRONG_SHAPE_TEST_ANCHORS];
 
-        assert!(postprocess(&shape, &data, 0.3).is_empty());
+        assert!(postprocess(&shape, &data, TEST_CONFIDENCE_THRESHOLD).is_empty());
     }
+
+    /// This webcam's native landscape resolution (see `preprocess`'s doc
+    /// comment), used to exercise letterbox padding on the vertical axis.
+    const LANDSCAPE_WIDTH: u32 = 640;
+    /// See `LANDSCAPE_WIDTH`.
+    const LANDSCAPE_HEIGHT: u32 = 480;
+
+    /// A mid-grey fixture pixel value, deliberately close to but distinct
+    /// from `LETTERBOX_PAD_VALUE`'s `114`, so the pad-fill assertion in the
+    /// landscape/portrait tests genuinely distinguishes "pad" from "resized
+    /// pixel" rather than passing coincidentally.
+    const GREY_FIXTURE_PIXEL: u8 = 200;
+
+    /// A fixture pixel value chosen to visibly differ per channel, so the
+    /// square-input test can assert "not the pad color" without ambiguity.
+    const NON_GREY_FIXTURE_PIXEL: [u8; 3] = [10, 20, 30];
+
+    /// Tolerance the square-input test uses to assert a pixel is clearly
+    /// *not* the letterbox pad value (wider than the exact-match tolerance
+    /// used elsewhere, since this compares two deliberately different values
+    /// rather than checking equality).
+    const NOT_PAD_VALUE_TOLERANCE: f32 = 0.05;
+
+    /// An arbitrary `Ok` payload value for `ort_err`'s passthrough test; its
+    /// exact value is irrelevant to what's being proven (that `Ok` values
+    /// pass through unchanged).
+    const ORT_ERR_OK_PAYLOAD: u32 = 42;
+
+    /// Mid-grey fixture value for the real-model inference test; a plain
+    /// neutral fill with no real subject, distinct from
+    /// `GREY_FIXTURE_PIXEL`/`NON_GREY_FIXTURE_PIXEL` only because this test
+    /// lives in a different logical group (real-model inference vs.
+    /// synthetic-tensor unit tests).
+    const NEUTRAL_FIXTURE_PIXEL: u8 = 128;
 
     #[test]
     fn preprocess_pads_vertically_for_landscape_input() {
-        let frame = RgbImage::from_pixel(640, 480, Rgb([200, 200, 200]));
+        let frame = RgbImage::from_pixel(
+            LANDSCAPE_WIDTH,
+            LANDSCAPE_HEIGHT,
+            Rgb([GREY_FIXTURE_PIXEL; 3]),
+        );
         let tensor = preprocess(&frame);
 
         // Landscape (wider than tall): scale is bound by width, so the resized
         // image is shorter than MODEL_INPUT_SIZE and padding is added on the
         // vertical axis only. The top row should be the grey pad fill, not a
         // resized pixel.
-        let pad_value = 114.0 / 255.0;
+        let pad_value = LETTERBOX_PAD_VALUE / PIXEL_MAX_VALUE;
         assert!((tensor[[0, 0, 0, 0]] - pad_value).abs() < f32::EPSILON);
     }
 
     #[test]
     fn preprocess_pads_horizontally_for_portrait_input() {
-        let frame = RgbImage::from_pixel(480, 640, Rgb([200, 200, 200]));
+        let frame = RgbImage::from_pixel(
+            LANDSCAPE_HEIGHT,
+            LANDSCAPE_WIDTH,
+            Rgb([GREY_FIXTURE_PIXEL; 3]),
+        );
         let tensor = preprocess(&frame);
 
-        let pad_value = 114.0 / 255.0;
+        let pad_value = LETTERBOX_PAD_VALUE / PIXEL_MAX_VALUE;
         assert!((tensor[[0, 0, 0, 0]] - pad_value).abs() < f32::EPSILON);
     }
 
     #[test]
     fn preprocess_adds_no_padding_for_square_input() {
-        let frame = RgbImage::from_pixel(640, 640, Rgb([10, 20, 30])); // deliberately non-grey
+        let frame = RgbImage::from_pixel(
+            MODEL_INPUT_SIZE,
+            MODEL_INPUT_SIZE,
+            Rgb(NON_GREY_FIXTURE_PIXEL),
+        );
         let tensor = preprocess(&frame);
 
         // A square input needs no letterboxing: scale = 1.0, new_w = new_h =
         // MODEL_INPUT_SIZE, so every pixel in the tensor comes from the
         // resized image rather than the grey pad fill.
-        let pad_value = 114.0 / 255.0;
-        assert!((tensor[[0, 0, 0, 0]] - pad_value).abs() > 0.05);
+        let pad_value = LETTERBOX_PAD_VALUE / PIXEL_MAX_VALUE;
+        assert!((tensor[[0, 0, 0, 0]] - pad_value).abs() > NOT_PAD_VALUE_TOLERANCE);
     }
 
     #[test]
     fn ort_err_passes_through_ok() {
-        let result: Result<u32, &str> = Ok(42);
-        assert_eq!(ort_err(result, "unused").unwrap(), 42);
+        let result: Result<u32, &str> = Ok(ORT_ERR_OK_PAYLOAD);
+        assert_eq!(ort_err(result, "unused").unwrap(), ORT_ERR_OK_PAYLOAD);
     }
 
     #[test]
@@ -439,7 +547,11 @@ mod tests {
         let mut detector = Detector::load(model_path, true)
             .expect("failed to load model, is models/yolov8n.onnx present?");
 
-        let frame = RgbImage::from_pixel(640, 480, Rgb([128, 128, 128]));
+        let frame = RgbImage::from_pixel(
+            LANDSCAPE_WIDTH,
+            LANDSCAPE_HEIGHT,
+            Rgb([NEUTRAL_FIXTURE_PIXEL; 3]),
+        );
 
         // A synthetic grey frame has no real subject in it, so this only
         // exercises Detector::load/detect's plumbing (session creation,
@@ -447,7 +559,7 @@ mod tests {
         // postprocess's actual filtering logic is already covered directly by
         // the postprocess_* tests above with controlled synthetic tensors.
         let detections = detector
-            .detect(&frame, 0.3)
+            .detect(&frame, TEST_CONFIDENCE_THRESHOLD)
             .expect("inference should not error on a well-formed frame");
 
         // No assertion on detections.len(): a blank grey frame may or may not
