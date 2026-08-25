@@ -1,7 +1,7 @@
 use serde::Serialize;
 
 /// One recorded detection, written into a clip's `.json` sidecar (ADR 4).
-#[derive(Serialize)]
+#[derive(Debug, Serialize)]
 pub struct DetectionRecord {
     /// Seconds from the start of the clip when this detection occurred.
     pub offset_secs: f64,
@@ -12,11 +12,12 @@ pub struct DetectionRecord {
 }
 
 /// One recorded motion-gate trip, written into a clip's `.json` sidecar.
+///
 /// Logged for every trip during an active recording, whether or not YOLO
 /// went on to confirm a living-thing class that same tick; this is what
 /// lets a clip that kept extending (via the post-buffer quiet window) be
 /// audited after the fact for what actually kept triggering it.
-#[derive(Serialize)]
+#[derive(Debug, Serialize)]
 pub struct MotionEvent {
     /// Seconds from the start of the clip when the gate tripped.
     pub offset_secs: f64,
@@ -25,7 +26,7 @@ pub struct MotionEvent {
 }
 
 /// A clip's `.json` sidecar contents (ADR 4).
-#[derive(Serialize)]
+#[derive(Debug, Serialize)]
 pub struct Sidecar {
     /// Every detection recorded during the clip, in chronological order.
     pub detections: Vec<DetectionRecord>,

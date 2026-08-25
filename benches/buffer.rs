@@ -1,0 +1,76 @@
+//! Benchmarks for `RingBuffer` push/read throughput, standing in for the
+//! detection/writer/preview loops' hot paths (`push_frame` runs on every
+//! captured camera frame; `latest_frame`/`frames_since` run on every
+//! detection/writer poll). See `docs/adr/0007-testing-conventions.md` for
+//! why this crate needs a library target at all to make `benches/` possible.
+#![allow(
+    missing_docs,
+    clippy::missing_docs_in_private_items,
+    reason = "criterion_group!/criterion_main! generate an undocumented fn main; this file has \
+               no public API of its own for missing_docs to meaningfully enforce"
+)]
+#![allow(
+    clippy::arithmetic_side_effects,
+    clippy::unchecked_time_subtraction,
+    reason = "benchmark setup subtracts a small hardcoded Duration from Instant::now(), which \
+               only underflows past the Unix epoch, not reachable here"
+)]
+
+use std::hint::black_box;
+use std::time::Duration;
+
+use criterion::{Criterion, criterion_group, criterion_main};
+use image::RgbImage;
+use motioncap::buffer::RingBuffer;
+
+/// A generous retention window so pushed frames never evict mid-benchmark.
+const BENCH_RETENTION: Duration = Duration::from_mins(1);
+
+/// Representative camera frame dimensions (matches this project's webcam).
+const FRAME_WIDTH: u32 = 640;
+/// Representative camera frame dimensions (matches this project's webcam).
+const FRAME_HEIGHT: u32 = 480;
+
+/// Number of frames pre-populated before a read-path benchmark runs, so
+/// `frames_since` has a realistic backlog to scan.
+const PREFILLED_FRAME_COUNT: usize = 64;
+
+fn push_frame(c: &mut Criterion) {
+    let mut buffer = RingBuffer::new(BENCH_RETENTION);
+    let frame = RgbImage::new(FRAME_WIDTH, FRAME_HEIGHT);
+
+    c.bench_function("ring_buffer_push_frame", |b| {
+        b.iter(|| buffer.push_frame(black_box(frame.clone())));
+    });
+}
+
+fn latest_frame(c: &mut Criterion) {
+    let mut buffer = RingBuffer::new(BENCH_RETENTION);
+    let frame = RgbImage::new(FRAME_WIDTH, FRAME_HEIGHT);
+
+    for _ in 0..PREFILLED_FRAME_COUNT {
+        buffer.push_frame(frame.clone());
+    }
+
+    c.bench_function("ring_buffer_latest_frame", |b| {
+        b.iter(|| black_box(buffer.latest_frame()));
+    });
+}
+
+fn frames_since(c: &mut Criterion) {
+    let mut buffer = RingBuffer::new(BENCH_RETENTION);
+    let frame = RgbImage::new(FRAME_WIDTH, FRAME_HEIGHT);
+
+    for _ in 0..PREFILLED_FRAME_COUNT {
+        buffer.push_frame(frame.clone());
+    }
+
+    let since = std::time::Instant::now() - Duration::from_secs(1);
+
+    c.bench_function("ring_buffer_frames_since", |b| {
+        b.iter(|| black_box(buffer.frames_since(since)));
+    });
+}
+
+criterion_group!(benches, push_frame, latest_frame, frames_since);
+criterion_main!(benches);

@@ -11,21 +11,28 @@ use ort::value::{Shape, Tensor};
 
 /// `ort::Error` doesn't implement `std::error::Error` in a way `anyhow::Context`
 /// can use directly, so ort results are converted through this helper instead.
+///
+/// # Errors
+///
+/// Returns an error (built from `msg` and the debug-formatted original
+/// error) whenever `result` is `Err`.
 pub fn ort_err<T, E: Debug>(result: std::result::Result<T, E>, msg: &str) -> Result<T> {
     result.map_err(|e| anyhow::anyhow!("{msg}: {e:?}"))
 }
 
 /// Serializes every `#[ignore]`d test across the crate that constructs a real
 /// `Detector`/ONNX Runtime session and/or a real `MotionGate` (both here and
-/// in `main.rs`'s test module). `cargo test`'s default parallelism ran
-/// multiple such tests concurrently and reliably produced a heap-corruption
-/// abort ("corrupted double-linked list") within a handful of runs. Neither
-/// `ort`'s `Session` nor `OpenCV`'s `BackgroundSubtractorMOG2` are documented
-/// as safe to construct/run concurrently across independent instances in
-/// separate threads, and this crate's production code never does so (YOLO
-/// inference and the motion gate both run single-threaded inside the
-/// detection worker). Every `#[ignore]`d test that touches either must
-/// acquire this lock for its full duration before doing anything else.
+/// in `app.rs`'s test module).
+///
+/// `cargo test`'s default parallelism ran multiple such tests concurrently
+/// and reliably produced a heap-corruption abort ("corrupted double-linked
+/// list") within a handful of runs. Neither `ort`'s `Session` nor `OpenCV`'s
+/// `BackgroundSubtractorMOG2` are documented as safe to construct/run
+/// concurrently across independent instances in separate threads, and this
+/// crate's production code never does so (YOLO inference and the motion gate
+/// both run single-threaded inside the detection worker). Every
+/// `#[ignore]`d test that touches either must acquire this lock for its full
+/// duration before doing anything else.
 #[cfg(test)]
 pub static MODEL_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
@@ -69,6 +76,7 @@ const YOLO_OUTPUT_CHANNELS: usize = 84;
 const YOLO_BOX_COORD_CHANNELS: usize = 4;
 
 /// A single YOLO detection above the confidence threshold.
+#[derive(Debug)]
 pub struct Detection {
     /// The detected COCO class name (person or an animal, see `LIVING_THING_CLASSES`).
     pub class_name: &'static str,
@@ -77,11 +85,13 @@ pub struct Detection {
 }
 
 /// Letterboxes the frame into a square canvas (preserving aspect ratio, padding
-/// with grey) and converts to an NCHW f32 tensor normalized to [0, 1]. This is the
-/// standard `YOLOv8` preprocessing; a naive stretch-to-square resize distorts
-/// non-square camera frames (e.g. this webcam's 640x480) enough to
-/// meaningfully degrade detection confidence, since the model is trained on
-/// letterboxed inputs, not stretched ones.
+/// with grey) and converts to an NCHW f32 tensor normalized to [0, 1].
+///
+/// This is the standard `YOLOv8` preprocessing; a naive stretch-to-square
+/// resize distorts non-square camera frames (e.g. this webcam's 640x480)
+/// enough to meaningfully degrade detection confidence, since the model is
+/// trained on letterboxed inputs, not stretched ones.
+#[must_use]
 #[allow(
     clippy::cast_precision_loss,
     reason = "camera frame dimensions never approach f32's 24-bit exact-integer range"
@@ -151,8 +161,16 @@ pub fn preprocess(frame: &RgbImage) -> Array4<f32> {
 
 /// Parses `YOLOv8`'s standard `[1, 84, 8400]` output (4 box coords + 80 class
 /// scores, per anchor) and filters to living-thing classes above threshold.
+///
 /// No NMS/box deduplication is performed since only class presence (not
 /// precise box geometry) is needed to decide whether to trigger a recording.
+///
+/// # Panics
+///
+/// Panics if `data`'s length doesn't match the anchor/channel dimensions
+/// reported by `shape`, which would mean the ONNX Runtime output tensor is
+/// internally inconsistent.
+#[must_use]
 pub fn postprocess(shape: &Shape, data: &[f32], confidence_threshold: f32) -> Vec<Detection> {
     #[allow(
         clippy::cast_possible_truncation,
@@ -210,6 +228,14 @@ pub struct Detector {
     session: Session,
 }
 
+impl std::fmt::Debug for Detector {
+    /// `ort::Session` doesn't implement `Debug`, so this just marks the
+    /// session as present without exposing its internals.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Detector").finish_non_exhaustive()
+    }
+}
+
 impl Detector {
     /// Loads the YOLO ONNX model, registering execution providers in priority
     /// order CUDA -> `ROCm` -> `OpenVINO` -> CPU (ADR 3). `ort` probes availability
@@ -220,6 +246,11 @@ impl Detector {
     /// no safe test can trigger without a real `models/yolov8n.onnx` and a
     /// working ONNX Runtime build; the two tests that do exercise this
     /// function (below) stay `#[ignore]`'d, requiring `MODEL_TEST_LOCK`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the ONNX Runtime session builder, optimization
+    /// level, execution provider registration, or model loading fails.
     pub fn load(model_path: &Path, force_cpu: bool) -> Result<Self> {
         let builder = ort_err(
             Session::builder(),
@@ -274,6 +305,11 @@ impl Detector {
     /// Contains at least one `Err` arm (an inference failure, an unrecognized
     /// output tensor) that no safe test can trigger without a real model
     /// file and ONNX Runtime session; see `load`'s doc comment.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if building the input tensor or running inference
+    /// fails.
     pub fn detect(
         &mut self,
         frame: &RgbImage,

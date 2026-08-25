@@ -11,9 +11,12 @@ use crate::ffmpeg::{mux_audio_into_video, resample_to_frame_rate, spawn_video_en
 use crate::paths::{clip_path, sidecar_path};
 use crate::sidecar::Sidecar;
 
-/// Construction parameters for `RecordingEvent::start`, grouped into a
-/// struct since the individual values (video dimensions, audio format,
-/// path-naming inputs, timeline anchor) don't share a natural owner.
+/// Construction parameters for `RecordingEvent::start`.
+///
+/// Grouped into a struct since the individual values (video dimensions,
+/// audio format, path-naming inputs, timeline anchor) don't share a natural
+/// owner.
+#[derive(Debug)]
 pub struct RecordingEventParams {
     /// Where the finished, muxed clip is written, before any class-list
     /// rename (see `RecordingEvent::all_classes`).
@@ -41,9 +44,13 @@ pub struct RecordingEventParams {
     pub clip_timeline_start: Instant,
 }
 
-/// Manages the lifecycle of a single recorded clip: seeds the file with the
-/// pre-event buffer, accepts live frames as they arrive, and tracks the
-/// post-event quiet window so the caller knows when to close it (ADR 2, ADR 4).
+/// Manages the lifecycle of a single recorded clip (ADR 2, ADR 4).
+///
+/// Seeds the file with the pre-event buffer, accepts live frames as they
+/// arrive, and tracks the post-event quiet window so the caller knows when
+/// to close it.
+///
+/// # Audio muxing
 ///
 /// Audio is buffered to a temporary raw PCM file and muxed in by ffmpeg only
 /// when the clip closes (`finish`), since ffmpeg needs the final duration of
@@ -74,6 +81,24 @@ pub struct RecordingEvent {
     audio_channels: u16,
     /// Pure timing/bookkeeping state for this clip (see `ClipState`).
     state: ClipState,
+}
+
+impl std::fmt::Debug for RecordingEvent {
+    /// `std::process::Child` doesn't implement `Debug`, so this omits
+    /// `ffmpeg_video`/`audio_file` and reports the rest of the clip's
+    /// bookkeeping instead.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RecordingEvent")
+            .field("audio_tmp_path", &self.audio_tmp_path)
+            .field("final_clip_path", &self.final_clip_path)
+            .field("output_dir", &self.output_dir)
+            .field("started_at", &self.started_at)
+            .field("video_tmp_path", &self.video_tmp_path)
+            .field("audio_sample_rate", &self.audio_sample_rate)
+            .field("audio_channels", &self.audio_channels)
+            .field("state", &self.state)
+            .finish_non_exhaustive()
+    }
 }
 
 impl RecordingEvent {
@@ -126,6 +151,11 @@ impl RecordingEvent {
     /// state mid-suite would race every other test that shells out,
     /// regardless. Everything else here (temp-file creation) is reachable
     /// and covered by tests below.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if spawning the video-encoding ffmpeg process or
+    /// creating the temp audio file fails.
     pub fn start(params: RecordingEventParams) -> Result<Self> {
         let RecordingEventParams {
             final_clip_path,
@@ -177,6 +207,12 @@ impl RecordingEvent {
     /// status, the mux step's own nonzero-exit handling, the class-list
     /// rename, and the sidecar write) is reachable and covered by
     /// fault-injection tests below.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if the ffmpeg video encoder exits nonzero, muxing
+    /// the audio in fails, serializing the sidecar fails, or writing the
+    /// final clip/sidecar files fails.
     pub fn finish(mut self) -> Result<()> {
         drop(self.ffmpeg_video.stdin.take());
 
@@ -253,6 +289,10 @@ impl RecordingEvent {
     /// timestamps before writing, so the pre-buffer portion of the clip plays
     /// back at the correct real-time duration instead of being stretched by
     /// writing every captured frame 1:1.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if writing a pre-buffer frame or audio chunk fails.
     pub fn seed(
         &mut self,
         pre_frames: &[TimestampedFrame],
@@ -301,6 +341,14 @@ impl RecordingEvent {
     /// writing and leaves `camera_stalled` reporting true so the caller ends
     /// the recording instead of the clip silently containing footage that
     /// was never actually captured.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if writing a drained frame fails.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the ring buffer's mutex is poisoned.
     pub fn drain_frames(
         &mut self,
         ring_buffer: &std::sync::Mutex<crate::buffer::RingBuffer>,
@@ -332,6 +380,7 @@ impl RecordingEvent {
     /// recording: `drain_frames` never fabricates a frame to cover for the
     /// camera, and the motion gate has nothing new to evaluate once frames
     /// stop arriving, so nothing else will naturally close the clip.
+    #[must_use]
     pub fn camera_stalled(&self) -> bool {
         self.state.camera_stalled()
     }
@@ -341,6 +390,14 @@ impl RecordingEvent {
     /// periodically while the event is active so live audio keeps
     /// accumulating for the clip's full duration, not just the pre-buffer
     /// window written in `start`.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if writing a drained audio chunk fails.
+    ///
+    /// # Panics
+    ///
+    /// Panics if the ring buffer's mutex is poisoned.
     pub fn drain_audio(
         &mut self,
         ring_buffer: &std::sync::Mutex<crate::buffer::RingBuffer>,
@@ -362,6 +419,11 @@ impl RecordingEvent {
     }
 
     /// Streams one raw video frame to ffmpeg's stdin.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if ffmpeg's stdin was already closed, or writing to
+    /// it fails.
     pub fn write_frame(&mut self, image: &image::RgbImage) -> Result<()> {
         let stdin = self
             .ffmpeg_video
@@ -376,6 +438,10 @@ impl RecordingEvent {
     }
 
     /// Appends raw PCM samples to the temp audio file.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if writing to the temp audio file fails.
     pub fn write_audio(&mut self, samples: &[f32]) -> Result<()> {
         let mut bytes = Vec::with_capacity(samples.len().saturating_mul(size_of::<f32>()));
 
@@ -420,6 +486,7 @@ impl RecordingEvent {
     }
 
     /// How long it's been since the last trigger/touch.
+    #[must_use]
     pub fn quiet_for(&self) -> Duration {
         self.state.quiet_for()
     }

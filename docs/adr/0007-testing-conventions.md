@@ -2,7 +2,12 @@
 
 ## Status
 
-Accepted
+Accepted. The "binary-only, no `src/lib.rs`" premise below no longer holds as of
+ADR 8: a library target was added so `benches/` can link against the crate. This does
+not change the decision recorded here (tests still live inline as
+`#[cfg(test)] mod tests`, not in a top-level `tests/` directory); see "Amendment" at
+the end of this ADR for why the reasoning still holds even though its "no `src/lib.rs`"
+premise is now out of date.
 
 ## Context
 
@@ -34,17 +39,26 @@ physically lives.
 
 Every test (unit, OpenCV-backed, ffmpeg-integration, or `#[ignore]`'d
 model-dependent) lives in an inline `#[cfg(test)] mod tests` block at the bottom of
-the file it exercises, compiled as part of the binary's own test harness. There is
-deliberately no top-level `tests/` directory. This crate is binary-only
-(`src/main.rs`, no `src/lib.rs`), and Rust's `tests/*.rs` integration tests compile as
-separate crates that can only import symbols from a crate's *library* target — a
-binary-only crate exposes nothing for `tests/` to link against. Adding a `lib.rs`
-purely to unlock a `tests/` directory was considered and rejected: every test target
-identified during planning is reachable as an inline `#[cfg(test)]` module against the
-binary's own compiled test harness, so the added indirection would have bought
-nothing. (This also means `RecordingEvent::start`, `Detector::load`, and every other
-ffmpeg-/OpenCV-/ONNX-Runtime-backed constructor is exercised through the exact same
-binary the shipped artifact is, not a separate library crate.)
+the file it exercises, compiled as part of the crate's own test harness. There is
+deliberately no top-level `tests/` directory.
+
+At the time this decision was made, the crate was binary-only (`src/main.rs`, no
+`src/lib.rs`), and Rust's `tests/*.rs` integration tests compile as separate crates
+that can only import symbols from a crate's *library* target, so a binary-only crate
+exposed nothing for `tests/` to link against. Adding a `lib.rs` purely to unlock a
+`tests/` directory was considered and rejected at the time: every test target
+identified during planning was reachable as an inline `#[cfg(test)]` module against
+the binary's own compiled test harness, so the added indirection would have bought
+nothing.
+
+**A `src/lib.rs` was later added for an unrelated reason (ADR 8: unlocking real
+`cargo bench` support).** This ADR's placement decision was revisited at that point
+and reaffirmed, not reversed: see "Amendment" below for why inline `#[cfg(test)]`
+modules remained the right choice even once a `tests/`-capable library target existed.
+`RecordingEvent::start`, `Detector::load`, and every other ffmpeg-/OpenCV-/ONNX-Runtime-
+backed constructor continue to be exercised through the same compiled artifact the
+shipped binary uses (via the library crate `src/main.rs` now consumes), not a separate
+build path a `tests/*.rs` file would introduce.
 
 ### Clippy-in-tests allowlist
 
@@ -128,5 +142,32 @@ present.
   rather than on every CI push.
 - If this crate ever gains a genuine library consumer (unlikely given ADR 1's
   single-binary distribution model), a `src/lib.rs` split would become worth
-  revisiting — at that point a `tests/` directory would become usable and this
+  revisiting - at that point a `tests/` directory would become usable and this
   decision should be re-examined against the tradeoffs recorded here.
+
+## Amendment: `src/lib.rs` exists now, but the placement decision still stands
+
+ADR 8 added `src/lib.rs` so `benches/` (a separate compiled crate, exactly like
+`tests/*.rs`) could link against the modules actually benchmarked. This technically
+removes the original blocker cited above: `tests/*.rs` integration tests could now
+compile and link, the same way `benches/*.rs` does.
+
+The placement decision itself was re-examined at that point and reaffirmed:
+
+- Every test that exists today was written against the inline `#[cfg(test)]`
+  convention, and every one of them still compiles and runs exactly as before; moving
+  them to `tests/*.rs` would only relocate passing tests, not enable any new one.
+- Inline tests sit next to the code they exercise, which this project has relied on
+  throughout (see the clippy-in-tests allowlist section above, written and reviewed
+  file-by-file against code sitting directly above each test module). A `tests/`
+  directory would separate that pairing for no offsetting benefit.
+- Most modules stayed `pub(crate)` in `lib.rs` specifically to keep clippy's
+  public-API-surface lints from firing crate-wide (see ADR 8). A `pub(crate)` module's
+  private items are invisible to a `tests/*.rs` file (a separate crate) but fully
+  visible to an inline `#[cfg(test)] mod tests` (compiled as a submodule in the same
+  crate). Moving to `tests/*.rs` now would force many more modules to `pub`, reopening
+  the exact clippy fallout ADR 8 scoped down.
+
+Net effect: `src/lib.rs`'s existence is orthogonal to this ADR's decision. Tests
+continue to live inline; `benches/` is the only thing under this crate that compiles
+as a genuinely separate crate against the library target.

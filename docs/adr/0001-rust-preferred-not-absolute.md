@@ -46,3 +46,9 @@ Both are declared as hard runtime requirements, checked at startup (see ADR 5).
 - If a pure-Rust background-subtraction implementation matures later, revisiting the
   OpenCV dependency is reasonable; the ffmpeg dependency is expected to remain for the
   foreseeable future given the encoding-acceleration gap.
+- ADR 8 added a `src/lib.rs` library target alongside `src/main.rs`, so `cargo bench`
+  (via Criterion) can link against the crate. This does not change anything decided
+  here: the shipped artifact is still exactly one binary users run, built the same way
+  (`cargo build --release`); `src/lib.rs` only changes how that binary's own source is
+  organized internally, and most of it stays `pub(crate)` rather than becoming a
+  real external API (see ADR 8).

@@ -10,6 +10,10 @@ use crate::clip_state;
 /// `Command::spawn`'s exec-failure arm is only reachable if `ffmpeg` is
 /// absent from `PATH`; see `RecordingEvent::start`'s doc comment for why
 /// that's not safely fakeable from a test.
+///
+/// # Errors
+///
+/// Returns an error if `ffmpeg` fails to spawn (e.g. missing from `PATH`).
 pub fn spawn_video_encoder(
     path: &std::path::Path,
     width: u32,
@@ -49,17 +53,24 @@ pub fn spawn_video_encoder(
         .context("failed to spawn ffmpeg video encoder")
 }
 
-/// Muxes the buffered raw audio into the encoded video. `-shortest` is
-/// deliberately not used: with independently-accumulated video/audio streams,
-/// whichever stream is shorter due to minor drift would otherwise have the
-/// *other* stream silently truncated to match, losing recorded content.
-/// Instead, the audio stream is padded with silence (`apad`) to at least the
-/// video's duration and `-shortest` is applied only to that padded output, so
-/// the result is exactly the video's length with no dropped video frames.
+/// Muxes the buffered raw audio into the encoded video.
+///
+/// `-shortest` is deliberately not used: with independently-accumulated
+/// video/audio streams, whichever stream is shorter due to minor drift would
+/// otherwise have the *other* stream silently truncated to match, losing
+/// recorded content. Instead, the audio stream is padded with silence
+/// (`apad`) to at least the video's duration and `-shortest` is applied only
+/// to that padded output, so the result is exactly the video's length with
+/// no dropped video frames.
 ///
 /// `.output()`'s exec-failure arm is only reachable if `ffmpeg` is absent
 /// from `PATH`; see `RecordingEvent::start`'s doc comment for why that's not
 /// safely fakeable from a test.
+///
+/// # Errors
+///
+/// Returns an error if `ffmpeg` fails to spawn, or exits with a nonzero
+/// status.
 pub fn mux_audio_into_video(
     video_path: &std::path::Path,
     audio_path: &std::path::Path,
@@ -102,10 +113,13 @@ pub fn mux_audio_into_video(
 
 /// Downsamples timestamped frames to approximately `frame_rate` frames per
 /// second based on their capture timestamps, keeping the first frame at or
-/// after each target tick. The ring buffer accumulates frames at the
-/// camera's native capture rate (which may be higher than the encoder's
-/// configured `frame_rate`), so writing every buffered frame 1:1 would
-/// stretch the pre-buffer's playback duration beyond its real elapsed time.
+/// after each target tick.
+///
+/// The ring buffer accumulates frames at the camera's native capture rate
+/// (which may be higher than the encoder's configured `frame_rate`), so
+/// writing every buffered frame 1:1 would stretch the pre-buffer's playback
+/// duration beyond its real elapsed time.
+#[must_use]
 pub fn resample_to_frame_rate(
     frames: &[TimestampedFrame],
     frame_rate: u32,

@@ -20,10 +20,11 @@ const MOG2_VARIANCE_THRESHOLD: f64 = 16.0;
 /// (any negative value means automatic).
 const MOG2_AUTO_LEARNING_RATE: f64 = -1.0;
 
-/// Background-subtraction motion gate (ADR 2). Its only job is deciding
-/// whether whole-frame motion exceeded the configured threshold; recording
-/// itself is only ever triggered by a subsequent confirmed YOLO
-/// classification, never by this gate alone.
+/// Background-subtraction motion gate (ADR 2).
+///
+/// Its only job is deciding whether whole-frame motion exceeded the
+/// configured threshold; recording itself is only ever triggered by a
+/// subsequent confirmed YOLO classification, never by this gate alone.
 pub struct MotionGate {
     /// The `OpenCV` MOG2 background-subtraction model.
     subtractor: opencv::core::Ptr<opencv::video::BackgroundSubtractorMOG2>,
@@ -31,7 +32,18 @@ pub struct MotionGate {
     threshold: f32,
 }
 
+impl std::fmt::Debug for MotionGate {
+    /// `opencv::core::Ptr` doesn't implement `Debug`, so this reports the
+    /// gate's configuration rather than the opaque `OpenCV` handle.
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("MotionGate")
+            .field("threshold", &self.threshold)
+            .finish_non_exhaustive()
+    }
+}
+
 /// The result of one `MotionGate::evaluate` call.
+#[derive(Debug)]
 pub struct MotionReading {
     /// Fraction of pixels (0.0-1.0) the background model marked as changed.
     pub changed_ratio: f32,
@@ -41,6 +53,11 @@ pub struct MotionReading {
 
 impl MotionGate {
     /// Creates a motion gate with a fresh MOG2 background model.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if `OpenCV` fails to construct the MOG2 background
+    /// subtractor.
     pub fn new(threshold: f32) -> Result<Self> {
         let subtractor =
             create_background_subtractor_mog2(MOG2_HISTORY, MOG2_VARIANCE_THRESHOLD, true)
@@ -55,6 +72,11 @@ impl MotionGate {
     /// changed-pixel ratio alongside whether it exceeded the configured
     /// threshold. Callers that need to log/record motion activity (not
     /// just gate on it) need the underlying ratio, not just the bool.
+    ///
+    /// # Errors
+    ///
+    /// Returns an error if converting `frame` to an `OpenCV` `Mat`,
+    /// running background subtraction, or counting changed pixels fails.
     pub fn evaluate(&mut self, frame: &RgbImage) -> Result<MotionReading> {
         let mat = rgb_image_to_bgr_mat(frame)?;
 

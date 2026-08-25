@@ -4,19 +4,23 @@ use std::time::{Duration, Instant};
 use crate::sidecar::{DetectionRecord, MotionEvent};
 
 /// How long the camera may go without delivering a real frame before
-/// `camera_stalled` reports true. Must be well above ordinary jitter between
-/// detection-loop polls (camera delivery timing, YOLO inference duration can
-/// both momentarily exceed one tick) so normal operation never false-trips
-/// this, while still being short enough that a genuinely dead camera ends
-/// the recording within a couple of seconds rather than dragging on.
+/// `camera_stalled` reports true.
+///
+/// Must be well above ordinary jitter between detection-loop polls (camera
+/// delivery timing, YOLO inference duration can both momentarily exceed one
+/// tick) so normal operation never false-trips this, while still being short
+/// enough that a genuinely dead camera ends the recording within a couple of
+/// seconds rather than dragging on.
 ///
 /// Also reused by `main`'s pre-trigger staleness check so both paths agree on
 /// what counts as a stalled camera.
 pub const MAX_FRAME_STALL: Duration = Duration::from_millis(1500);
 
-/// Duration of one frame-rate tick at `frame_rate` frames per second. Shared
-/// by `ClipState::frame_tick` and `ffmpeg::resample_to_frame_rate` so the two
-/// never compute this independently and risk diverging.
+/// Duration of one frame-rate tick at `frame_rate` frames per second.
+///
+/// Shared by `ClipState::frame_tick` and `ffmpeg::resample_to_frame_rate` so
+/// the two never compute this independently and risk diverging.
+#[must_use]
 pub fn frame_tick(frame_rate: u32) -> Duration {
     Duration::from_secs_f64(1.0 / f64::from(frame_rate))
 }
@@ -24,6 +28,8 @@ pub fn frame_tick(frame_rate: u32) -> Duration {
 /// `false` while the ring buffer hasn't yet had `pre_buffer_secs` worth of
 /// wall-clock time to refill since the capture stream was last rebuilt by
 /// `reconnect::maybe_reconnect_camera`.
+///
+/// # `reconnected_at`
 ///
 /// A reconnect drops the old `CallbackCamera` and opens a fresh one (see
 /// `maybe_reconnect_camera`'s doc comment), so the ring buffer starts
@@ -40,6 +46,7 @@ pub fn frame_tick(frame_rate: u32) -> Duration {
 /// against a configured 10s). `reconnected_at` is `None` before any
 /// reconnect has happened this run, in which case the buffer has had the
 /// entire process lifetime to fill and this always returns `true`.
+#[must_use]
 pub fn pre_buffer_ready(
     reconnected_at: Option<Instant>,
     pre_buffer_secs: u32,
@@ -52,12 +59,15 @@ pub fn pre_buffer_ready(
     now.duration_since(reconnected_at) >= Duration::from_secs(u64::from(pre_buffer_secs))
 }
 
-/// Pure timing/bookkeeping state for a single recorded clip, split out from
-/// `RecordingEvent` so it can be unit-tested by constructing a bare
-/// `ClipState` directly, with no ffmpeg process or temp files involved. Holds
-/// everything about a clip's lifecycle *except* the actual I/O handles
-/// (`RecordingEvent`'s `ffmpeg_video`/`audio_file`/temp-file paths), which
-/// `RecordingEvent` still owns and drives through this struct's methods.
+/// Pure timing/bookkeeping state for a single recorded clip.
+///
+/// Split out from `RecordingEvent` so it can be unit-tested by constructing
+/// a bare `ClipState` directly, with no ffmpeg process or temp files
+/// involved. Holds everything about a clip's lifecycle *except* the actual
+/// I/O handles (`RecordingEvent`'s `ffmpeg_video`/`audio_file`/temp-file
+/// paths), which `RecordingEvent` still owns and drives through this
+/// struct's methods.
+#[derive(Debug)]
 pub struct ClipState {
     /// Configured video frame rate for this clip.
     pub(crate) frame_rate: u32,
@@ -91,6 +101,7 @@ pub struct ClipState {
 
 impl ClipState {
     /// Starts fresh bookkeeping for a clip beginning now, with playback at `frame_rate`.
+    #[must_use]
     pub fn new(frame_rate: u32, clip_timeline_start: Instant) -> Self {
         let now = Instant::now();
 
@@ -113,6 +124,7 @@ impl ClipState {
     /// recording: `drain_frames` never fabricates a frame to cover for the
     /// camera, and the motion gate has nothing new to evaluate once frames
     /// stop arriving, so nothing else will naturally close the clip.
+    #[must_use]
     pub fn camera_stalled(&self) -> bool {
         self.last_real_frame_at.elapsed() >= MAX_FRAME_STALL
     }
@@ -122,6 +134,7 @@ impl ClipState {
     /// formula), which `ffmpeg::resample_to_frame_rate` also calls directly
     /// since it only has a raw frame rate, not a `ClipState`; keep both call
     /// sites in mind if the formula ever changes.
+    #[must_use]
     pub fn frame_tick(&self) -> Duration {
         frame_tick(self.frame_rate)
     }
@@ -214,6 +227,7 @@ impl ClipState {
     /// Seconds from the clip's actual timeline start (not wall-clock time at
     /// the moment the caller happens to run) to `frame_timestamp`, the
     /// capture timestamp of the frame being recorded against.
+    #[must_use]
     pub fn offset_secs(&self, frame_timestamp: Instant) -> f64 {
         frame_timestamp
             .saturating_duration_since(self.clip_timeline_start)
@@ -221,6 +235,7 @@ impl ClipState {
     }
 
     /// How long it's been since the last trigger/touch.
+    #[must_use]
     pub fn quiet_for(&self) -> Duration {
         self.last_trigger_at.elapsed()
     }
@@ -229,6 +244,7 @@ impl ClipState {
     /// and sidecar records to the caller. Used by `RecordingEvent::finish`
     /// to build the final filename's class list and the `Sidecar` written
     /// alongside it.
+    #[must_use]
     pub fn into_parts(
         self,
     ) -> (
