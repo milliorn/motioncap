@@ -36,52 +36,54 @@ pub struct PendingConfirmation {
     pub first_seen: std::time::Instant,
 }
 
-/// The pending-confirmation slot for a sighting seen while no recording is
-/// active (consumed by `try_start_recording`). A distinct type from
-/// `ActiveEventPending`, rather than both being a bare
-/// `Option<PendingConfirmation>`, specifically so the two slots can never be
-/// swapped by accident at a call site: they answer different questions
+/// Defines a newtype wrapper around `Option<PendingConfirmation>` with
+/// `Deref`/`DerefMut` to the inner `Option`. Used to give `PreTriggerPending`
+/// and `ActiveEventPending` identical ergonomics without hand-duplicating the
+/// impl bodies, while keeping them distinct types so the two slots can never
+/// be swapped by accident at a call site: they answer different questions
 /// (whether to start a new recording vs. whether to trust a hit enough to
 /// extend one already justified) and sharing state across that boundary
 /// would let a stale pre-recording sighting spuriously confirm a hit against
 /// an event it had nothing to do with.
-#[derive(Default)]
-pub struct PreTriggerPending(pub Option<PendingConfirmation>);
+macro_rules! pending_confirmation_slot {
+    ($(#[$doc:meta])* $name:ident) => {
+        $(#[$doc])*
+        #[derive(Default)]
+        pub struct $name(pub Option<PendingConfirmation>);
 
-impl std::ops::Deref for PreTriggerPending {
-    type Target = Option<PendingConfirmation>;
+        impl std::ops::Deref for $name {
+            type Target = Option<PendingConfirmation>;
 
-    fn deref(&self) -> &Self::Target {
-        &self.0
-    }
+            fn deref(&self) -> &Self::Target {
+                &self.0
+            }
+        }
+
+        impl std::ops::DerefMut for $name {
+            fn deref_mut(&mut self) -> &mut Self::Target {
+                &mut self.0
+            }
+        }
+    };
 }
 
-impl std::ops::DerefMut for PreTriggerPending {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.0
-    }
-}
+pending_confirmation_slot!(
+    /// The pending-confirmation slot for a sighting seen while no recording
+    /// is active (consumed by `try_start_recording`). See
+    /// `pending_confirmation_slot!`'s doc comment for why this is a distinct
+    /// type rather than sharing one `Option<PendingConfirmation>` with the
+    /// active-event slot.
+    PreTriggerPending
+);
 
-/// The pending-confirmation slot for a sighting seen while a recording is
-/// already active (consumed by `evaluate_active_event`). See
-/// `PreTriggerPending`'s doc comment for why this is a distinct type rather
-/// than sharing one `Option<PendingConfirmation>` with the pre-recording slot.
-#[derive(Default)]
-pub struct ActiveEventPending(pub Option<PendingConfirmation>);
-
-impl std::ops::Deref for ActiveEventPending {
-    type Target = Option<PendingConfirmation>;
-
-    fn deref(&self) -> &Self::Target {
-        &self.0
-    }
-}
-
-impl std::ops::DerefMut for ActiveEventPending {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.0
-    }
-}
+pending_confirmation_slot!(
+    /// The pending-confirmation slot for a sighting seen while a recording is
+    /// already active (consumed by `evaluate_active_event`). See
+    /// `pending_confirmation_slot!`'s doc comment for why this is a distinct
+    /// type rather than sharing one `Option<PendingConfirmation>` with the
+    /// pre-recording slot.
+    ActiveEventPending
+);
 
 /// Clears `pending` once it's gone `PENDING_CONFIRMATION_WINDOW` without a
 /// fresh sighting. Called on *every* tripped-motion poll (not only polls
