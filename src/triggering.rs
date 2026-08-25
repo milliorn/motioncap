@@ -160,13 +160,20 @@ pub fn try_start_recording(
     // relying on each branch to remember the call itself). Idempotent to
     // call again inside `poll_confirmed_detections` a few lines down: it
     // only clears an already-stale `pending_confirmation`, so running it
-    // twice with the same/later `frame_timestamp` is a no-op the second
-    // time. See `expire_stale_pending`'s doc comment for why skipping it on
-    // any tripped-motion poll (not just ones that reach YOLO) reproduces the
-    // stale-confirmation bug this gate exists to prevent.
-    crate::confirmation::expire_stale_pending(&mut pending_confirmation.0, frame_timestamp);
+    // twice with the same/later `now` is a no-op the second time. See
+    // `expire_stale_pending`'s doc comment for why skipping it on any
+    // tripped-motion poll (not just ones that reach YOLO) reproduces the
+    // stale-confirmation bug this gate exists to prevent. Uses a fresh
+    // wall-clock `Instant::now()` here rather than `frame_timestamp` (the
+    // frame's capture time) because `first_seen`/`reconnected_at` are also
+    // stamped with `Instant::now()`; `frame_timestamp` can be earlier than
+    // either (e.g. the same frame re-polled during a stall), which would
+    // make `duration_since` panic on underflow.
+    let now = std::time::Instant::now();
 
-    if !pre_buffer_ready(reconnected_at, config.pre_buffer_secs, frame_timestamp) {
+    crate::confirmation::expire_stale_pending(&mut pending_confirmation.0, now);
+
+    if !pre_buffer_ready(reconnected_at, config.pre_buffer_secs, now) {
         // The capture stream was rebuilt too recently for the ring buffer to
         // have refilled a full pre-buffer window; skip the expensive YOLO
         // call entirely rather than running inference on every tripped-motion
