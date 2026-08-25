@@ -2,6 +2,21 @@ use std::path::{Path, PathBuf};
 
 use clap::Parser;
 
+/// Default `--pre-buffer-secs`. Named (not just a bare `default_value_t`
+/// literal) so `config.rs`'s own tests can assert against the same value
+/// `Config` actually defaults to, rather than a second, independently
+/// hardcoded copy of it.
+const DEFAULT_PRE_BUFFER_SECS: u32 = 10;
+
+/// Default `--post-buffer-secs`. See `DEFAULT_PRE_BUFFER_SECS`.
+const DEFAULT_POST_BUFFER_SECS: u32 = 15;
+
+/// Default `--detection-confidence`. See `DEFAULT_PRE_BUFFER_SECS`.
+const DEFAULT_DETECTION_CONFIDENCE: f32 = 0.3;
+
+/// Default `--motion-threshold`. See `DEFAULT_PRE_BUFFER_SECS`.
+const DEFAULT_MOTION_THRESHOLD: f32 = 0.01;
+
 /// motioncap: webcam-based security motion capture
 #[derive(Parser, Debug)]
 #[command(name = "motioncap", version)]
@@ -23,19 +38,19 @@ pub struct Config {
     pub force_cpu: bool,
 
     /// Seconds of video/audio to keep buffered before a trigger
-    #[arg(long, default_value_t = 10)]
+    #[arg(long, default_value_t = DEFAULT_PRE_BUFFER_SECS)]
     pub pre_buffer_secs: u32,
 
     /// Seconds to keep recording after the last trigger before closing the clip
-    #[arg(long, default_value_t = 15)]
+    #[arg(long, default_value_t = DEFAULT_POST_BUFFER_SECS)]
     pub post_buffer_secs: u32,
 
     /// Minimum confidence (0.0-1.0) for a YOLO detection to confirm a living-thing event
-    #[arg(long, default_value_t = 0.3)]
+    #[arg(long, default_value_t = DEFAULT_DETECTION_CONFIDENCE)]
     pub detection_confidence: f32,
 
     /// Minimum changed-pixel ratio (0.0-1.0) for the background-subtraction gate to trip
-    #[arg(long, default_value_t = 0.01)]
+    #[arg(long, default_value_t = DEFAULT_MOTION_THRESHOLD)]
     pub motion_threshold: f32,
 
     /// Show a live preview window with the raw camera feed (off by default)
@@ -71,6 +86,20 @@ mod tests {
 
     use super::*;
 
+    /// Overridden `--pre-buffer-secs` value for `flags_are_overridable`,
+    /// distinct from `DEFAULT_PRE_BUFFER_SECS` so the test actually proves
+    /// the flag changed the value rather than coincidentally matching it.
+    const OVERRIDE_PRE_BUFFER_SECS: u32 = 5;
+
+    /// Overridden `--post-buffer-secs` value. See `OVERRIDE_PRE_BUFFER_SECS`.
+    const OVERRIDE_POST_BUFFER_SECS: u32 = 20;
+
+    /// Overridden `--detection-confidence` value. See `OVERRIDE_PRE_BUFFER_SECS`.
+    const OVERRIDE_DETECTION_CONFIDENCE: f32 = 0.7;
+
+    /// Overridden `--motion-threshold` value. See `OVERRIDE_PRE_BUFFER_SECS`.
+    const OVERRIDE_MOTION_THRESHOLD: f32 = 0.05;
+
     #[test]
     fn defaults_match_documented_values() {
         let config = Config::try_parse_from(["motioncap"]).unwrap();
@@ -79,10 +108,10 @@ mod tests {
         assert_eq!(config.model_path, PathBuf::from("./models/yolov8n.onnx"));
         assert_eq!(config.camera_device, None);
         assert!(!config.force_cpu);
-        assert_eq!(config.pre_buffer_secs, 10);
-        assert_eq!(config.post_buffer_secs, 15);
-        assert!((config.detection_confidence - 0.3).abs() < f32::EPSILON);
-        assert!((config.motion_threshold - 0.01).abs() < f32::EPSILON);
+        assert_eq!(config.pre_buffer_secs, DEFAULT_PRE_BUFFER_SECS);
+        assert_eq!(config.post_buffer_secs, DEFAULT_POST_BUFFER_SECS);
+        assert!((config.detection_confidence - DEFAULT_DETECTION_CONFIDENCE).abs() < f32::EPSILON);
+        assert!((config.motion_threshold - DEFAULT_MOTION_THRESHOLD).abs() < f32::EPSILON);
         assert!(!config.preview);
     }
 
@@ -98,13 +127,13 @@ mod tests {
             "/dev/video1",
             "--force-cpu",
             "--pre-buffer-secs",
-            "5",
+            &OVERRIDE_PRE_BUFFER_SECS.to_string(),
             "--post-buffer-secs",
-            "20",
+            &OVERRIDE_POST_BUFFER_SECS.to_string(),
             "--detection-confidence",
-            "0.7",
+            &OVERRIDE_DETECTION_CONFIDENCE.to_string(),
             "--motion-threshold",
-            "0.05",
+            &OVERRIDE_MOTION_THRESHOLD.to_string(),
             "--preview",
         ])
         .unwrap();
@@ -113,10 +142,10 @@ mod tests {
         assert_eq!(config.model_path, PathBuf::from("/tmp/model.onnx"));
         assert_eq!(config.camera_device, Some(PathBuf::from("/dev/video1")));
         assert!(config.force_cpu);
-        assert_eq!(config.pre_buffer_secs, 5);
-        assert_eq!(config.post_buffer_secs, 20);
-        assert!((config.detection_confidence - 0.7).abs() < f32::EPSILON);
-        assert!((config.motion_threshold - 0.05).abs() < f32::EPSILON);
+        assert_eq!(config.pre_buffer_secs, OVERRIDE_PRE_BUFFER_SECS);
+        assert_eq!(config.post_buffer_secs, OVERRIDE_POST_BUFFER_SECS);
+        assert!((config.detection_confidence - OVERRIDE_DETECTION_CONFIDENCE).abs() < f32::EPSILON);
+        assert!((config.motion_threshold - OVERRIDE_MOTION_THRESHOLD).abs() < f32::EPSILON);
         assert!(config.preview);
     }
 

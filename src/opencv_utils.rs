@@ -49,9 +49,26 @@ mod tests {
 
     use super::*;
 
+    /// Frame dimension for the channel-order test; 2x2 is large enough to
+    /// place a distinct color at every corner while staying trivial to
+    /// reason about.
+    const CHANNEL_ORDER_TEST_DIM: u32 = 2;
+
+    /// Frame width for the dimensions test, deliberately different from its
+    /// height so a transposed rows/cols mix-up would fail the assertion.
+    const DIMENSIONS_TEST_WIDTH: u32 = 5;
+
+    /// Frame height for the dimensions test. See `DIMENSIONS_TEST_WIDTH`.
+    const DIMENSIONS_TEST_HEIGHT: u32 = 3;
+
+    /// A buffer length that deliberately does not match
+    /// `DIMENSIONS_TEST_WIDTH * DIMENSIONS_TEST_HEIGHT`, to exercise
+    /// `bgr_vec_to_mat`'s length-mismatch error path.
+    const MISMATCHED_BUFFER_LEN: usize = 4;
+
     #[test]
     fn converts_rgb_pixels_to_bgr_channel_order() {
-        let mut image = RgbImage::new(2, 2);
+        let mut image = RgbImage::new(CHANNEL_ORDER_TEST_DIM, CHANNEL_ORDER_TEST_DIM);
         image.put_pixel(0, 0, Rgb([10, 20, 30]));
         image.put_pixel(1, 0, Rgb([40, 50, 60]));
         image.put_pixel(0, 1, Rgb([70, 80, 90]));
@@ -74,18 +91,18 @@ mod tests {
 
     #[test]
     fn produces_mat_with_matching_dimensions() {
-        let image = RgbImage::new(5, 3);
+        let image = RgbImage::new(DIMENSIONS_TEST_WIDTH, DIMENSIONS_TEST_HEIGHT);
         let mat = rgb_image_to_bgr_mat(&image).unwrap();
 
-        assert_eq!(mat.rows(), 3);
-        assert_eq!(mat.cols(), 5);
+        assert_eq!(mat.rows(), i32::try_from(DIMENSIONS_TEST_HEIGHT).unwrap());
+        assert_eq!(mat.cols(), i32::try_from(DIMENSIONS_TEST_WIDTH).unwrap());
     }
 
     #[test]
     fn bgr_vec_to_mat_errors_when_buffer_length_does_not_match_dimensions() {
-        let bgr = vec![Vec3b::from([0, 0, 0]); 4];
+        let bgr = vec![Vec3b::from([0, 0, 0]); MISMATCHED_BUFFER_LEN];
 
-        let err = bgr_vec_to_mat(5, 3, &bgr).unwrap_err();
+        let err = bgr_vec_to_mat(DIMENSIONS_TEST_WIDTH, DIMENSIONS_TEST_HEIGHT, &bgr).unwrap_err();
 
         assert!(err.to_string().contains("failed to build Mat from frame"));
     }

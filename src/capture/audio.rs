@@ -135,6 +135,16 @@ mod tests {
 
     use super::*;
 
+    /// Tolerance for comparing a converted sample against its expected
+    /// normalized value; wider than `f32::EPSILON` to absorb the rounding
+    /// `i16`/`u16` -> `f32` conversion introduces, without being loose enough
+    /// to mask a real conversion bug.
+    const NORMALIZED_SAMPLE_TOLERANCE: f32 = 0.001;
+
+    /// Divisor used to derive `u16`'s exact midpoint sample value from its
+    /// `MAX`, for a normalized-to-zero conversion test case.
+    const U16_MIDPOINT_DIVISOR: u16 = 2;
+
     #[test]
     fn samples_to_f32_converts_i16_to_normalized_f32() {
         let converted = samples_to_f32::<i16>(&[i16::MIN, 0, i16::MAX]);
@@ -142,16 +152,17 @@ mod tests {
         assert_eq!(converted.len(), 3);
         assert!((converted[0] - -1.0).abs() < f32::EPSILON);
         assert!((converted[1] - 0.0).abs() < f32::EPSILON);
-        assert!((converted[2] - 1.0).abs() < 0.001);
+        assert!((converted[2] - 1.0).abs() < NORMALIZED_SAMPLE_TOLERANCE);
     }
 
     #[test]
     fn samples_to_f32_converts_u16_to_normalized_f32() {
-        let converted = samples_to_f32::<u16>(&[u16::MIN, u16::MAX / 2, u16::MAX]);
+        let converted =
+            samples_to_f32::<u16>(&[u16::MIN, u16::MAX / U16_MIDPOINT_DIVISOR, u16::MAX]);
 
         assert_eq!(converted.len(), 3);
-        assert!((converted[0] - -1.0).abs() < 0.001);
-        assert!((converted[2] - 1.0).abs() < 0.001);
+        assert!((converted[0] - -1.0).abs() < NORMALIZED_SAMPLE_TOLERANCE);
+        assert!((converted[2] - 1.0).abs() < NORMALIZED_SAMPLE_TOLERANCE);
     }
 
     #[test]

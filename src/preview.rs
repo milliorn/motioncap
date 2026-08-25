@@ -21,6 +21,11 @@ const WINDOW_NAME: &str = "motioncap preview";
 /// window on a modern display.
 const PREVIEW_SCALE: i32 = 2;
 
+/// Minimum wait, in milliseconds, `highgui::wait_key` blocks for a keypress
+/// before returning; pumps the window's event queue without waiting for
+/// human input to be present, since nothing here reads keyboard state.
+const WAIT_KEY_MILLIS: i32 = 1;
+
 /// Opt-in live preview window (ADR: off by default). Entirely decoupled from
 /// the recording pipeline: it only ever displays frames, never affects
 /// whether or how a clip is recorded.
@@ -57,7 +62,7 @@ impl PreviewWindow {
         }
 
         highgui::imshow(WINDOW_NAME, &mat).context("failed to display preview frame")?;
-        highgui::wait_key(1).context("failed to pump preview window events")?;
+        highgui::wait_key(WAIT_KEY_MILLIS).context("failed to pump preview window events")?;
 
         Ok(())
     }

@@ -1,59 +1,15 @@
-use std::collections::BTreeSet;
 use std::io::Write;
-use std::process::{Child, Command, Stdio};
+use std::process::Child;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, bail};
 use chrono::{DateTime, Local};
-use serde::Serialize;
 
 use crate::buffer::{TimestampedAudio, TimestampedFrame};
+use crate::clip_state::ClipState;
+use crate::ffmpeg::{mux_audio_into_video, resample_to_frame_rate, spawn_video_encoder};
 use crate::paths::{clip_path, sidecar_path};
-
-/// How long the camera may go without delivering a real frame before
-/// `camera_stalled` reports true. Must be well above ordinary jitter between
-/// detection-loop polls (camera delivery timing, YOLO inference duration can
-/// both momentarily exceed one tick) so normal operation never false-trips
-/// this, while still being short enough that a genuinely dead camera ends
-/// the recording within a couple of seconds rather than dragging on.
-///
-/// Also reused by `main`'s pre-trigger staleness check so both paths agree on
-/// what counts as a stalled camera.
-pub const MAX_FRAME_STALL: Duration = Duration::from_millis(1500);
-
-/// One recorded detection, written into a clip's `.json` sidecar (ADR 4).
-#[derive(Serialize)]
-pub struct DetectionRecord {
-    /// Seconds from the start of the clip when this detection occurred.
-    pub offset_secs: f64,
-    /// The detected COCO class name.
-    pub class_name: String,
-    /// The model's reported confidence for this detection.
-    pub confidence: f32,
-}
-
-/// One recorded motion-gate trip, written into a clip's `.json` sidecar.
-/// Logged for every trip during an active recording, whether or not YOLO
-/// went on to confirm a living-thing class that same tick; this is what
-/// lets a clip that kept extending (via the post-buffer quiet window) be
-/// audited after the fact for what actually kept triggering it.
-#[derive(Serialize)]
-pub struct MotionEvent {
-    /// Seconds from the start of the clip when the gate tripped.
-    pub offset_secs: f64,
-    /// Fraction of pixels (0.0-1.0) the background model marked as changed.
-    pub changed_ratio: f32,
-}
-
-/// A clip's `.json` sidecar contents (ADR 4).
-#[derive(Serialize)]
-pub struct Sidecar {
-    /// Every detection recorded during the clip, in chronological order.
-    pub detections: Vec<DetectionRecord>,
-    /// Every motion-gate trip recorded during the clip, in chronological
-    /// order, including ones YOLO never confirmed as a living thing.
-    pub motion_events: Vec<MotionEvent>,
-}
+use crate::sidecar::Sidecar;
 
 /// Construction parameters for `RecordingEvent::start`, grouped into a
 /// struct since the individual values (video dimensions, audio format,
@@ -83,213 +39,6 @@ pub struct RecordingEventParams {
     /// pre-buffer window, not the trigger instant), used as the zero point
     /// for `DetectionRecord::offset_secs`.
     pub clip_timeline_start: Instant,
-}
-
-/// Pure timing/bookkeeping state for a single recorded clip, split out from
-/// `RecordingEvent` so it can be unit-tested by constructing a bare
-/// `ClipState` directly, with no ffmpeg process or temp files involved. Holds
-/// everything about a clip's lifecycle *except* the actual I/O handles
-/// (`RecordingEvent`'s `ffmpeg_video`/`audio_file`/temp-file paths), which
-/// `RecordingEvent` still owns and drives through this struct's methods.
-pub struct ClipState {
-    /// Configured video frame rate for this clip.
-    frame_rate: u32,
-    /// Capture timestamp of the clip's first frame (the start of the
-    /// pre-buffer window, not the trigger instant), used as the zero point
-    /// for `DetectionRecord::offset_secs`.
-    clip_timeline_start: Instant,
-    /// When the most recent triggering detection occurred (drives the post-buffer quiet window).
-    last_trigger_at: Instant,
-    /// Timestamp up to which audio has already been drained.
-    last_audio_drain_at: Instant,
-    /// Timestamp up to which frames have already been drained.
-    last_frame_drain_at: Instant,
-    /// The next frame-rate tick due to be written, if any.
-    next_frame_due: Option<Instant>,
-    /// Wall-clock time a real, camera-delivered frame was last written. Used
-    /// by `camera_stalled` to detect when the camera has stopped delivering
-    /// frames. A security recording must never paper over a gap by
-    /// fabricating footage, so unlike a naive resampler this never duplicates
-    /// a frame to fill a missed tick; it reports the stall instead.
-    last_real_frame_at: Instant,
-    /// Every distinct class detected so far during this clip (ADR 4: the
-    /// final filename must reflect every class seen over the clip's
-    /// lifetime, not just the classes that triggered it).
-    all_classes: BTreeSet<&'static str>,
-    /// Every detection recorded so far during this clip.
-    detections: Vec<DetectionRecord>,
-    /// Every motion-gate trip recorded so far during this clip.
-    motion_events: Vec<MotionEvent>,
-}
-
-impl ClipState {
-    /// Starts fresh bookkeeping for a clip beginning now, with playback at `frame_rate`.
-    pub fn new(frame_rate: u32, clip_timeline_start: Instant) -> Self {
-        let now = Instant::now();
-        Self {
-            frame_rate,
-            clip_timeline_start,
-            last_trigger_at: now,
-            last_audio_drain_at: now,
-            last_frame_drain_at: now,
-            next_frame_due: None,
-            last_real_frame_at: now,
-            all_classes: BTreeSet::new(),
-            detections: Vec::new(),
-            motion_events: Vec::new(),
-        }
-    }
-
-    /// True once the camera has gone `MAX_FRAME_STALL` without delivering a
-    /// real frame. Callers should treat this as a signal to end the
-    /// recording: `drain_frames` never fabricates a frame to cover for the
-    /// camera, and the motion gate has nothing new to evaluate once frames
-    /// stop arriving, so nothing else will naturally close the clip.
-    fn camera_stalled(&self) -> bool {
-        self.last_real_frame_at.elapsed() >= MAX_FRAME_STALL
-    }
-
-    /// Duration of one frame-rate tick at this event's configured `frame_rate`.
-    fn frame_tick(&self) -> Duration {
-        Duration::from_secs_f64(1.0 / f64::from(self.frame_rate))
-    }
-
-    /// Decides whether a newly-drained frame at `frame_timestamp` is due to
-    /// be written at this event's configured `frame_rate`, advancing
-    /// `next_frame_due` to the following tick if so. The first call with no
-    /// prior `next_frame_due` treats `frame_timestamp` itself as due, so
-    /// draining never stalls waiting for a tick boundary that predates the
-    /// first frame it ever saw.
-    fn should_write_frame(&mut self, frame_timestamp: Instant) -> bool {
-        let due = self.next_frame_due.unwrap_or(frame_timestamp);
-
-        if frame_timestamp < due {
-            return false;
-        }
-
-        #[allow(
-            clippy::arithmetic_side_effects,
-            reason = "Instant + a sub-second Duration only overflows after ~584 billion years of process uptime"
-        )]
-        let next_due = due + self.frame_tick();
-
-        self.next_frame_due = Some(next_due);
-
-        true
-    }
-
-    /// Anchors the frame-rate tick clock to `last_seeded_timestamp` (the
-    /// capture timestamp of the last frame written by `seed`), so the first
-    /// live `drain_frames` call after seeding schedules its next write one
-    /// tick after the pre-buffer's last frame rather than from whatever
-    /// wall-clock instant `drain_frames` first happens to run at.
-    fn anchor_next_tick_after_seed(&mut self, last_seeded_timestamp: Instant) {
-        self.last_frame_drain_at = last_seeded_timestamp;
-
-        #[allow(
-            clippy::arithmetic_side_effects,
-            reason = "Instant + a sub-second Duration only overflows after ~584 billion years of process uptime"
-        )]
-        let next_due = last_seeded_timestamp + self.frame_tick();
-
-        self.next_frame_due = Some(next_due);
-    }
-
-    /// Records a detection into the sidecar and resets the post-buffer quiet
-    /// window. `frame_timestamp` is the capture timestamp of the frame the
-    /// detection ran against (from the ring buffer), used to compute
-    /// `offset_secs` relative to the clip's actual timeline start rather than
-    /// wall-clock time at the moment this function happens to run.
-    fn record_detection(
-        &mut self,
-        class_name: &'static str,
-        confidence: f32,
-        frame_timestamp: Instant,
-    ) {
-        let offset_secs = self.offset_secs(frame_timestamp);
-
-        self.all_classes.insert(class_name);
-
-        self.detections.push(DetectionRecord {
-            offset_secs,
-            class_name: class_name.to_string(),
-            confidence,
-        });
-
-        self.last_trigger_at = Instant::now();
-    }
-
-    /// Resets the post-buffer quiet window without recording a new detection
-    /// (e.g. motion continues but wasn't re-confirmed by YOLO this tick).
-    fn touch(&mut self) {
-        self.last_trigger_at = Instant::now();
-    }
-
-    /// Records a motion-gate trip into the sidecar for later audit (e.g.
-    /// distinguishing a fan/curtain repeatedly tripping the gate from an
-    /// actual subject). Purely diagnostic bookkeeping. It does not itself
-    /// touch the post-buffer quiet window. Callers already call
-    /// `touch`/`record_detection` for that as needed.
-    fn record_motion(&mut self, changed_ratio: f32, frame_timestamp: Instant) {
-        let offset_secs = self.offset_secs(frame_timestamp);
-
-        self.motion_events.push(MotionEvent {
-            offset_secs,
-            changed_ratio,
-        });
-    }
-
-    /// Seconds from the clip's actual timeline start (not wall-clock time at
-    /// the moment the caller happens to run) to `frame_timestamp`, the
-    /// capture timestamp of the frame being recorded against.
-    fn offset_secs(&self, frame_timestamp: Instant) -> f64 {
-        frame_timestamp
-            .saturating_duration_since(self.clip_timeline_start)
-            .as_secs_f64()
-    }
-
-    /// How long it's been since the last trigger/touch.
-    fn quiet_for(&self) -> Duration {
-        self.last_trigger_at.elapsed()
-    }
-
-    /// Consumes this state, handing ownership of the accumulated class list
-    /// and sidecar records to the caller. Used by `RecordingEvent::finish`
-    /// to build the final filename's class list and the `Sidecar` written
-    /// alongside it.
-    pub fn into_parts(
-        self,
-    ) -> (
-        BTreeSet<&'static str>,
-        Vec<DetectionRecord>,
-        Vec<MotionEvent>,
-    ) {
-        (self.all_classes, self.detections, self.motion_events)
-    }
-}
-
-/// Test-only surface, kept in a separate `impl` block (rather than mixed
-/// into the block above) so production code never has a test-only method
-/// sitting alongside it, per ADR 6/7's convention of splitting
-/// coverage/test-only concerns into their own block/file rather than
-/// interleaving them with the code real callers use.
-#[cfg(test)]
-impl ClipState {
-    /// Backdates `last_real_frame_at` so `camera_stalled` reads true without
-    /// a real `thread::sleep`, matching this file's own
-    /// `camera_stalled_true_once_max_frame_stall_elapses` test below and
-    /// ADR 7's convention of backdating `Instant`s instead of sleeping in
-    /// real time (real sleeps at durations this close to `MAX_FRAME_STALL`
-    /// are flaky under `cargo test`'s parallel load).
-    #[allow(
-        clippy::arithmetic_side_effects,
-        clippy::unchecked_time_subtraction,
-        reason = "test assertions favor unwrap/indexing/plain time arithmetic for clarity; test \
-                   durations are small hardcoded constants, so underflow is not reachable"
-    )]
-    pub(crate) fn backdate_last_real_frame_at_past_stall(&mut self) {
-        self.last_real_frame_at = Instant::now() - MAX_FRAME_STALL - Duration::from_millis(50);
-    }
 }
 
 /// Manages the lifecycle of a single recorded clip: seeds the file with the
@@ -323,14 +72,19 @@ pub struct RecordingEvent {
     audio_sample_rate: u32,
     /// Channel count of the buffered audio, needed to mux correctly.
     audio_channels: u16,
-    /// Pure timing/bookkeeping state for this clip (see `ClipState`). Kept
-    /// `pub(crate)` (not fully private) so `main.rs`'s tests can reach
-    /// `ClipState`'s own test-only helpers (e.g.
-    /// `backdate_last_real_frame_at_past_stall`) directly.
-    pub(crate) state: ClipState,
+    /// Pure timing/bookkeeping state for this clip (see `ClipState`).
+    state: ClipState,
 }
 
 impl RecordingEvent {
+    /// Exposes the pure `ClipState` for tests elsewhere (e.g.
+    /// `event_lifecycle.rs`) that need to reach its test-only helpers (e.g.
+    /// `backdate_last_real_frame_at_past_stall`) directly.
+    #[cfg(test)]
+    pub(crate) const fn state_mut(&mut self) -> &mut ClipState {
+        &mut self.state
+    }
+
     /// Starts a new event: launches the video-encoding ffmpeg process and
     /// creates the temp audio file. `final_clip_path` should already reflect
     /// the trigger's classes/timestamp per the output layout convention
@@ -671,143 +425,14 @@ impl RecordingEvent {
     }
 }
 
-/// Spawns ffmpeg to encode raw RGB frames fed via stdin into an H.264 file.
-///
-/// `Command::spawn`'s exec-failure arm is only reachable if `ffmpeg` is
-/// absent from `PATH`; see `RecordingEvent::start`'s doc comment for why
-/// that's not safely fakeable from a test.
-fn spawn_video_encoder(
-    path: &std::path::Path,
-    width: u32,
-    height: u32,
-    frame_rate: u32,
-) -> Result<Child> {
-    #[cfg(unix)]
-    use std::os::unix::process::CommandExt;
-
-    let mut command = Command::new("ffmpeg");
-
-    command
-        .args(["-y", "-loglevel", "error"])
-        .args(["-f", "rawvideo", "-pixel_format", "rgb24"])
-        .args(["-video_size", &format!("{width}x{height}")])
-        .args(["-framerate", &frame_rate.to_string()])
-        .args(["-i", "-"])
-        .args(["-c:v", "libx264", "-pix_fmt", "yuv420p"])
-        .arg(path)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::null())
-        .stderr(Stdio::piped());
-
-    // Put ffmpeg in its own process group so a terminal SIGINT (Ctrl+C)
-    // doesn't reach it directly. It shares the foreground process group
-    // with motioncap by default, so without this, Ctrl+C kills ffmpeg at
-    // the same instant as motioncap's own ctrlc handler tries to close it
-    // gracefully (closing stdin, then waiting), racing ffmpeg's own SIGINT
-    // handling and producing a nonzero exit even when the output file is
-    // actually complete and valid. Graceful shutdown should be the only
-    // thing that ever tells ffmpeg to stop.
-    #[cfg(unix)]
-    command.process_group(0);
-
-    command
-        .spawn()
-        .context("failed to spawn ffmpeg video encoder")
-}
-
-/// Muxes the buffered raw audio into the encoded video. `-shortest` is
-/// deliberately not used: with independently-accumulated video/audio streams,
-/// whichever stream is shorter due to minor drift would otherwise have the
-/// *other* stream silently truncated to match, losing recorded content.
-/// Instead, the audio stream is padded with silence (`apad`) to at least the
-/// video's duration and `-shortest` is applied only to that padded output, so
-/// the result is exactly the video's length with no dropped video frames.
-///
-/// `.output()`'s exec-failure arm is only reachable if `ffmpeg` is absent
-/// from `PATH`; see `RecordingEvent::start`'s doc comment for why that's not
-/// safely fakeable from a test.
-fn mux_audio_into_video(
-    video_path: &std::path::Path,
-    audio_path: &std::path::Path,
-    output_path: &std::path::Path,
-    sample_rate: u32,
-    channels: u16,
-) -> Result<()> {
-    let output = Command::new("ffmpeg")
-        .args(["-y", "-i"])
-        .arg(video_path)
-        .args([
-            "-f",
-            "f32le",
-            "-ar",
-            &sample_rate.to_string(),
-            "-ac",
-            &channels.to_string(),
-        ])
-        .arg("-i")
-        .arg(audio_path)
-        .args(["-c:v", "copy", "-af", "apad", "-c:a", "aac", "-shortest"])
-        .arg(output_path)
-        .stdout(Stdio::null())
-        .stderr(Stdio::piped())
-        .output()
-        .context("failed to spawn ffmpeg for audio muxing")?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-
-        bail!(
-            "ffmpeg audio mux exited with {}: {}",
-            output.status,
-            stderr.trim()
-        );
-    }
-
-    Ok(())
-}
-
-/// Downsamples timestamped frames to approximately `frame_rate` frames per
-/// second based on their capture timestamps, keeping the first frame at or
-/// after each target tick. The ring buffer accumulates frames at the
-/// camera's native capture rate (which may be higher than the encoder's
-/// configured `frame_rate`), so writing every buffered frame 1:1 would
-/// stretch the pre-buffer's playback duration beyond its real elapsed time.
-fn resample_to_frame_rate(frames: &[TimestampedFrame], frame_rate: u32) -> Vec<&TimestampedFrame> {
-    let Some(first) = frames.first() else {
-        return Vec::new();
-    };
-
-    if frame_rate == 0 {
-        return frames.iter().collect();
-    }
-
-    let tick = Duration::from_secs_f64(1.0 / f64::from(frame_rate));
-    let mut selected = Vec::new();
-    let mut next_due = first.timestamp;
-
-    for frame in frames {
-        if frame.timestamp >= next_due {
-            selected.push(frame);
-            #[allow(
-                clippy::arithmetic_side_effects,
-                reason = "Instant += a sub-second Duration only overflows after ~584 billion years of process uptime"
-            )]
-            {
-                next_due += tick;
-            }
-        }
-    }
-
-    selected
-}
-
 #[cfg(test)]
 mod tests {
-    //! Unit tests for `ClipState`'s bookkeeping (no ffmpeg process required),
-    //! `resample_to_frame_rate`, and sidecar JSON serialization, plus inline
-    //! ffmpeg-backed round-trip tests for `RecordingEvent::start`/`seed`/
-    //! `drain_frames`/`drain_audio`/`finish` further down in this same module
-    //! (no top-level `tests/` directory exists for this binary-only crate, see ADR 7).
+    //! Inline ffmpeg-backed round-trip and fault-injection tests for
+    //! `RecordingEvent::start`/`seed`/`drain_frames`/`drain_audio`/`finish`
+    //! (no top-level `tests/` directory exists for this binary-only crate,
+    //! see ADR 7). Pure bookkeeping tests for `ClipState` and
+    //! `resample_to_frame_rate` live in `clip_state.rs` and `ffmpeg.rs`
+    //! respectively, alongside the code they exercise.
     #![allow(
         clippy::unwrap_used,
         clippy::indexing_slicing,
@@ -821,201 +446,9 @@ mod tests {
 
     use super::*;
     use crate::paths::{clip_path, sidecar_path};
-
-    fn frame_at(timestamp: Instant) -> TimestampedFrame {
-        TimestampedFrame {
-            timestamp,
-            image: image::RgbImage::new(1, 1),
-        }
-    }
-
-    // --- ClipState ---
-
-    #[test]
-    fn camera_stalled_false_when_recently_touched() {
-        let state = ClipState::new(15, Instant::now());
-        assert!(!state.camera_stalled());
-    }
-
-    #[test]
-    fn camera_stalled_true_once_max_frame_stall_elapses() {
-        let mut state = ClipState::new(15, Instant::now());
-        state.backdate_last_real_frame_at_past_stall();
-        assert!(state.camera_stalled());
-    }
-
-    #[test]
-    fn quiet_for_reflects_time_since_touch() {
-        let mut state = ClipState::new(15, Instant::now());
-        state.last_trigger_at = Instant::now() - Duration::from_secs(5);
-
-        assert!(state.quiet_for() >= Duration::from_secs(5));
-
-        state.touch();
-        assert!(state.quiet_for() < Duration::from_secs(1));
-    }
-
-    #[test]
-    fn quiet_for_reflects_time_since_record_detection() {
-        let mut state = ClipState::new(15, Instant::now());
-        state.last_trigger_at = Instant::now() - Duration::from_secs(5);
-
-        state.record_detection("person", 0.9, Instant::now());
-
-        assert!(state.quiet_for() < Duration::from_secs(1));
-    }
-
-    #[test]
-    fn offset_secs_relative_to_clip_timeline_start() {
-        let start = Instant::now();
-        let state = ClipState::new(15, start);
-
-        let five_secs_in = start + Duration::from_secs(5);
-        assert!((state.offset_secs(five_secs_in) - 5.0).abs() < 0.01);
-    }
-
-    #[test]
-    fn offset_secs_clamps_to_zero_for_timestamp_before_clip_start() {
-        let start = Instant::now();
-        let state = ClipState::new(15, start);
-
-        let before_start = start - Duration::from_secs(2);
-        assert!((state.offset_secs(before_start) - 0.0).abs() < f64::EPSILON);
-    }
-
-    #[test]
-    fn record_detection_deduplicates_and_sorts_classes() {
-        let mut state = ClipState::new(15, Instant::now());
-        let now = Instant::now();
-
-        state.record_detection("dog", 0.5, now);
-        state.record_detection("person", 0.9, now);
-        state.record_detection("dog", 0.6, now);
-
-        let classes: Vec<&str> = state.all_classes.iter().copied().collect();
-        assert_eq!(classes, vec!["dog", "person"]);
-        assert_eq!(state.detections.len(), 3);
-    }
-
-    #[test]
-    fn record_motion_appends_without_touching_quiet_window() {
-        let mut state = ClipState::new(15, Instant::now());
-        state.last_trigger_at = Instant::now() - Duration::from_secs(10);
-
-        state.record_motion(0.05, Instant::now());
-
-        assert_eq!(state.motion_events.len(), 1);
-        assert!(state.quiet_for() >= Duration::from_secs(9));
-    }
-
-    #[test]
-    fn should_write_frame_true_on_first_call_with_no_prior_due_tick() {
-        let mut state = ClipState::new(15, Instant::now());
-        assert!(state.next_frame_due.is_none());
-
-        assert!(state.should_write_frame(Instant::now()));
-        assert!(state.next_frame_due.is_some());
-    }
-
-    #[test]
-    fn should_write_frame_false_before_the_next_due_tick() {
-        let mut state = ClipState::new(15, Instant::now());
-        let first = Instant::now();
-        assert!(state.should_write_frame(first));
-
-        let just_after = first + Duration::from_millis(1);
-        assert!(!state.should_write_frame(just_after));
-    }
-
-    #[test]
-    fn should_write_frame_true_once_the_next_tick_is_reached() {
-        let mut state = ClipState::new(15, Instant::now());
-        let first = Instant::now();
-        assert!(state.should_write_frame(first));
-
-        let next_tick = first + state.frame_tick();
-        assert!(state.should_write_frame(next_tick));
-    }
-
-    #[test]
-    fn anchor_next_tick_after_seed_schedules_one_tick_past_the_seeded_frame() {
-        let mut state = ClipState::new(15, Instant::now());
-        let last_seeded = Instant::now();
-        let tick = state.frame_tick();
-
-        state.anchor_next_tick_after_seed(last_seeded);
-
-        assert_eq!(state.last_frame_drain_at, last_seeded);
-        assert_eq!(state.next_frame_due, Some(last_seeded + tick));
-    }
-
-    // --- resample_to_frame_rate ---
-
-    #[test]
-    fn resample_empty_input_yields_empty_output() {
-        let frames: Vec<TimestampedFrame> = Vec::new();
-        assert!(resample_to_frame_rate(&frames, 15).is_empty());
-    }
-
-    #[test]
-    fn resample_zero_frame_rate_passes_through_every_frame() {
-        let start = Instant::now();
-        let frames = vec![
-            frame_at(start),
-            frame_at(start + Duration::from_millis(1)),
-            frame_at(start + Duration::from_millis(2)),
-        ];
-
-        assert_eq!(resample_to_frame_rate(&frames, 0).len(), 3);
-    }
-
-    #[test]
-    fn resample_dedups_frames_tighter_than_one_tick() {
-        let start = Instant::now();
-        // 15fps tick is ~66.7ms; these arrive far tighter than that.
-        let frames = vec![
-            frame_at(start),
-            frame_at(start + Duration::from_millis(5)),
-            frame_at(start + Duration::from_millis(10)),
-        ];
-
-        assert_eq!(resample_to_frame_rate(&frames, 15).len(), 1);
-    }
-
-    #[test]
-    fn resample_keeps_all_frames_spaced_wider_than_one_tick() {
-        let start = Instant::now();
-        let frames = vec![
-            frame_at(start),
-            frame_at(start + Duration::from_millis(100)),
-            frame_at(start + Duration::from_millis(200)),
-        ];
-
-        assert_eq!(resample_to_frame_rate(&frames, 15).len(), 3);
-    }
-
-    // --- Sidecar serde round-trip ---
-
-    #[test]
-    fn sidecar_serializes_with_expected_shape() {
-        let sidecar = Sidecar {
-            detections: vec![DetectionRecord {
-                offset_secs: 1.5,
-                class_name: "person".to_string(),
-                confidence: 0.87,
-            }],
-            motion_events: vec![MotionEvent {
-                offset_secs: 0.2,
-                changed_ratio: 0.05,
-            }],
-        };
-
-        let json = serde_json::to_value(&sidecar).unwrap();
-
-        assert_eq!(json["detections"][0]["class_name"], "person");
-        assert!((json["detections"][0]["offset_secs"].as_f64().unwrap() - 1.5).abs() < 0.001);
-        assert!((json["motion_events"][0]["changed_ratio"].as_f64().unwrap() - 0.05).abs() < 0.001);
-    }
+    use crate::test_support::{
+        TEST_AUDIO_CHANNELS, TEST_AUDIO_SAMPLE_RATE, TEST_FRAME_DIM, TEST_FRAME_RATE,
+    };
 
     // --- RecordingEvent end-to-end (real ffmpeg subprocess) ---
 
@@ -1042,19 +475,85 @@ mod tests {
         serde_json::from_slice(&output.stdout).expect("ffprobe produced invalid JSON")
     }
 
-    /// A 2x2 timestamped frame; libx264 requires even width/height, so this
-    /// (rather than the shared `frame_at`'s 1x1) is used for the ffmpeg
-    /// round-trip test below.
+    /// A timestamped frame sized `TEST_FRAME_DIM` x `TEST_FRAME_DIM`; libx264
+    /// requires even width/height, and `TEST_FRAME_DIM` (2) is the smallest
+    /// value that satisfies that. Used for the ffmpeg round-trip tests below.
     fn even_sized_frame_at(timestamp: Instant) -> TimestampedFrame {
         TimestampedFrame {
             timestamp,
-            image: image::RgbImage::new(2, 2),
+            image: std::sync::Arc::new(image::RgbImage::new(TEST_FRAME_DIM, TEST_FRAME_DIM)),
         }
     }
 
+    /// A small, arbitrary sample count for fixture audio chunks; large
+    /// enough to be a non-trivial write, small enough to keep test data
+    /// tiny.
+    const SEED_AUDIO_SAMPLES: usize = 100;
+
+    /// A larger sample count for the round-trip test's pre-buffer audio
+    /// chunk; distinct from `SEED_AUDIO_SAMPLES` only because this is a
+    /// different (larger) fixture used by a different test, not because the
+    /// exact size matters to either.
+    const PRE_AUDIO_SAMPLES: usize = 800;
+
+    /// Spacing between the round-trip test's two pre-buffer frames, wide
+    /// enough to be a meaningfully distinct second frame.
+    const PRE_FRAME_SPACING: Duration = Duration::from_millis(250);
+
+    /// A representative changed-pixel ratio for `record_motion` calls in
+    /// this module's tests; its exact value doesn't matter, only that it
+    /// gets recorded verbatim into the sidecar.
+    const TEST_CHANGED_RATIO: f32 = 0.02;
+
+    /// A representative detection confidence for `record_detection` calls in
+    /// this module's tests.
+    const DETECTION_CONFIDENCE: f32 = 0.95;
+
+    /// A second representative detection confidence, used by tests that
+    /// don't otherwise care about the specific value; distinct from
+    /// `DETECTION_CONFIDENCE` only because it was already in use at these
+    /// call sites, not because the difference is meaningful.
+    const OTHER_DETECTION_CONFIDENCE: f32 = 0.9;
+
+    /// Sample count for `write_audio`/`seed`'s audio fault-injection test
+    /// buffers.
+    const WRITE_AUDIO_TEST_SAMPLES: usize = 10;
+
+    /// Upper bound `quiet_for` must read under immediately after a
+    /// touch/detection resets it.
+    const FRESH_QUIET_UPPER_BOUND: Duration = Duration::from_secs(1);
+
+    /// Sleep past a frame-rate tick before pushing new content into the ring
+    /// buffer, so `drain_frames`/`drain_audio` see it as genuinely due
+    /// rather than arriving before its scheduled tick. At `TEST_FRAME_RATE`
+    /// (5fps), one tick is 200ms, so this comfortably clears it.
+    const PAST_TICK_SLEEP: Duration = Duration::from_millis(250);
+
+    /// Ring-buffer retention window for tests that drain freshly-pushed
+    /// content shortly after pushing it; ample margin so nothing evicts
+    /// before the test reads it back.
+    const DRAIN_TEST_RETENTION: Duration = Duration::from_secs(30);
+
+    /// A representative audio fill value for ring-buffer fixture pushes; its
+    /// exact value doesn't matter, only that draining writes it through.
+    const DRAIN_TEST_AUDIO_SAMPLE: f32 = 0.5;
+
+    /// Sample count for the drain tests' pushed audio chunk.
+    const DRAIN_TEST_AUDIO_SAMPLES: usize = 100;
+
+    /// Upper bound on retry attempts before giving up on observing a broken
+    /// pipe; generous relative to `BROKEN_PIPE_POLL_INTERVAL` so the retry
+    /// loop only fails if the pipe genuinely never breaks, not due to
+    /// scheduling jitter under a loaded `cargo test` run.
+    const BROKEN_PIPE_MAX_RETRIES: u32 = 200;
+
+    /// Interval between broken-pipe retry attempts.
+    const BROKEN_PIPE_POLL_INTERVAL: Duration = Duration::from_millis(10);
+
     /// Starts a `RecordingEvent` with the field values shared by most tests
-    /// in this module (2x2 frames, 5fps, 8kHz mono audio), overriding only
-    /// the fields a given test needs to vary.
+    /// in this module (`TEST_FRAME_DIM` square frames, `TEST_FRAME_RATE`fps,
+    /// `TEST_AUDIO_SAMPLE_RATE`Hz mono audio), overriding only the fields a
+    /// given test needs to vary.
     fn start_event(
         dir: &std::path::Path,
         final_clip_path: std::path::PathBuf,
@@ -1070,11 +569,44 @@ mod tests {
             started_at,
             width,
             height,
-            frame_rate: 5,
+            frame_rate: TEST_FRAME_RATE,
             audio_sample_rate,
-            audio_channels: 1,
+            audio_channels: TEST_AUDIO_CHANNELS,
             clip_timeline_start,
         })
+    }
+
+    /// A deliberately invalid (zero) width/height, used to force ffmpeg to
+    /// reject `-video_size 0x0` and exit nonzero, exercising `finish`'s
+    /// nonzero-exit error arm.
+    const INVALID_DIM: u32 = 0;
+
+    /// A deliberately invalid (zero) audio sample rate, used to force
+    /// ffmpeg's mux step to reject `-ar 0`, exercising `finish`'s mux-failure
+    /// error arm.
+    const INVALID_SAMPLE_RATE: u32 = 0;
+
+    /// Starts a `RecordingEvent` with every field at this module's standard
+    /// test values (see `start_event`'s doc comment); for the (large
+    /// majority of) tests that don't need to vary width/height/sample rate
+    /// away from the shared fixture values. Tests that deliberately need an
+    /// invalid dimension/rate (e.g. to force an ffmpeg failure) call
+    /// `start_event` directly instead.
+    fn start_event_standard(
+        dir: &std::path::Path,
+        final_clip_path: std::path::PathBuf,
+        started_at: DateTime<Local>,
+        clip_timeline_start: Instant,
+    ) -> Result<RecordingEvent> {
+        start_event(
+            dir,
+            final_clip_path,
+            started_at,
+            clip_timeline_start,
+            TEST_FRAME_DIM,
+            TEST_FRAME_DIM,
+            TEST_AUDIO_SAMPLE_RATE,
+        )
     }
 
     /// Seeds `event` with a single even-sized frame and a small audio chunk,
@@ -1086,7 +618,7 @@ mod tests {
                 &[even_sized_frame_at(clip_timeline_start)],
                 &[TimestampedAudio {
                     timestamp: clip_timeline_start,
-                    samples: vec![0.0; 100],
+                    samples: vec![0.0; SEED_AUDIO_SAMPLES],
                 }],
             )
             .unwrap();
@@ -1105,33 +637,24 @@ mod tests {
         let initial_path = clip_path(dir.path(), started_at, &[]).unwrap();
         let expected_final_path = clip_path(dir.path(), started_at, &["person"]).unwrap();
 
-        let mut event = RecordingEvent::start(RecordingEventParams {
-            final_clip_path: initial_path,
-            output_dir: dir.path().to_path_buf(),
-            started_at,
-            width: 2,
-            height: 2,
-            frame_rate: 5,
-            audio_sample_rate: 8000,
-            audio_channels: 1,
-            clip_timeline_start,
-        })
-        .unwrap();
+        let mut event =
+            start_event_standard(dir.path(), initial_path, started_at, clip_timeline_start)
+                .unwrap();
 
         let pre_frames = vec![
             even_sized_frame_at(clip_timeline_start),
-            even_sized_frame_at(clip_timeline_start + Duration::from_millis(250)),
+            even_sized_frame_at(clip_timeline_start + PRE_FRAME_SPACING),
         ];
         let pre_audio = vec![TimestampedAudio {
             timestamp: clip_timeline_start,
-            samples: vec![0.0; 800],
+            samples: vec![0.0; PRE_AUDIO_SAMPLES],
         }];
 
         event.seed(&pre_frames, &pre_audio).unwrap();
 
-        event.record_motion(0.02, clip_timeline_start);
-        event.record_detection("person", 0.95, clip_timeline_start);
-        assert!(event.quiet_for() < Duration::from_secs(1));
+        event.record_motion(TEST_CHANGED_RATIO, clip_timeline_start);
+        event.record_detection("person", DETECTION_CONFIDENCE, clip_timeline_start);
+        assert!(event.quiet_for() < FRESH_QUIET_UPPER_BOUND);
         event.touch();
 
         event.finish().unwrap();
@@ -1170,16 +693,9 @@ mod tests {
 
         let initial_path = clip_path(dir.path(), started_at, &[]).unwrap();
 
-        let mut event = start_event(
-            dir.path(),
-            initial_path,
-            started_at,
-            clip_timeline_start,
-            2,
-            2,
-            8000,
-        )
-        .unwrap();
+        let mut event =
+            start_event_standard(dir.path(), initial_path, started_at, clip_timeline_start)
+                .unwrap();
 
         seed_one_frame(&mut event, clip_timeline_start);
 
@@ -1187,14 +703,14 @@ mod tests {
         // sleeping past that before pushing ensures the newly-buffered frame
         // is actually due and gets written (not silently skipped for arriving
         // before its tick), exercising drain_frames' write branch for real.
-        std::thread::sleep(Duration::from_millis(250));
+        std::thread::sleep(PAST_TICK_SLEEP);
 
         let ring_buffer =
-            std::sync::Mutex::new(crate::buffer::RingBuffer::new(Duration::from_secs(30)));
+            std::sync::Mutex::new(crate::buffer::RingBuffer::new(DRAIN_TEST_RETENTION));
         {
             let mut buf = ring_buffer.lock().unwrap();
-            buf.push_frame(image::RgbImage::new(2, 2));
-            buf.push_audio(vec![0.5; 100]);
+            buf.push_frame(image::RgbImage::new(TEST_FRAME_DIM, TEST_FRAME_DIM));
+            buf.push_audio(vec![DRAIN_TEST_AUDIO_SAMPLE; DRAIN_TEST_AUDIO_SAMPLES]);
         }
 
         // Both must succeed without error against real newly-buffered content
@@ -1221,17 +737,9 @@ mod tests {
         let missing_subdir = dir.path().join("does-not-exist");
         let final_clip_path = missing_subdir.join("clip.mp4");
 
-        let err = start_event(
-            dir.path(),
-            final_clip_path,
-            started_at,
-            Instant::now(),
-            2,
-            2,
-            8000,
-        )
-        .err()
-        .unwrap();
+        let err = start_event_standard(dir.path(), final_clip_path, started_at, Instant::now())
+            .err()
+            .unwrap();
 
         assert!(err.to_string().contains("failed to create temp audio file"));
     }
@@ -1243,16 +751,17 @@ mod tests {
         let started_at = chrono::Local::now();
         let initial_path = clip_path(dir.path(), started_at, &[]).unwrap();
 
-        // width/height of 0 makes ffmpeg reject "-video_size 0x0" and exit
-        // nonzero immediately, without needing any frames written to stdin.
+        // An invalid (zero) width/height makes ffmpeg reject "-video_size
+        // 0x0" and exit nonzero immediately, without needing any frames
+        // written to stdin.
         let event = start_event(
             dir.path(),
             initial_path,
             started_at,
             clip_timeline_start,
-            0,
-            0,
-            8000,
+            INVALID_DIM,
+            INVALID_DIM,
+            TEST_AUDIO_SAMPLE_RATE,
         )
         .unwrap();
 
@@ -1277,9 +786,9 @@ mod tests {
             initial_path,
             started_at,
             clip_timeline_start,
-            2,
-            2,
-            0,
+            TEST_FRAME_DIM,
+            TEST_FRAME_DIM,
+            INVALID_SAMPLE_RATE,
         )
         .unwrap();
 
@@ -1302,16 +811,9 @@ mod tests {
         let renamed_path = clip_path(dir.path(), started_at, &["person"]).unwrap();
         std::fs::create_dir_all(&renamed_path).unwrap();
 
-        let mut event = start_event(
-            dir.path(),
-            initial_path,
-            started_at,
-            clip_timeline_start,
-            2,
-            2,
-            8000,
-        )
-        .unwrap();
+        let mut event =
+            start_event_standard(dir.path(), initial_path, started_at, clip_timeline_start)
+                .unwrap();
 
         // Unlike finish_errors_when_audio_mux_fails' -ar 0 (which fails
         // fast), this test uses a valid sample rate so finish() actually
@@ -1322,7 +824,7 @@ mod tests {
         // so a real frame/audio chunk must be seeded first.
         seed_one_frame(&mut event, clip_timeline_start);
 
-        event.record_detection("person", 0.9, clip_timeline_start);
+        event.record_detection("person", OTHER_DETECTION_CONFIDENCE, clip_timeline_start);
 
         let err = event.finish().unwrap_err();
 
@@ -1339,23 +841,18 @@ mod tests {
         let started_at = chrono::Local::now();
         let initial_path = clip_path(dir.path(), started_at, &[]).unwrap();
 
-        let mut event = start_event(
-            dir.path(),
-            initial_path,
-            started_at,
-            clip_timeline_start,
-            2,
-            2,
-            8000,
-        )
-        .unwrap();
+        let mut event =
+            start_event_standard(dir.path(), initial_path, started_at, clip_timeline_start)
+                .unwrap();
 
         // Taking stdin out from under the event (rather than anything ffmpeg
         // does) is what write_frame's own "already closed" arm guards
         // against; drop it here to force that arm directly.
         drop(event.ffmpeg_video.stdin.take());
 
-        let err = event.write_frame(&image::RgbImage::new(2, 2)).unwrap_err();
+        let err = event
+            .write_frame(&image::RgbImage::new(TEST_FRAME_DIM, TEST_FRAME_DIM))
+            .unwrap_err();
         assert!(err.to_string().contains("ffmpeg stdin was already closed"));
 
         // ffmpeg_video is still a live child with no stdin ever supplied a
@@ -1374,16 +871,9 @@ mod tests {
         let started_at = chrono::Local::now();
         let initial_path = clip_path(dir.path(), started_at, &[]).unwrap();
 
-        let mut event = start_event(
-            dir.path(),
-            initial_path,
-            started_at,
-            clip_timeline_start,
-            2,
-            2,
-            8000,
-        )
-        .unwrap();
+        let mut event =
+            start_event_standard(dir.path(), initial_path, started_at, clip_timeline_start)
+                .unwrap();
 
         drop(event.ffmpeg_video.stdin.take());
 
@@ -1402,25 +892,18 @@ mod tests {
         let started_at = chrono::Local::now();
         let initial_path = clip_path(dir.path(), started_at, &[]).unwrap();
 
-        let mut event = start_event(
-            dir.path(),
-            initial_path,
-            started_at,
-            clip_timeline_start,
-            2,
-            2,
-            8000,
-        )
-        .unwrap();
+        let mut event =
+            start_event_standard(dir.path(), initial_path, started_at, clip_timeline_start)
+                .unwrap();
 
         seed_one_frame(&mut event, clip_timeline_start);
-        std::thread::sleep(Duration::from_millis(250));
+        std::thread::sleep(PAST_TICK_SLEEP);
 
         let ring_buffer =
-            std::sync::Mutex::new(crate::buffer::RingBuffer::new(Duration::from_secs(30)));
+            std::sync::Mutex::new(crate::buffer::RingBuffer::new(DRAIN_TEST_RETENTION));
         {
             let mut buf = ring_buffer.lock().unwrap();
-            buf.push_frame(image::RgbImage::new(2, 2));
+            buf.push_frame(image::RgbImage::new(TEST_FRAME_DIM, TEST_FRAME_DIM));
         }
 
         drop(event.ffmpeg_video.stdin.take());
@@ -1438,16 +921,9 @@ mod tests {
         let started_at = chrono::Local::now();
         let initial_path = clip_path(dir.path(), started_at, &[]).unwrap();
 
-        let mut event = start_event(
-            dir.path(),
-            initial_path,
-            started_at,
-            clip_timeline_start,
-            2,
-            2,
-            8000,
-        )
-        .unwrap();
+        let mut event =
+            start_event_standard(dir.path(), initial_path, started_at, clip_timeline_start)
+                .unwrap();
 
         // Kill the encoder out from under the event so its stdin pipe becomes
         // a broken pipe (the process is gone, but the Stdio::piped() handle
@@ -1460,16 +936,18 @@ mod tests {
         // arm instead of the one this test targets.
         event.ffmpeg_video.kill().unwrap();
 
-        let mut result = event.write_frame(&image::RgbImage::new(2, 2));
+        let broken_pipe_frame = || image::RgbImage::new(TEST_FRAME_DIM, TEST_FRAME_DIM);
+
+        let mut result = event.write_frame(&broken_pipe_frame());
         // A single write can land in the pipe buffer before the kernel
         // notices the reader is gone; retry briefly until the broken pipe is
         // actually observed rather than asserting on a racy first attempt.
-        for _ in 0..200 {
+        for _ in 0..BROKEN_PIPE_MAX_RETRIES {
             if result.is_err() {
                 break;
             }
-            std::thread::sleep(Duration::from_millis(10));
-            result = event.write_frame(&image::RgbImage::new(2, 2));
+            std::thread::sleep(BROKEN_PIPE_POLL_INTERVAL);
+            result = event.write_frame(&broken_pipe_frame());
         }
 
         let err = result.unwrap_err();
@@ -1491,16 +969,9 @@ mod tests {
         let started_at = chrono::Local::now();
         let initial_path = clip_path(dir.path(), started_at, &[]).unwrap();
 
-        let mut event = start_event(
-            dir.path(),
-            initial_path,
-            started_at,
-            clip_timeline_start,
-            2,
-            2,
-            8000,
-        )
-        .unwrap();
+        let mut event =
+            start_event_standard(dir.path(), initial_path, started_at, clip_timeline_start)
+                .unwrap();
 
         // Swap in a read-only handle to the same temp file so write_all
         // itself fails (EBADF) rather than anything about the path/directory
@@ -1508,7 +979,9 @@ mod tests {
         // here as a same-module test.
         event.audio_file = std::fs::File::open(&event.audio_tmp_path).unwrap();
 
-        let err = event.write_audio(&[0.0; 10]).unwrap_err();
+        let err = event
+            .write_audio(&[0.0; WRITE_AUDIO_TEST_SAMPLES])
+            .unwrap_err();
         assert!(
             err.to_string()
                 .contains("failed to write audio samples to temp file"),
@@ -1526,16 +999,9 @@ mod tests {
         let started_at = chrono::Local::now();
         let initial_path = clip_path(dir.path(), started_at, &[]).unwrap();
 
-        let mut event = start_event(
-            dir.path(),
-            initial_path,
-            started_at,
-            clip_timeline_start,
-            2,
-            2,
-            8000,
-        )
-        .unwrap();
+        let mut event =
+            start_event_standard(dir.path(), initial_path, started_at, clip_timeline_start)
+                .unwrap();
 
         event.audio_file = std::fs::File::open(&event.audio_tmp_path).unwrap();
 
@@ -1544,7 +1010,7 @@ mod tests {
                 &[],
                 &[TimestampedAudio {
                     timestamp: clip_timeline_start,
-                    samples: vec![0.0; 10],
+                    samples: vec![0.0; WRITE_AUDIO_TEST_SAMPLES],
                 }],
             )
             .unwrap_err();
@@ -1565,24 +1031,17 @@ mod tests {
         let started_at = chrono::Local::now();
         let initial_path = clip_path(dir.path(), started_at, &[]).unwrap();
 
-        let mut event = start_event(
-            dir.path(),
-            initial_path,
-            started_at,
-            clip_timeline_start,
-            2,
-            2,
-            8000,
-        )
-        .unwrap();
+        let mut event =
+            start_event_standard(dir.path(), initial_path, started_at, clip_timeline_start)
+                .unwrap();
 
         seed_one_frame(&mut event, clip_timeline_start);
 
         let ring_buffer =
-            std::sync::Mutex::new(crate::buffer::RingBuffer::new(Duration::from_secs(30)));
+            std::sync::Mutex::new(crate::buffer::RingBuffer::new(DRAIN_TEST_RETENTION));
         {
             let mut buf = ring_buffer.lock().unwrap();
-            buf.push_audio(vec![0.5; 100]);
+            buf.push_audio(vec![DRAIN_TEST_AUDIO_SAMPLE; DRAIN_TEST_AUDIO_SAMPLES]);
         }
 
         event.audio_file = std::fs::File::open(&event.audio_tmp_path).unwrap();
@@ -1605,19 +1064,12 @@ mod tests {
         let started_at = chrono::Local::now();
         let initial_path = clip_path(dir.path(), started_at, &[]).unwrap();
 
-        let mut event = start_event(
-            dir.path(),
-            initial_path,
-            started_at,
-            clip_timeline_start,
-            2,
-            2,
-            8000,
-        )
-        .unwrap();
+        let mut event =
+            start_event_standard(dir.path(), initial_path, started_at, clip_timeline_start)
+                .unwrap();
 
         seed_one_frame(&mut event, clip_timeline_start);
-        event.record_detection("person", 0.9, clip_timeline_start);
+        event.record_detection("person", OTHER_DETECTION_CONFIDENCE, clip_timeline_start);
 
         // finish()'s `if let Some(stderr_pipe) = self.ffmpeg_video.stderr.take()`
         // only has stderr to capture the first time it runs; pre-taking it
@@ -1642,16 +1094,9 @@ mod tests {
         let sidecar_target = sidecar_path(&initial_path);
         std::fs::create_dir_all(&sidecar_target).unwrap();
 
-        let mut event = start_event(
-            dir.path(),
-            initial_path,
-            started_at,
-            clip_timeline_start,
-            2,
-            2,
-            8000,
-        )
-        .unwrap();
+        let mut event =
+            start_event_standard(dir.path(), initial_path, started_at, clip_timeline_start)
+                .unwrap();
 
         seed_one_frame(&mut event, clip_timeline_start);
 
@@ -1669,19 +1114,12 @@ mod tests {
         let started_at = chrono::Local::now();
         let initial_path = clip_path(dir.path(), started_at, &[]).unwrap();
 
-        let mut event = start_event(
-            dir.path(),
-            initial_path,
-            started_at,
-            clip_timeline_start,
-            2,
-            2,
-            8000,
-        )
-        .unwrap();
+        let mut event =
+            start_event_standard(dir.path(), initial_path, started_at, clip_timeline_start)
+                .unwrap();
 
         seed_one_frame(&mut event, clip_timeline_start);
-        event.record_detection("person", 0.9, clip_timeline_start);
+        event.record_detection("person", OTHER_DETECTION_CONFIDENCE, clip_timeline_start);
 
         // finish() recomputes the final path via clip_path(&self.output_dir,
         // ...), which create_dir_all()s the day directory under output_dir.

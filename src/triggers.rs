@@ -25,6 +25,10 @@ mod tests {
 
     use super::*;
 
+    /// Fixture confidence for a synthetic test detection; its exact value
+    /// doesn't matter, only that `evaluate` passes it through unchanged.
+    const FIXTURE_CONFIDENCE: f32 = 0.9;
+
     #[test]
     fn empty_detections_yield_no_trigger() {
         assert!(evaluate(Vec::new()).is_none());
@@ -34,7 +38,7 @@ mod tests {
     fn nonempty_detections_are_passed_through_unchanged() {
         let detections = vec![Detection {
             class_name: "person",
-            confidence: 0.9,
+            confidence: FIXTURE_CONFIDENCE,
         }];
 
         let result = evaluate(detections);

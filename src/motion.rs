@@ -7,6 +7,19 @@ use opencv::video::{BackgroundSubtractorTrait, create_background_subtractor_mog2
 
 use crate::opencv_utils::rgb_image_to_bgr_mat;
 
+/// Number of recent frames MOG2 uses to build its rolling background model.
+const MOG2_HISTORY: i32 = 500;
+
+/// MOG2's Mahalanobis-distance-squared threshold for classifying a pixel as
+/// foreground (changed) vs. background, in the background subtractor's own
+/// units. `OpenCV`'s documented default.
+const MOG2_VARIANCE_THRESHOLD: f64 = 16.0;
+
+/// Sentinel passed as MOG2's `apply` learning-rate argument to mean "choose
+/// an automatic rate," per `OpenCV`'s own convention for this parameter
+/// (any negative value means automatic).
+const MOG2_AUTO_LEARNING_RATE: f64 = -1.0;
+
 /// Background-subtraction motion gate (ADR 2). Its only job is deciding
 /// whether whole-frame motion exceeded the configured threshold; recording
 /// itself is only ever triggered by a subsequent confirmed YOLO
@@ -29,8 +42,9 @@ pub struct MotionReading {
 impl MotionGate {
     /// Creates a motion gate with a fresh MOG2 background model.
     pub fn new(threshold: f32) -> Result<Self> {
-        let subtractor = create_background_subtractor_mog2(500, 16.0, true)
-            .context("failed to create MOG2 background subtractor")?;
+        let subtractor =
+            create_background_subtractor_mog2(MOG2_HISTORY, MOG2_VARIANCE_THRESHOLD, true)
+                .context("failed to create MOG2 background subtractor")?;
         Ok(Self {
             subtractor,
             threshold,
@@ -47,7 +61,7 @@ impl MotionGate {
         let mut fgmask = Mat::default();
 
         self.subtractor
-            .apply(&mat, &mut fgmask, -1.0)
+            .apply(&mat, &mut fgmask, MOG2_AUTO_LEARNING_RATE)
             .context("background subtraction apply failed")?;
 
         #[allow(
@@ -100,6 +114,49 @@ mod tests {
     use super::*;
     use crate::detect;
 
+    /// Motion-gate threshold used throughout this module's tests; low enough
+    /// that the large synthetic changed-region test reliably trips it
+    /// without also tripping on MOG2's own settling noise.
+    const TEST_MOTION_THRESHOLD: f32 = 0.01;
+
+    /// Frame dimension for this module's synthetic test frames; small enough
+    /// to keep MOG2 warm-up fast, large enough to contain a meaningfully
+    /// sized changed region.
+    const TEST_FRAME_DIM: u32 = 64;
+
+    /// A neutral background fill color for synthetic test frames.
+    const BACKGROUND_COLOR: [u8; 3] = [50, 50, 50];
+
+    /// Number of frames fed through MOG2 before asserting on a *stable*
+    /// scene, giving its background model time to settle.
+    const STABLE_SCENE_WARMUP_FRAMES: u32 = 5;
+
+    /// Number of frames fed through MOG2 before introducing a changed
+    /// region, giving its background model time to settle on the
+    /// pre-change scene specifically (a higher count than
+    /// `STABLE_SCENE_WARMUP_FRAMES` since this test's assertion is more
+    /// sensitive to an unsettled background producing spurious foreground).
+    const CHANGED_REGION_WARMUP_FRAMES: u32 = 10;
+
+    /// Side length of the deliberately-changed square region within the
+    /// `TEST_FRAME_DIM`-sized test frame.
+    const CHANGED_REGION_SIZE: u32 = 32;
+
+    /// A fill color for the changed region, chosen to contrast sharply
+    /// against `BACKGROUND_COLOR` so MOG2 reliably classifies it as
+    /// foreground.
+    const CHANGED_REGION_COLOR: [u8; 3] = [250, 250, 250];
+
+    /// Row/column count for the multi-channel-mask test's `Mat`; its exact
+    /// value doesn't matter since the test expects `count_non_zero` to error
+    /// before any pixel is actually inspected.
+    const MULTI_CHANNEL_MASK_DIM: i32 = 4;
+
+    /// An arbitrary nonzero `total_pixels` value for the multi-channel-mask
+    /// test; irrelevant to the outcome since `count_non_zero` is expected to
+    /// error before this divisor is ever used.
+    const UNUSED_TOTAL_PIXELS: f32 = 16.0;
+
     fn solid_frame(width: u32, height: u32, color: [u8; 3]) -> RgbImage {
         RgbImage::from_pixel(width, height, Rgb(color))
     }
@@ -110,12 +167,12 @@ mod tests {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
 
-        let mut gate = MotionGate::new(0.01).unwrap();
-        let frame = solid_frame(64, 64, [50, 50, 50]);
+        let mut gate = MotionGate::new(TEST_MOTION_THRESHOLD).unwrap();
+        let frame = solid_frame(TEST_FRAME_DIM, TEST_FRAME_DIM, BACKGROUND_COLOR);
 
         // MOG2 needs a few frames to establish its background model before
         // its foreground mask stabilizes near zero for an unchanging scene.
-        for _ in 0..5 {
+        for _ in 0..STABLE_SCENE_WARMUP_FRAMES {
             gate.evaluate(&frame).unwrap();
         }
 
@@ -130,25 +187,25 @@ mod tests {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
 
-        let mut gate = MotionGate::new(0.01).unwrap();
-        let background = solid_frame(64, 64, [50, 50, 50]);
+        let mut gate = MotionGate::new(TEST_MOTION_THRESHOLD).unwrap();
+        let background = solid_frame(TEST_FRAME_DIM, TEST_FRAME_DIM, BACKGROUND_COLOR);
 
-        for _ in 0..10 {
+        for _ in 0..CHANGED_REGION_WARMUP_FRAMES {
             gate.evaluate(&background).unwrap();
         }
 
         let mut changed = background.clone();
 
-        for y in 0..32 {
-            for x in 0..32 {
-                changed.put_pixel(x, y, Rgb([250, 250, 250]));
+        for y in 0..CHANGED_REGION_SIZE {
+            for x in 0..CHANGED_REGION_SIZE {
+                changed.put_pixel(x, y, Rgb(CHANGED_REGION_COLOR));
             }
         }
 
         let reading = gate.evaluate(&changed).unwrap();
 
         assert!(reading.tripped, "changed_ratio={}", reading.changed_ratio);
-        assert!(reading.changed_ratio > 0.01);
+        assert!(reading.changed_ratio > TEST_MOTION_THRESHOLD);
     }
 
     #[test]
@@ -165,14 +222,14 @@ mod tests {
         // an `Err`, unlike `MotionGate::new`/`evaluate`'s other fallible
         // calls, which tolerate every input this crate can construct.
         let mask = Mat::new_rows_cols_with_default(
-            4,
-            4,
+            MULTI_CHANNEL_MASK_DIM,
+            MULTI_CHANNEL_MASK_DIM,
             opencv::core::CV_8UC3,
             opencv::core::Scalar::all(0.0),
         )
         .unwrap();
 
-        let result = changed_ratio(&mask, 16.0);
+        let result = changed_ratio(&mask, UNUSED_TOTAL_PIXELS);
 
         assert!(result.is_err());
     }
