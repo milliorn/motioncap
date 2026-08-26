@@ -47,6 +47,12 @@ const PREFILLED_FRAME_COUNT: usize = 64;
 /// per-poll drain (`RecordingEvent::drain_frames`/`drain_audio`, polled at
 /// `RECORDING_FRAME_RATE`) sees since its own last poll, not the entire
 /// retained backlog.
+///
+/// Must stay less than or equal to `PREFILLED_FRAME_COUNT`: `frames_since`'s
+/// setup splits the prefill into an older batch (`PREFILLED_FRAME_COUNT -
+/// RECENT_FRAME_COUNT` frames) and this trailing batch, so raising this
+/// past `PREFILLED_FRAME_COUNT` without also raising that constant would
+/// underflow the older batch's count.
 const RECENT_FRAME_COUNT: usize = 4;
 
 fn push_frame(c: &mut Criterion) {
@@ -79,7 +85,7 @@ fn frames_since(c: &mut Criterion) {
     let mut buffer = RingBuffer::new(BENCH_RETENTION);
     let frame = RgbImage::new(FRAME_WIDTH, FRAME_HEIGHT);
 
-    for _ in 0..(PREFILLED_FRAME_COUNT - RECENT_FRAME_COUNT) {
+    for _ in 0..PREFILLED_FRAME_COUNT.saturating_sub(RECENT_FRAME_COUNT) {
         buffer.push_frame(frame.clone());
     }
 
