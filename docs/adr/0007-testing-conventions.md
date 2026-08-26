@@ -142,7 +142,7 @@ present.
   rather than on every CI push.
 - If this crate ever gains a genuine library consumer (unlikely given ADR 1's
   single-binary distribution model), a `src/lib.rs` split would become worth
-  revisiting - at that point a `tests/` directory would become usable and this
+  revisiting; at that point a `tests/` directory would become usable and this
   decision should be re-examined against the tradeoffs recorded here.
 
 ## Amendment: `src/lib.rs` exists now, but the placement decision still stands

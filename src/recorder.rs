@@ -84,9 +84,11 @@ pub struct RecordingEvent {
 }
 
 impl std::fmt::Debug for RecordingEvent {
-    /// `std::process::Child` doesn't implement `Debug`, so this omits
-    /// `ffmpeg_video`/`audio_file` and reports the rest of the clip's
-    /// bookkeeping instead.
+    /// `std::process::Child` does implement `Debug`, but its output is just
+    /// the process's stdio handle states, not useful clip bookkeeping, and
+    /// `std::fs::File` (`audio_file`)'s `Debug` output is platform-specific
+    /// raw fd/handle detail. This omits `ffmpeg_video`/`audio_file` and
+    /// reports the rest of the clip's bookkeeping instead.
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("RecordingEvent")
             .field("audio_tmp_path", &self.audio_tmp_path)
