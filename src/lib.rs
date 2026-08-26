@@ -17,49 +17,40 @@
 
 /// Rolling pre-buffer of recent frames/audio (see `RingBuffer`).
 ///
-/// Public: used by `benches/` to exercise ring-buffer throughput, and its
-/// types (`TimestampedFrame`, `TimestampedAudio`) appear in `recorder`'s
-/// public API.
+/// Public: used by `benches/` to exercise ring-buffer throughput.
 pub mod buffer;
 /// Camera and audio capture callbacks.
 pub(crate) mod capture;
-/// Pure timing/bookkeeping state for a single recorded clip. Public: appears
-/// in `recorder::RecordingEvent`'s public API.
-pub mod clip_state;
+/// Pure timing/bookkeeping state for a single recorded clip.
+pub(crate) mod clip_state;
 /// CLI argument parsing.
 pub(crate) mod config;
 /// Repeat-sighting confirmation gate for YOLO detections.
 pub(crate) mod confirmation;
-/// YOLO object-detection inference. Public: used by `benches/` to exercise
-/// preprocess/postprocess.
-pub mod detect;
+/// YOLO object-detection inference.
+pub(crate) mod detect;
 /// Recording-event state machine and shutdown/close/seed-drain lifecycle.
 pub(crate) mod event_lifecycle;
-/// ffmpeg subprocess helpers (video encoder, audio mux, resampling). Public:
-/// used by `benches/` to exercise frame resampling, and appears in
-/// `recorder`'s implementation surface.
-pub mod ffmpeg;
+/// ffmpeg subprocess helpers (video encoder, audio mux, resampling).
+pub(crate) mod ffmpeg;
 /// Camera liveness/stall detection (no camera dependency).
 pub(crate) mod liveness;
 /// Logging setup (`init_logging`, `TeeWriter`).
 pub(crate) mod logging;
-/// Background-subtraction motion gate. Public: used by `benches/` to
-/// exercise the motion gate.
-pub mod motion;
+/// Background-subtraction motion gate.
+pub(crate) mod motion;
 /// Shared `OpenCV` conversion helpers.
 pub(crate) mod opencv_utils;
-/// Output file/folder naming. Public: appears in `recorder`'s public API.
-pub mod paths;
+/// Output file/folder naming.
+pub(crate) mod paths;
 /// Opt-in live preview window.
 pub(crate) mod preview;
 /// Camera reconnect gating and stream-rebuild mechanism.
 pub(crate) mod reconnect;
-/// Recording lifecycle and ffmpeg-backed encoding. Public: used by
-/// `benches/` to exercise frame resampling via `RecordingEvent`.
-pub mod recorder;
-/// Clip `.json` sidecar output shapes (ADR 4). Public: appears in
-/// `recorder`'s public API.
-pub mod sidecar;
+/// Recording lifecycle and ffmpeg-backed encoding.
+pub(crate) mod recorder;
+/// Clip `.json` sidecar output shapes (ADR 4).
+pub(crate) mod sidecar;
 /// Startup dependency checks.
 pub(crate) mod startup;
 /// Test fixtures shared across more than one module's test suite.

@@ -12,8 +12,8 @@ use crate::sidecar::{DetectionRecord, MotionEvent};
 /// enough that a genuinely dead camera ends the recording within a couple of
 /// seconds rather than dragging on.
 ///
-/// Also reused by `main`'s pre-trigger staleness check so both paths agree on
-/// what counts as a stalled camera.
+/// Also reused by `app.rs`'s pre-trigger staleness check so both paths agree
+/// on what counts as a stalled camera.
 pub const MAX_FRAME_STALL: Duration = Duration::from_millis(1500);
 
 /// Duration of one frame-rate tick at `frame_rate` frames per second.

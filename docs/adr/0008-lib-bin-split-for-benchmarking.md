@@ -49,29 +49,29 @@ signatures unavoidably reference it.**
 
 Concretely:
 
-- `src/main.rs` shrank to a six-line entry point:
+- `src/main.rs` shrank to a three-line entry point:
   `fn main() -> anyhow::Result<()> { motioncap::app::run() }`.
 - A new `src/app.rs` holds `run()` and the three long-lived worker loops
   (`run_detection_loop`, `run_recording_writer_loop`, `run_preview_loop`), moved
   verbatim out of the old `main.rs`. It stays `pub` in `lib.rs`'s module declaration
   only because `src/main.rs` is a separate compiled crate from the library even within
   the same package, and needs `pub` visibility to call `app::run()`.
-- `src/lib.rs` declares every other module `pub(crate)` by default. Only `buffer`,
-  `clip_state`, `detect`, `ffmpeg`, `motion`, `paths`, `recorder`, and `sidecar` are
-  `pub`: `motion`, `detect`, `buffer`, and `recorder` because `benches/` exercises them
-  directly; `clip_state`, `ffmpeg`, `paths`, and `sidecar` because `recorder`'s public
-  types (`RecordingEvent`, `RecordingEventParams`) reference their types in field or
-  method signatures, and a `pub` item cannot expose a `pub(crate)`-only type without
-  triggering a reachability error.
-- Every clippy finding the newly-`pub` modules exposed was fixed for real (not
+- `src/lib.rs` declares every other module `pub(crate)` by default. Only `buffer` is
+  `pub`, because `benches/buffer.rs`, the only benchmark that exists so far, exercises
+  it directly. `detect`, `motion`, `recorder`, `ffmpeg`, `clip_state`, `paths`, and
+  `sidecar` were briefly made `pub` during development on the assumption that
+  benchmarking them was imminent, but no bench file actually reached any of them
+  (`RecordingEvent`'s `pub` methods never expose `ClipState`, `Sidecar`, or the
+  `ffmpeg`/`paths` helpers in their own signatures; those are used only in method
+  bodies, which doesn't require `pub`), so they were reverted to `pub(crate)` rather
+  than left promoted ahead of need.
+- Every clippy finding the `pub` modules exposed at the time was fixed for real (not
   suppressed): `#[must_use]` on pure accessors/constructors, `# Errors` sections on
   every `pub fn` returning `Result`, `# Panics` sections on every `pub fn` that can
-  panic, and `Debug` implementations on every newly-`pub` type. Three types
-  (`MotionGate`, `Detector`, `RecordingEvent`) wrap a field that itself doesn't
-  implement `Debug` (`opencv::core::Ptr`, `ort::session::Session`,
-  `std::process::Child` respectively) and got a manual `impl Debug` reporting their
-  other fields via `finish_non_exhaustive()`, rather than a blanket
-  `#[allow(missing_debug_implementations)]`.
+  panic, and `Debug` implementations on every newly-`pub` type. Some of these
+  annotations remain on `detect`/`motion`/`recorder` and friends even after those
+  modules reverted to `pub(crate)`; they're accurate documentation either way, just no
+  longer load-bearing for clippy's public-API lints, so removing them wasn't necessary.
 - `benches/buffer.rs` was added as the first real benchmark, exercising
   `RingBuffer::push_frame`/`latest_frame`/`frames_since` (the hot paths every
   detection/writer/preview poll hits) via Criterion, with a scoped
@@ -100,8 +100,9 @@ This was chosen over two alternatives considered and rejected:
 
 - `cargo bench` now works exactly as documented upstream: Criterion's HTML reports,
   statistical warm-up/sampling, and run-over-run regression comparison all function
-  against the real `RingBuffer` (and, as more benchmarks are added, `MotionGate`,
-  `Detector`, `RecordingEvent`) from the library crate.
+  against the real `RingBuffer` from the library crate. Benchmarking `MotionGate`,
+  `Detector`, or `RecordingEvent` remains possible later; it just hasn't happened yet,
+  so those modules stay `pub(crate)` until a bench file actually needs them.
 - Adding a new benchmark that needs a currently-`pub(crate)` module requires promoting
   that module (and any modules its public types reference) to `pub` in `lib.rs`, then
   fixing whatever `clippy::pedantic` findings that promotion surfaces on that module's

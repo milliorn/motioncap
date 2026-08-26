@@ -9,17 +9,10 @@
     reason = "criterion_group!/criterion_main! generate an undocumented fn main; this file has \
                no public API of its own for missing_docs to meaningfully enforce"
 )]
-#![allow(
-    clippy::arithmetic_side_effects,
-    clippy::unchecked_time_subtraction,
-    reason = "benchmark setup subtracts a small hardcoded Duration from Instant::now(), which \
-               only underflows past the Unix epoch, not reachable here"
-)]
-
 use std::hint::black_box;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
-use criterion::{Criterion, criterion_group, criterion_main};
+use criterion::{BatchSize, Criterion, criterion_group, criterion_main};
 use image::RgbImage;
 use motioncap::buffer::RingBuffer;
 
@@ -32,15 +25,26 @@ const FRAME_WIDTH: u32 = 640;
 const FRAME_HEIGHT: u32 = 480;
 
 /// Number of frames pre-populated before a read-path benchmark runs, so
-/// `frames_since` has a realistic backlog to scan.
+/// `latest_frame` has a realistic backlog to scan past.
 const PREFILLED_FRAME_COUNT: usize = 64;
+
+/// Number of trailing prefilled frames that a `frames_since` call should
+/// actually return, standing in for the small handful of frames a real
+/// per-poll drain (`RecordingEvent::drain_frames`/`drain_audio`, polled at
+/// `RECORDING_FRAME_RATE`) sees since its own last poll, not the entire
+/// retained backlog.
+const RECENT_FRAME_COUNT: usize = 4;
 
 fn push_frame(c: &mut Criterion) {
     let mut buffer = RingBuffer::new(BENCH_RETENTION);
     let frame = RgbImage::new(FRAME_WIDTH, FRAME_HEIGHT);
 
     c.bench_function("ring_buffer_push_frame", |b| {
-        b.iter(|| buffer.push_frame(black_box(frame.clone())));
+        b.iter_batched(
+            || frame.clone(),
+            |owned_frame| buffer.push_frame(black_box(owned_frame)),
+            BatchSize::SmallInput,
+        );
     });
 }
 
@@ -61,11 +65,15 @@ fn frames_since(c: &mut Criterion) {
     let mut buffer = RingBuffer::new(BENCH_RETENTION);
     let frame = RgbImage::new(FRAME_WIDTH, FRAME_HEIGHT);
 
-    for _ in 0..PREFILLED_FRAME_COUNT {
+    for _ in 0..(PREFILLED_FRAME_COUNT - RECENT_FRAME_COUNT) {
         buffer.push_frame(frame.clone());
     }
 
-    let since = std::time::Instant::now() - Duration::from_secs(1);
+    let since = Instant::now();
+
+    for _ in 0..RECENT_FRAME_COUNT {
+        buffer.push_frame(frame.clone());
+    }
 
     c.bench_function("ring_buffer_frames_since", |b| {
         b.iter(|| black_box(buffer.frames_since(since)));
