@@ -60,10 +60,17 @@ fn push_frame(c: &mut Criterion) {
     let frame = RgbImage::new(FRAME_WIDTH, FRAME_HEIGHT);
 
     c.bench_function("ring_buffer_push_frame", |b| {
+        // `LargeInput`, not `SmallInput`: `iter_batched` collects every
+        // setup output for a whole batch into memory before timing starts
+        // (`iters_per_batch` divides total iterations by 10 for
+        // `SmallInput` vs. 1000 for `LargeInput`), and each setup output
+        // here is a cloned ~0.9MB `RgbImage`. At this benchmark's measured
+        // iteration counts, `SmallInput`'s larger batches would hold
+        // thousands of cloned frames (multiple GB) simultaneously.
         b.iter_batched(
             || frame.clone(),
             |owned_frame| buffer.push_frame(black_box(owned_frame)),
-            BatchSize::SmallInput,
+            BatchSize::LargeInput,
         );
     });
 }
