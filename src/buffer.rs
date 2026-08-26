@@ -22,7 +22,7 @@ trait Timestamped {
 /// costs ~6.9ms per poll (over 10% of one 66.7ms 15fps tick budget), scaling
 /// to ~14.9ms (22%) at 3840x2160; the `Arc` clone costs under 150ns
 /// regardless of resolution or backlog depth in the same benchmark.
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct TimestampedFrame {
     /// When this frame was captured.
     pub timestamp: Instant,
@@ -37,7 +37,7 @@ impl Timestamped for TimestampedFrame {
 }
 
 /// A chunk of captured audio samples paired with the instant it arrived.
-#[derive(Clone)]
+#[derive(Clone, Debug)]
 pub struct TimestampedAudio {
     /// When this audio chunk was captured.
     pub timestamp: Instant,
@@ -77,6 +77,7 @@ fn since<T: Timestamped + Clone>(deque: &VecDeque<T>, since: Instant) -> Vec<T> 
 
 /// Rolling window of the last `retention` worth of frames and audio, so a
 /// recording event can be started with footage from *before* the trigger fired.
+#[derive(Debug)]
 pub struct RingBuffer {
     /// How long a frame/audio chunk is kept before being evicted.
     retention: Duration,
@@ -88,6 +89,7 @@ pub struct RingBuffer {
 
 impl RingBuffer {
     /// Creates an empty buffer that retains up to `retention` worth of frames/audio.
+    #[must_use]
     pub const fn new(retention: Duration) -> Self {
         Self {
             retention,
@@ -132,6 +134,7 @@ impl RingBuffer {
 
     /// Snapshot of everything currently buffered, oldest first. Used to seed a
     /// new recording with the pre-event window when a trigger fires.
+    #[must_use]
     pub fn snapshot(&self) -> (Vec<TimestampedFrame>, Vec<TimestampedAudio>) {
         (
             self.frames.iter().cloned().collect(),
@@ -140,6 +143,7 @@ impl RingBuffer {
     }
 
     /// The most recently pushed frame, if any.
+    #[must_use]
     pub fn latest_frame(&self) -> Option<&TimestampedFrame> {
         self.frames.back()
     }
@@ -150,6 +154,7 @@ impl RingBuffer {
     /// latest silently skips any frame that arrived and was superseded
     /// before the writer's next poll, which shows up as a visible jump in
     /// the subject's position despite otherwise-correct frame timestamps.
+    #[must_use]
     pub fn frames_since(&self, since_ts: Instant) -> Vec<TimestampedFrame> {
         since(&self.frames, since_ts)
     }
@@ -158,6 +163,7 @@ impl RingBuffer {
     /// newly-captured audio into an active recording each poll, so live clips
     /// keep accumulating audio for their full duration instead of only ever
     /// containing the pre-buffer's audio.
+    #[must_use]
     pub fn audio_since(&self, since_ts: Instant) -> Vec<TimestampedAudio> {
         since(&self.audio, since_ts)
     }

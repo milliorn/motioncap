@@ -4,13 +4,18 @@ use anyhow::{Context, Result};
 use chrono::{DateTime, Local};
 
 /// Builds the `<output_dir>/<YYYY-MM-DD>/<YYYY-MM-DD_HH-MM-SS>_<class1>_<class2>.mp4`
-/// path for a recorded clip (ADR 4), creating the day's folder if needed. The
-/// full date is repeated in the filename (not just the containing folder) so
-/// that filenames sort chronologically by name alone (e.g. in a flat
-/// listing across multiple days' folders), rather than only within a single
-/// day's folder. `classes` is deduplicated and sorted alphabetically so
-/// multi-subject clips get a stable, predictable filename regardless of
+/// path for a recorded clip (ADR 4), creating the day's folder if needed.
+///
+/// The full date is repeated in the filename (not just the containing
+/// folder) so that filenames sort chronologically by name alone (e.g. in a
+/// flat listing across multiple days' folders), rather than only within a
+/// single day's folder. `classes` is deduplicated and sorted alphabetically
+/// so multi-subject clips get a stable, predictable filename regardless of
 /// detection order.
+///
+/// # Errors
+///
+/// Returns an error if the day's output directory can't be created.
 pub fn clip_path(
     output_dir: &Path,
     started_at: DateTime<Local>,
@@ -39,6 +44,7 @@ pub fn clip_path(
 }
 
 /// The sidecar JSON path for a given clip path, e.g. `foo.mp4` -> `foo.json`.
+#[must_use]
 pub fn sidecar_path(clip_path: &Path) -> PathBuf {
     clip_path.with_extension("json")
 }

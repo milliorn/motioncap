@@ -59,4 +59,9 @@ doc_link_code = "deny"
 doc_include_without_cfg = "deny"
 
 [dev-dependencies]
+criterion = "0.7.0"
 tempfile = "3.27.0"
+
+[[bench]]
+name = "buffer"
+harness = false

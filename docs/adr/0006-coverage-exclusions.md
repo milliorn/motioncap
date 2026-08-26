@@ -246,6 +246,37 @@ different achievable ceilings:
   that number's own trajectory. The drop to 73 reflects newly-counted code, not newly
   broken tests.)
 
+## Amendment: `main.rs` split into `lib.rs` + `app.rs` (ADR 8)
+
+ADR 8 moved `run`/`run_detection_loop`/`run_recording_writer_loop`/`run_preview_loop`
+(previously described throughout this ADR as living in `main.rs`) into a new
+`src/app.rs`, part of a new library target; `src/main.rs` shrank to a three-line
+`fn main() { motioncap::app::run() }`. This is a pure file move, not a coverage-policy
+change: every reference above to "`main.rs`'s loop functions" or "`main.rs`'s
+untestable lines" now means the equivalent functions in `app.rs`. The reasoning for
+why those functions can't be automated (real camera/audio devices, real wall-clock
+`thread::sleep`, a real `OpenCV` highgui display) is unchanged; only the file name
+changed.
+
+Concretely, after the move:
+
+- `main.rs` itself is now three lines, trivially 0% or 100% covered depending on
+  whether the one delegation line executes; it carries no meaningful signal of its own
+  and was never the interesting number this ADR tracks.
+- `app.rs` inherits the coverage profile this ADR previously attributed to `main.rs`:
+  its two loop functions with a testable shutdown-check branch (unit-tested, matching
+  the tests described above) and untestable steady-state bodies waiting on real
+  hardware/wall-clock time.
+- The two `#[cfg(test)]` tests previously described as living in `main.rs`'s test
+  module (`run_recording_writer_loop_drains_and_signals_on_immediate_shutdown`,
+  `run_preview_loop_returns_immediately_on_shutdown_without_preview`) moved with their
+  functions and now live in `app.rs`'s test module.
+- Aggregate coverage numbers (local and CI) are materially unchanged by this move
+  alone: the same lines are covered or uncovered as before, just filed under a
+  different filename in the per-file report. Re-run the coverage commands in this ADR
+  to get current numbers rather than trusting the figures recorded above, which
+  predate this split.
+
 ## Consequences (current)
 
 - Only `preview.rs` is excluded from the coverage report by file. Every other file,
