@@ -16,8 +16,22 @@ use criterion::{BatchSize, Criterion, criterion_group, criterion_main};
 use image::RgbImage;
 use motioncap::buffer::RingBuffer;
 
-/// A generous retention window so pushed frames never evict mid-benchmark.
+/// A generous retention window so prefilled frames never evict mid-benchmark
+/// in the read-path benchmarks (`latest_frame`, `frames_since`), which push
+/// only a small, fixed number of frames before the timed portion runs.
 const BENCH_RETENTION: Duration = Duration::from_mins(1);
+
+/// A short retention window for the `push_frame` benchmark specifically, so
+/// each push evicts the frame from several pushes ago instead of retaining
+/// every frame for the whole run. Criterion's default warm-up + measurement
+/// window runs for several seconds, during which `push_frame` (tens of
+/// nanoseconds per call) executes many millions of times; without eviction
+/// actually firing, `BENCH_RETENTION`'s one-minute window would let a single
+/// invocation accumulate millions of unevicted 640x480 frames (gigabytes of
+/// image data) and measure ever-growing `VecDeque` reallocation cost instead
+/// of the bounded, steady-state append+evict cost `push_frame` actually has
+/// in production.
+const PUSH_FRAME_BENCH_RETENTION: Duration = Duration::from_millis(100);
 
 /// Representative camera frame dimensions (matches this project's webcam).
 const FRAME_WIDTH: u32 = 640;
@@ -36,7 +50,7 @@ const PREFILLED_FRAME_COUNT: usize = 64;
 const RECENT_FRAME_COUNT: usize = 4;
 
 fn push_frame(c: &mut Criterion) {
-    let mut buffer = RingBuffer::new(BENCH_RETENTION);
+    let mut buffer = RingBuffer::new(PUSH_FRAME_BENCH_RETENTION);
     let frame = RgbImage::new(FRAME_WIDTH, FRAME_HEIGHT);
 
     c.bench_function("ring_buffer_push_frame", |b| {
