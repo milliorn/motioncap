@@ -78,7 +78,12 @@ pub fn mux_audio_into_video(
     sample_rate: u32,
     channels: u16,
 ) -> Result<()> {
-    let output = Command::new("ffmpeg")
+    #[cfg(unix)]
+    use std::os::unix::process::CommandExt;
+
+    let mut command = Command::new("ffmpeg");
+
+    command
         .args(["-y", "-i"])
         .arg(video_path)
         .args([
@@ -94,7 +99,20 @@ pub fn mux_audio_into_video(
         .args(["-c:v", "copy", "-af", "apad", "-c:a", "aac", "-shortest"])
         .arg(output_path)
         .stdout(Stdio::null())
-        .stderr(Stdio::piped())
+        .stderr(Stdio::piped());
+
+    // Same rationale as spawn_video_encoder: without its own process group,
+    // a terminal SIGINT reaches this mux subprocess directly at the same
+    // instant motioncap's own ctrlc handler is running finish(), producing a
+    // nonzero exit (255) even when the muxed output is actually complete and
+    // valid. finish() bails out on that error before renaming the clip to
+    // its final classified path or writing the sidecar, so an interrupted
+    // mux leaves a fully-encoded clip stuck under its tmp name with no
+    // sidecar despite the video data itself being intact.
+    #[cfg(unix)]
+    command.process_group(0);
+
+    let output = command
         .output()
         .context("failed to spawn ffmpeg for audio muxing")?;
 
