@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.11.0](https://github.com/milliorn/motioncap/compare/motioncap-v0.10.0...motioncap-v0.11.0) (2026-08-26)
+
+
+### Features
+
+* **build:** add lib target and Criterion benchmarks ([#45](https://github.com/milliorn/motioncap/issues/45)) ([2d6399d](https://github.com/milliorn/motioncap/commit/2d6399dc6d867da4033e4b5bbbfa9b36e2867a5a))
+
 ## [0.10.0](https://github.com/milliorn/motioncap/compare/motioncap-v0.9.0...motioncap-v0.10.0) (2026-08-18)
 
 
