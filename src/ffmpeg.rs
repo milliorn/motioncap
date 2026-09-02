@@ -5,6 +5,23 @@ use anyhow::{Context, Result, bail};
 use crate::buffer::TimestampedFrame;
 use crate::clip_state;
 
+/// Puts `command` in its own process group so a terminal SIGINT (Ctrl+C)
+/// doesn't reach it directly. An ffmpeg child shares the foreground process
+/// group with motioncap by default, so without this, Ctrl+C kills ffmpeg at
+/// the same instant motioncap's own ctrlc handler tries to close it
+/// gracefully (closing stdin then waiting, or, for the mux step, letting the
+/// blocking call return), racing ffmpeg's own SIGINT handling and producing
+/// a nonzero exit even when the output is actually complete and valid.
+/// Graceful shutdown should be the only thing that ever tells ffmpeg to
+/// stop.
+fn isolate_process_group(#[allow(unused_variables)] command: &mut Command) {
+    #[cfg(unix)]
+    {
+        use std::os::unix::process::CommandExt;
+        command.process_group(0);
+    }
+}
+
 /// Spawns ffmpeg to encode raw RGB frames fed via stdin into an H.264 file.
 ///
 /// `Command::spawn`'s exec-failure arm is only reachable if `ffmpeg` is
@@ -20,9 +37,6 @@ pub fn spawn_video_encoder(
     height: u32,
     frame_rate: u32,
 ) -> Result<Child> {
-    #[cfg(unix)]
-    use std::os::unix::process::CommandExt;
-
     let mut command = Command::new("ffmpeg");
 
     command
@@ -37,16 +51,7 @@ pub fn spawn_video_encoder(
         .stdout(Stdio::null())
         .stderr(Stdio::piped());
 
-    // Put ffmpeg in its own process group so a terminal SIGINT (Ctrl+C)
-    // doesn't reach it directly. It shares the foreground process group
-    // with motioncap by default, so without this, Ctrl+C kills ffmpeg at
-    // the same instant as motioncap's own ctrlc handler tries to close it
-    // gracefully (closing stdin, then waiting), racing ffmpeg's own SIGINT
-    // handling and producing a nonzero exit even when the output file is
-    // actually complete and valid. Graceful shutdown should be the only
-    // thing that ever tells ffmpeg to stop.
-    #[cfg(unix)]
-    command.process_group(0);
+    isolate_process_group(&mut command);
 
     command
         .spawn()
@@ -78,9 +83,6 @@ pub fn mux_audio_into_video(
     sample_rate: u32,
     channels: u16,
 ) -> Result<()> {
-    #[cfg(unix)]
-    use std::os::unix::process::CommandExt;
-
     let mut command = Command::new("ffmpeg");
 
     command
@@ -101,16 +103,15 @@ pub fn mux_audio_into_video(
         .stdout(Stdio::null())
         .stderr(Stdio::piped());
 
-    // Same rationale as spawn_video_encoder: without its own process group,
-    // a terminal SIGINT reaches this mux subprocess directly at the same
+    // Without process-group isolation (see isolate_process_group), a
+    // terminal SIGINT reaches this mux subprocess directly at the same
     // instant motioncap's own ctrlc handler is running finish(), producing a
     // nonzero exit (255) even when the muxed output is actually complete and
     // valid. finish() bails out on that error before renaming the clip to
     // its final classified path or writing the sidecar, so an interrupted
     // mux leaves a fully-encoded clip stuck under its tmp name with no
     // sidecar despite the video data itself being intact.
-    #[cfg(unix)]
-    command.process_group(0);
+    isolate_process_group(&mut command);
 
     let output = command
         .output()
