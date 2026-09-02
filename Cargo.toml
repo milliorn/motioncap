@@ -1,6 +1,6 @@
 [package]
 name = "motioncap"
-version = "0.11.0"
+version = "0.11.1"
 edition = "2024"
 description = "Webcam-based security motion-capture tool with motion detection, YOLO confirmation, and H.264+AAC recording"
 license = "MIT"

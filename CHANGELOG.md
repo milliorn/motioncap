@@ -1,5 +1,12 @@
 # Changelog
 
+## [0.11.1](https://github.com/milliorn/motioncap/compare/motioncap-v0.11.0...motioncap-v0.11.1) (2026-09-02)
+
+
+### Bug Fixes
+
+* **ffmpeg:** handle SIGINT for muxing process to prevent premature exit ([#51](https://github.com/milliorn/motioncap/issues/51)) ([40a1ec8](https://github.com/milliorn/motioncap/commit/40a1ec817d6237df38097a173ee41006ee16736b))
+
 ## [0.11.0](https://github.com/milliorn/motioncap/compare/motioncap-v0.10.0...motioncap-v0.11.0) (2026-08-26)
 
 
